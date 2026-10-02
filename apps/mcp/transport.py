@@ -296,7 +296,9 @@ def _modern_endpoint(request, body, context):
     else:
         code = response["error"]["code"]
         status = 404 if code == METHOD_NOT_FOUND else 400 if code in {INVALID_PARAMS, INVALID_REQUEST} else 200
-    _log_mcp_audit(request, body, status_code=status)
+    # Keep application/RPC failures visible in the audit even when their
+    # correct wire-level HTTP response is 200 (for example callback rejection).
+    _log_mcp_audit(request, body, status_code=_status_for_response(response))
     result = JsonResponse(response, status=status)
     result["Cache-Control"] = "private, no-store"
     return result

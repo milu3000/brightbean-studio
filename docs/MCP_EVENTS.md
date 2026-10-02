@@ -41,6 +41,17 @@ The feature defaults off, and the exact callback-host allowlist defaults empty (
 6. Explicitly authorize the account-scoped event subscription and its persistent callback access. ChatGPT supplies the callback and signing secret; configure only the verified exact callback hostname. Do not invent a host or paste signing secrets into chat, source, logs, or environment examples. This step is separate from deploying code and must not silently create a new credential/grant.
 7. Verify the full live lifecycle in a staging account: discovery, challenge, matching/nonmatching inbound DM, token refresh/revocation, unsubscribe, and retry deduplication. Neither successful HTTP receipt nor these offline tests establish that ChatGPT completed a downstream task.
 
+If an authenticated, correctly formed modern subscribe request has valid current
+owner/workspace/account access and a well-formed signing secret but its callback
+host is not allowed, error `-32015` includes `data.candidateHost` and
+`data.requiresApproval: true`. The hint contains only that request's normalized
+hostname, not its scheme, port, path, query, signing secret, or configured hosts.
+Malformed requests, unauthorized principals/accounts, and malformed URLs receive
+no candidate hint. No DNS lookup, callback, subscription creation, or allowlist
+change occurs. The host is **unverified and unapproved**: confirm it came from the
+intended platform setup, verify the destination, and obtain the required approval
+before configuring it. There is no assumed fixed OpenAI callback hostname.
+
 Optional `MCP_EVENTS_SUBSCRIPTION_TTL_SECONDS` lowers the default granted TTL. The code still caps grants to 24 hours and credential expiry. No callback is sent merely by enabling the feature or migrating an empty database.
 
 ## Delivery and recovery

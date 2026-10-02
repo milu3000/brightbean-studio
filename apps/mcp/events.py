@@ -11,6 +11,7 @@ import logging
 import uuid
 from datetime import timedelta
 from typing import Any
+from urllib.parse import urlsplit
 
 from django.conf import settings
 from django.db import transaction
@@ -176,7 +177,7 @@ def _validate_params(params, method):
         raise JsonRpcError(INVALID_PARAMS, "Invalid event parameters") from exc
 
 
-def _identity_params(params, *, unsubscribing=False):
+def _identity_params(params):
     if params.get("name") != EVENT_NAME:
         raise JsonRpcError(INVALID_PARAMS, "Unknown event")
     arguments = params.get("arguments")
@@ -190,7 +191,7 @@ def _identity_params(params, *, unsubscribing=False):
     if not isinstance(delivery, dict) or delivery.get("mode") != "webhook":
         raise JsonRpcError(INVALID_PARAMS, "Only webhook delivery is supported")
     try:
-        url = validate_callback_url(delivery.get("url"), check_allowlist=not unsubscribing)
+        url = validate_callback_url(delivery.get("url"), check_allowlist=False)
     except CallbackError as exc:
         raise JsonRpcError(CALLBACK_ENDPOINT_ERROR, "Callback endpoint rejected", {"reason": exc.reason}) from exc
     return arguments, delivery, url
@@ -239,6 +240,21 @@ def subscribe(params, context):
         validate_secret(secret)
     except CallbackError as exc:
         raise JsonRpcError(INVALID_PARAMS, "Invalid webhook signing secret") from exc
+    # Re-read all principal/account grants before even returning an operator
+    # diagnostic. This object is not saved and contains no callback URL or signing secret.
+    if not subscription_authorized(EventSubscription(**credential, social_account=account)):
+        raise JsonRpcError(INVALID_PARAMS, "Event access denied")
+    try:
+        validate_callback_url(url)
+    except CallbackError as exc:
+        details: dict[str, Any] = {"reason": exc.reason}
+        if exc.reason == "callback_host_not_allowed" and context.get("modern") is True:
+            # Only a validated authenticated MCP 2.0 subscribe reaches this
+            # branch. Echo its normalized HOST only, never the callback path,
+            # query, signing key, or configured allowlist. This is a candidate,
+            # not verified ownership or permission to change the allowlist.
+            details.update(candidateHost=urlsplit(url).hostname, requiresApproval=True)
+        raise JsonRpcError(CALLBACK_ENDPOINT_ERROR, "Callback endpoint rejected", details) from exc
     sub_id = _subscription_id(credential["principal"], url, arguments)
     now = timezone.now()
     # Persisted verification survives worker/restart; bounded to this principal,
@@ -318,7 +334,7 @@ def subscribe(params, context):
 
 def unsubscribe(params, context):
     _validate_params(params, "unsubscribe")
-    arguments, _delivery, url = _identity_params(params, unsubscribing=True)
+    arguments, _delivery, url = _identity_params(params)
     credential = _credential(context)
     # Cancellation remains available after an OAuth user's selected workspace
     # changes. The immutable owner + client/key identity is still mandatory;
