@@ -29,6 +29,12 @@ The safe weekly outcome is a reviewed, tested update branch and a draft pull req
 5. Run the gates below, and summarize upstream commits, conflicts, changed behavior and test results in a draft PR targeted at the fork's customization branch. Avoid posting security-sensitive reports to the upstream public issue tracker.
 6. Do not reset, force-push, delete customization commits, merge the PR, or deploy automatically. A failing or unverified gate remains a blocker.
 
+## GitHub CI activation and target branches
+
+The inherited workflow has been reviewed and enabled for this fork. It has read-only repository permissions, pinned official GitHub/Docker actions, and a Docker build with `push: false`; it does not deploy. It has no `workflow_dispatch` entry. Its existing triggers are pushes to `main` and pull requests targeting `main`.
+
+The initial customization draft PR targets `main`, so a new commit on that PR starts the existing CI. A later maintenance PR targeting the customization branch does **not** match the inherited branch filter: run all local regression gates and do not interpret absent checks as success. Expanding that filter or adding manual dispatch is a separate, deliberate CI change; keep the upstream-tracking branch and deployment gate intact.
+
 ## Regression gates
 
 Use Python 3.12 and an isolated PostgreSQL database, matching the repository CI. Never point tests at production, copied private production data, or real provider credentials.
