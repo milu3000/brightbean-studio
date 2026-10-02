@@ -1,7 +1,8 @@
 import hashlib
 
+from django.conf import settings
 from django.core.cache import cache
-from django.http import HttpResponse
+from django.http import HttpResponse, HttpResponseForbidden
 from django.shortcuts import redirect
 from django.urls import reverse
 
@@ -79,3 +80,28 @@ class AuthRateLimitMiddleware:
         if x_forwarded_for:
             return x_forwarded_for.split(",")[0].strip()
         return request.META.get("REMOTE_ADDR", "")
+
+
+class GoogleLoginPolicyMiddleware:
+    """Block allauth Google initiation/callback/token endpoints, never publishing OAuth."""
+
+    def __init__(self, get_response):
+        self.get_response = get_response
+
+    def __call__(self, request):
+        return self.get_response(request)
+
+    def process_view(self, request, view_func, view_args, view_kwargs):
+        match = request.resolver_match
+        if (
+            not settings.AUTH_GOOGLE_LOGIN_ENABLED
+            and match
+            and match.url_name
+            in {
+                "google_login",
+                "google_callback",
+                "google_login_by_token",
+            }
+        ):
+            return HttpResponseForbidden("Google sign-in is disabled. Sign in with your password.")
+        return None
