@@ -2,6 +2,15 @@
 
 Implementation target: [OpenAI MCP Events](https://developers.openai.com/plugins/build/mcp-events), checked October 2, 2026. The current integration uses MCP 2.0 protocol version `2026-07-28`. This implementation has offline contract/security tests; live ChatGPT event activation has **not** been tested.
 
+**Production gate:** keep `MCP_EVENTS_ENABLED=false`. With Events off,
+`server/discover` returns JSON-RPC method-not-found, preserving the existing
+legacy `initialize` and tools flow. A successful modern discovery response that
+advertises only a legacy revision prevents current clients from falling back.
+The experimental enabled branch still needs a complete modern wire-contract
+review (per-request metadata/header validation, result envelopes, and discovery
+and tool-list cache metadata) and live acceptance before it may be enabled.
+Passing the offline event tests alone does not establish modern-client compatibility.
+
 ## Contract
 
 All calls use the existing authenticated `/api/v1/mcp` endpoint and its existing rate limiting/auditing.

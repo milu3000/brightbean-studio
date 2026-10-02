@@ -26,6 +26,7 @@ from apps.mcp.protocol import (
     INVALID_PARAMS,
     INVALID_REQUEST,
     MCP_PROTOCOL_VERSION,
+    METHOD_NOT_FOUND,
     PARSE_ERROR,
     SERVER_NAME,
     SERVER_VERSION,
@@ -63,6 +64,12 @@ def _initialize(params: dict, context: dict[str, Any]) -> dict:
 
 
 def _server_discover(params: dict, context: dict[str, Any]) -> dict:
+    if not events_enabled():
+        # Discovery belongs to the modern per-request lifecycle. A successful
+        # response advertising only our legacy initialize revision is
+        # inconsistent and prevents clients from falling back to initialize.
+        # Preserve the upstream method-not-found response while Events are off.
+        raise JsonRpcError(METHOD_NOT_FOUND, "Method 'server/discover' not found")
     capabilities: dict[str, Any] = {"tools": {}}
     versions = [MCP_PROTOCOL_VERSION]
     if events_enabled():

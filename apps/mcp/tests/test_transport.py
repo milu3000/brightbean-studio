@@ -201,6 +201,30 @@ class TestMcpUrlVariants:
 
 @pytest.mark.django_db
 class TestProtocolMechanics:
+    @pytest.mark.parametrize("url", [MCP_URL, MCP_URL_NO_SLASH])
+    def test_disabled_events_discovery_falls_back_to_legacy_tools(self, client_with_token, settings, url):
+        settings.MCP_EVENTS_ENABLED = False
+        probe = client_with_token.post(
+            url,
+            data=json.dumps(
+                _rpc("server/discover", {"_meta": {"io.modelcontextprotocol/protocolVersion": "2026-07-28"}})
+            ),
+            content_type="application/json",
+        )
+        assert probe.status_code == 200
+        assert probe.json()["error"]["code"] == METHOD_NOT_FOUND
+
+        status, body = _post(client_with_token, _rpc("initialize", {"protocolVersion": "2025-03-26"}))
+        assert status == 200
+        assert body["result"] == {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {"tools": {"listChanged": False}},
+            "serverInfo": {"name": "brightbean-studio", "version": "1.0.0"},
+        }
+        status, body = _post(client_with_token, _rpc("tools/list"))
+        assert status == 200
+        assert "list_accounts" in {tool["name"] for tool in body["result"]["tools"]}
+
     def test_initialize_returns_server_info(self, client_with_token):
         status, body = _post(
             client_with_token,

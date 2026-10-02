@@ -467,7 +467,7 @@ class TestTransport:
 
     def test_feature_disabled_not_advertised(self, context, settings):
         settings.MCP_EVENTS_ENABLED = False
-        assert "events" not in self.rpc(context, "server/discover")["result"]["capabilities"]
+        assert self.rpc(context, "server/discover")["error"]["code"] == -32601
         assert self.rpc(context, "events/list")["error"]["code"] == -32601
 
 
