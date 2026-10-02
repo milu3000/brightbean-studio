@@ -4,7 +4,9 @@ import logging
 from datetime import timedelta
 
 from django.conf import settings
+from django.core.exceptions import ValidationError
 from django.core.mail import EmailMultiAlternatives
+from django.db import transaction
 from django.db.models import F, Q
 from django.template.loader import render_to_string
 from django.utils import timezone
@@ -205,63 +207,64 @@ def _check_org_invite_budget(org) -> None:
         )
 
 
-def accept_invitation(invitation, user, *, require_email_match=True):
-    """Accept an invitation: create org + workspace memberships.
+@transaction.atomic
+def accept_invitation(invitation, user):
+    """Consume a fresh, email-matched invitation and grant memberships atomically.
 
-    Args:
-        invitation: The Invitation to accept.
-        user: The User accepting.
-        require_email_match: When True (default), reject if the user's email
-            differs from the invitation's. The signup signal path passes
-            False because the session-bound token is itself proof of email
-            delivery (and social logins return whatever email the provider
-            owns, which often differs from the invited address).
-
-    Raises:
-        ValueError: If the invitation is expired, already accepted, or the
-            user's email does not match (when require_email_match is True).
+    Re-read with a row lock: a stale model instance is not authorization. The
+    token match also rejects a link invalidated by resend. Expiry represents
+    revocation, so no separate revocation flag can become inconsistent.
     """
-    if invitation.is_expired:
-        raise ValueError("This invitation has expired.")
-    if invitation.is_accepted:
-        raise ValueError("This invitation has already been accepted.")
+    from apps.accounts.policy import normalize_invitation_email
 
-    if require_email_match and user.email.lower() != invitation.email.lower():
+    try:
+        locked = Invitation.objects.select_for_update().get(pk=invitation.pk, token=invitation.token)
+    except Invitation.DoesNotExist as exc:
+        raise ValueError("This invitation is no longer valid.") from exc
+    if locked.is_expired:
+        raise ValueError("This invitation has expired.")
+    if locked.is_accepted:
+        raise ValueError("This invitation has already been accepted.")
+    if normalize_invitation_email(user.email) != normalize_invitation_email(locked.email):
         raise ValueError("This invitation was sent to a different email address.")
 
-    # Create org membership (skip if exists, e.g. user was already added)
-    org_membership, created = OrgMembership.objects.get_or_create(
-        user=user,
-        organization=invitation.organization,
-        defaults={"org_role": invitation.org_role},
-    )
-
-    # Create workspace memberships
-    for assignment in invitation.workspace_assignments:
-        import uuid as uuid_mod
-
-        ws_id = uuid_mod.UUID(str(assignment["workspace_id"]))
+    # Do not trust JSON assignments to grant access outside the invited org.
+    assignments = []
+    for assignment in locked.workspace_assignments:
+        try:
+            workspace = Workspace.objects.get(
+                pk=assignment["workspace_id"],
+                organization_id=locked.organization_id,
+            )
+        except (KeyError, TypeError, ValueError, ValidationError, Workspace.DoesNotExist) as exc:
+            raise ValueError("An invited workspace is no longer available. Ask for a new invitation.") from exc
         role = assignment.get("role", WorkspaceMembership.WorkspaceRole.VIEWER)
+        if role not in WorkspaceMembership.WorkspaceRole.values:
+            raise ValueError("An invited workspace role is no longer valid. Ask for a new invitation.")
+        assignments.append((workspace, role))
+
+    org_membership, _ = OrgMembership.objects.get_or_create(
+        user=user,
+        organization_id=locked.organization_id,
+        defaults={"org_role": locked.org_role, "accepted_at": timezone.now()},
+    )
+    for workspace, role in assignments:
         WorkspaceMembership.objects.get_or_create(
             user=user,
-            workspace_id=ws_id,
+            workspace=workspace,
             defaults={"workspace_role": role},
         )
 
-    invitation.accepted_at = timezone.now()
-    invitation.save(update_fields=["accepted_at"])
-
-    # Set last workspace for dashboard redirect
-    if invitation.workspace_assignments:
-        import uuid as uuid_mod
-
-        first_ws_id = uuid_mod.UUID(str(invitation.workspace_assignments[0]["workspace_id"]))
-        user.last_workspace_id = first_ws_id
+    locked.accepted_at = timezone.now()
+    locked.save(update_fields=["accepted_at"])
+    invitation.accepted_at = locked.accepted_at
+    if assignments:
+        user.last_workspace_id = assignments[0][0].id
         user.save(update_fields=["last_workspace_id"])
-
     return org_membership
 
 
+@transaction.atomic
 def resend_invitation(invitation):
     """Resend an invitation with a fresh token and expiry.
 
@@ -280,6 +283,8 @@ def resend_invitation(invitation):
             cooldown, has been sent as many times as it is allowed, or the
             email could not be sent.
     """
+    Invitation.objects.select_for_update().get(pk=invitation.pk)
+    invitation.refresh_from_db()
     if invitation.is_accepted:
         raise ValueError("This invitation has already been accepted.")
 
@@ -318,8 +323,11 @@ def resend_invitation(invitation):
     return invitation
 
 
+@transaction.atomic
 def revoke_invitation(invitation):
-    """Revoke an invitation by expiring it immediately."""
+    """Revoke an invitation by expiring it immediately, serialized with accept."""
+    Invitation.objects.select_for_update().get(pk=invitation.pk)
+    invitation.refresh_from_db()
     if invitation.is_accepted:
         raise ValueError("Cannot revoke an already accepted invitation.")
     invitation.expires_at = timezone.now()

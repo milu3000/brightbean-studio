@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block title %}Invitation required · BrightBean Studio{% endblock %}
+{% block auth_content %}
+<div class="w-full max-w-md px-4 text-center">
+    <h1 class="text-2xl font-bold">Invitation required</h1>
+    <p class="mt-4">Use a valid invitation link from your organization administrator to create an account.</p>
+    <p class="mt-4"><a href="{% url 'account_login' %}">Sign in to an existing account</a></p>
+</div>
+{% endblock %}

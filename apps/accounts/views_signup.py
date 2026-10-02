@@ -1,23 +1,14 @@
 from allauth.account.views import SignupView
 
-from apps.members.models import Invitation
+from .policy import pending_invitation
 
 
 class InvitePrefillSignupView(SignupView):
-    """Signup view that pre-fills and locks the email when a pending
-    invite token is in the session."""
+    """Show the invited email; authorization is enforced by forms and adapters."""
 
     def _invited_email(self):
-        token = self.request.session.get("pending_invite_token")
-        if not token:
-            return None
-        invitation = Invitation.objects.filter(
-            token=token,
-            accepted_at__isnull=True,
-        ).first()
-        if invitation and not invitation.is_expired:
-            return invitation.email
-        return None
+        invitation = pending_invitation(self.request)
+        return invitation.email if invitation else None
 
     def get_initial(self):
         initial = super().get_initial()
@@ -30,3 +21,8 @@ class InvitePrefillSignupView(SignupView):
         ctx = super().get_context_data(**kwargs)
         ctx["invited_email_locked"] = bool(self._invited_email())
         return ctx
+
+    def closed(self):
+        response = super().closed()
+        response.status_code = 403
+        return response

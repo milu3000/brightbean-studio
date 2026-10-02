@@ -4,7 +4,7 @@ from django.contrib.auth.decorators import login_required
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.utils import timezone
-from django.views.decorators.http import require_GET, require_POST
+from django.views.decorators.http import require_GET, require_http_methods, require_POST
 from django_ratelimit.decorators import ratelimit
 
 from apps.workspaces.models import Workspace
@@ -211,6 +211,7 @@ def revoke_invite(request, invitation_id):
 # ---------------------------------------------------------------------------
 
 
+@require_http_methods(["GET", "POST"])
 def accept_invite(request, token):
     """Accept an invitation (public - no login required for GET)."""
     try:
@@ -225,7 +226,7 @@ def accept_invite(request, token):
     ws_display = []
     for a in invitation.workspace_assignments:
         try:
-            ws = Workspace.objects.get(id=a["workspace_id"])
+            ws = Workspace.objects.get(id=a["workspace_id"], organization=invitation.organization)
             ws_display.append({"name": ws.name, "role": a.get("role", "viewer")})
         except Workspace.DoesNotExist:
             pass
@@ -244,8 +245,11 @@ def accept_invite(request, token):
                     "invitation": invitation,
                     "ws_display": ws_display,
                     "error": str(e),
+                    "accept_url": f"/members/invite/{token}/accept/",
                 },
             )
+
+        request.session.pop("pending_invite_token", None)
 
         # Redirect to first assigned workspace or home
         if request.user.last_workspace_id:

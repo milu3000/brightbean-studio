@@ -10,7 +10,8 @@ from apps.accounts.models import OAuthConnection, User
 
 
 @pytest.fixture
-def adapter():
+def adapter(settings):
+    settings.AUTH_GOOGLE_LOGIN_ENABLED = True
     return SocialAccountAdapter()
 
 

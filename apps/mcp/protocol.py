@@ -142,9 +142,9 @@ def dispatch(
         return make_response(msg["id"], result)
     except JsonRpcError as exc:
         return make_error(msg["id"], exc.code, exc.message, exc.data)
-    except Exception as exc:  # noqa: BLE001 — last-ditch
+    except Exception:  # noqa: BLE001 — last-ditch
         # Don't leak internals to clients; log for ops.
         import logging
 
         logging.getLogger(__name__).exception("MCP handler '%s' raised", method)
-        return make_error(msg["id"], INTERNAL_ERROR, str(exc))
+        return make_error(msg["id"], INTERNAL_ERROR, "Internal server error")

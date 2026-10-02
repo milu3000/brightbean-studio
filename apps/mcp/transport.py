@@ -21,6 +21,7 @@ from ninja import Router
 
 from apps.api.limits import enforce_http_rate_limits
 from apps.api.middleware import log_audit_entry
+from apps.mcp.events import MODERN_PROTOCOL_VERSION, events_enabled, list_events, subscribe, unsubscribe
 from apps.mcp.protocol import (
     INVALID_PARAMS,
     INVALID_REQUEST,
@@ -50,14 +51,24 @@ def _initialize(params: dict, context: dict[str, Any]) -> dict:
     ``Mcp-Session-Id`` because our bearer token already identifies the
     session — every authenticated request stands on its own.
     """
+    modern = events_enabled() and params.get("protocolVersion") == MODERN_PROTOCOL_VERSION
+    capabilities = {"tools": {"listChanged": False}}
+    if modern:
+        capabilities["events"] = {}
     return {
-        "protocolVersion": MCP_PROTOCOL_VERSION,
-        "capabilities": {
-            # Static tool catalog; we don't send listChanged notifications.
-            "tools": {"listChanged": False},
-        },
+        "protocolVersion": MODERN_PROTOCOL_VERSION if modern else MCP_PROTOCOL_VERSION,
+        "capabilities": capabilities,
         "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
     }
+
+
+def _server_discover(params: dict, context: dict[str, Any]) -> dict:
+    capabilities: dict[str, Any] = {"tools": {}}
+    versions = [MCP_PROTOCOL_VERSION]
+    if events_enabled():
+        capabilities["events"] = {}
+        versions.insert(0, MODERN_PROTOCOL_VERSION)
+    return {"resultType": "complete", "supportedVersions": versions, "capabilities": capabilities}
 
 
 def _initialized(params: dict, context: dict[str, Any]) -> None:
@@ -124,6 +135,10 @@ def _validate_tool_arguments(schema: dict, arguments: dict) -> None:
 
 METHODS = {
     "initialize": _initialize,
+    "server/discover": _server_discover,
+    "events/list": list_events,
+    "events/subscribe": subscribe,
+    "events/unsubscribe": unsubscribe,
     "notifications/initialized": _initialized,
     "ping": _ping,
     "tools/list": _tools_list,

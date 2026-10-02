@@ -45,7 +45,7 @@
         {% endif %}
 
         <!-- Social Signup -->
-        {% if SOCIALACCOUNT_ENABLED %}
+        {% if SOCIALACCOUNT_ENABLED and auth_google_login_enabled and auth_public_signup_enabled and not invited_email_locked %}
             {% get_providers as socialaccount_providers %}
             {% if socialaccount_providers %}
                 <div class="space-y-3 mb-6">
@@ -72,6 +72,7 @@
         <form method="post" action="{{ signup_action_url }}">
             {% csrf_token %}
             {{ redirect_field }}
+            {% if form.non_field_errors %}<div class="alert-error">{{ form.non_field_errors }}</div>{% endif %}
 
             {% for field in form %}
             <div class="mb-4">

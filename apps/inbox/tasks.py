@@ -2,11 +2,12 @@
 
 import logging
 import re
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from background_task import background
 from django.conf import settings
+from django.db import transaction
 from django.utils import timezone
 
 from apps.common import quota
@@ -28,6 +29,10 @@ logger = logging.getLogger(__name__)
 # account's genuinely-new first message still alerts instead of being swallowed.
 INBOX_BACKLOG_NOTIFY_WINDOW = timedelta(hours=1)
 _YOUTUBE_INBOX_REFRESH_WINDOW = timedelta(minutes=10)
+# Unknown provider timestamps must never look like a fresh inbound DM: the
+# received time also governs Meta's 24-hour automated-reply window.
+UNKNOWN_MESSAGE_TIMESTAMP = datetime(1970, 1, 1, tzinfo=UTC)
+_PROVIDER_CLOCK_SKEW = timedelta(minutes=5)
 
 # Platforms whose provider implements the ``deep`` walk. Only YouTube needs it:
 # it is the only one whose routine poll stops early to protect a shared budget,
@@ -71,13 +76,40 @@ def _queue_health_check(account: SocialAccount) -> None:
         logger.error("Could not queue inbox health check for account %s: error_type=%s", account.id, type(exc).__name__)
 
 
-def _is_recent(ts):
-    """True if a provider message timestamp falls within the backlog-notify window."""
-    if ts is None:
-        return False
+def _safe_message_timestamp(ts):
+    """Keep provider time, with a conservative fallback for missing/broken data."""
+    if not isinstance(ts, datetime):
+        return UNKNOWN_MESSAGE_TIMESTAMP
     if timezone.is_naive(ts):
         ts = timezone.make_aware(ts, timezone.get_default_timezone())
-    return ts >= timezone.now() - INBOX_BACKLOG_NOTIFY_WINDOW
+    if ts > timezone.now() + _PROVIDER_CLOCK_SKEW:
+        return UNKNOWN_MESSAGE_TIMESTAMP
+    return ts
+
+
+def _is_recent(ts):
+    """True if a provider message timestamp falls within the backlog-notify window."""
+    return _safe_message_timestamp(ts) >= timezone.now() - INBOX_BACKLOG_NOTIFY_WINDOW
+
+
+def _is_outgoing_dm(account, sender_id, extra):
+    """Defend both ingestion paths against our own replies and provider echoes."""
+    extra = extra or {}
+    message = extra.get("message") or {}
+    if (
+        extra.get("is_echo")
+        or extra.get("is_self")
+        or extra.get("direction") == "outbound"
+        or (isinstance(message, dict) and message.get("is_echo"))
+    ):
+        return True
+    own_ids = {str(account.account_platform_id), str(account.webhook_target_id or "")}
+    own_ids.discard("")
+    sender = extra.get("sender") or {}
+    sender_ids = [sender_id, extra.get("sender_id")]
+    if isinstance(sender, dict):
+        sender_ids.append(sender.get("id"))
+    return any(str(value) in own_ids for value in sender_ids if value is not None)
 
 
 def _related_post_key(extra: dict | None) -> str:
@@ -496,8 +528,14 @@ class InboxSyncEngine:
         logger.info("YouTube inbox poll recovered for account %s", account.id)
         return messages
 
+    @transaction.atomic
     def _upsert_message(self, account, msg, notify=True, related_post_id=None):
         """Create or update an inbox message, deduplicating by platform_message_id."""
+        message_id = str(msg.platform_message_id or "").strip()
+        if not message_id:
+            return
+        if msg.message_type == InboxMessage.MessageType.DM and _is_outgoing_dm(account, msg.sender_id, msg.extra):
+            return
         defaults = {
             "workspace": account.workspace,
             "sender_name": msg.sender_name,
@@ -505,7 +543,7 @@ class InboxSyncEngine:
             "sender_avatar_url": msg.extra.get("sender_avatar_url", ""),
             "body": msg.text,
             "message_type": msg.message_type,
-            "received_at": msg.timestamp,
+            "received_at": _safe_message_timestamp(msg.timestamp),
             "extra": msg.extra,
         }
         if related_post_id:
@@ -513,13 +551,20 @@ class InboxSyncEngine:
 
         obj, created = InboxMessage.objects.update_or_create(
             social_account=account,
-            platform_message_id=msg.platform_message_id,
+            platform_message_id=message_id,
             defaults=defaults,
         )
         if created:
             obj.sentiment = analyze_sentiment(obj.body)
             obj.save(update_fields=["sentiment"])
             if notify:
+                if obj.message_type == InboxMessage.MessageType.DM:
+                    from apps.mcp.events import enqueue_inbox_event
+
+                    # Persist the outbox in this transaction, not on_commit:
+                    # a failed enqueue must roll back the inbox row too, or a
+                    # retry would see a duplicate and permanently lose its event.
+                    enqueue_inbox_event(obj)
                 self._notify_new_message(obj)
 
     def _notify_new_message(self, message):

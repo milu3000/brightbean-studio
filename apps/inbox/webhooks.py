@@ -4,8 +4,11 @@ import hashlib
 import hmac
 import json
 import logging
+import math
+from datetime import timedelta
 
 from django.conf import settings
+from django.db import transaction
 from django.http import HttpResponse, HttpResponseForbidden
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
@@ -393,25 +396,49 @@ def _upsert_instagram_mention(account, value: dict):
 
 def _handle_facebook_messaging(account, messaging: dict):
     """Handle a Facebook/Instagram messaging event (DM)."""
-    message_data = messaging.get("message", {})
+    from .tasks import _is_outgoing_dm
+
+    message_data = messaging.get("message") or {}
+    if not isinstance(message_data, dict):
+        return
     mid = message_data.get("mid")
     if not mid:
         return
 
-    sender = messaging.get("sender", {})
-    text = message_data.get("text", "")
+    sender = messaging.get("sender") or {}
+    if not isinstance(sender, dict) or _is_outgoing_dm(account, sender.get("id"), messaging):
+        return
+    text = message_data.get("text") or ""
 
     _create_if_new(
         account=account,
         platform_message_id=str(mid),
         message_type=InboxMessage.MessageType.DM,
-        sender_name=sender.get("name", sender.get("id", "Unknown")),
-        sender_id=sender.get("id", ""),
+        sender_name=str(sender.get("name") or sender.get("id") or "Unknown"),
+        sender_id=str(sender.get("id") or ""),
         body=text,
         extra=messaging,
+        received_at=_meta_message_timestamp(messaging.get("timestamp")),
     )
 
 
+def _meta_message_timestamp(value):
+    """Meta messaging timestamps are milliseconds, never server receipt time."""
+    from .tasks import UNKNOWN_MESSAGE_TIMESTAMP, _safe_message_timestamp
+
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return UNKNOWN_MESSAGE_TIMESTAMP
+    try:
+        milliseconds = float(value)
+        if not math.isfinite(milliseconds):
+            return UNKNOWN_MESSAGE_TIMESTAMP
+        timestamp = UNKNOWN_MESSAGE_TIMESTAMP + timedelta(milliseconds=milliseconds)
+    except (ValueError, OverflowError):
+        return UNKNOWN_MESSAGE_TIMESTAMP
+    return _safe_message_timestamp(timestamp)
+
+
+@transaction.atomic
 def _create_if_new(
     account,
     platform_message_id: str,
@@ -420,11 +447,22 @@ def _create_if_new(
     sender_id: str,
     body: str,
     extra: dict,
+    *,
+    received_at=None,
+    notify=True,
 ):
     """Create InboxMessage if it doesn't already exist (deduplication)."""
     from django.utils import timezone
 
-    from .tasks import _related_post_key
+    from .tasks import UNKNOWN_MESSAGE_TIMESTAMP, _is_outgoing_dm, _related_post_key, _safe_message_timestamp
+
+    platform_message_id = str(platform_message_id or "").strip()
+    if not platform_message_id:
+        return
+    if message_type == InboxMessage.MessageType.DM and _is_outgoing_dm(account, sender_id, extra):
+        return
+    if received_at is None:
+        received_at = UNKNOWN_MESSAGE_TIMESTAMP if message_type == InboxMessage.MessageType.DM else timezone.now()
 
     defaults = {
         "workspace": account.workspace,
@@ -434,7 +472,7 @@ def _create_if_new(
         "body": body,
         "sentiment": analyze_sentiment(body),
         "extra": extra,
-        "received_at": timezone.now(),
+        "received_at": _safe_message_timestamp(received_at),
     }
 
     # Link back to the post being commented on, matching what the poll does.
@@ -455,9 +493,15 @@ def _create_if_new(
         platform_message_id=platform_message_id,
         defaults=defaults,
     )
-    if created:
+    if created and notify:
         from .tasks import InboxSyncEngine
 
+        if obj.message_type == InboxMessage.MessageType.DM:
+            from apps.mcp.events import enqueue_inbox_event
+
+            # Keep the row and its event atomic so provider retries recover
+            # from a failed enqueue rather than becoming silent duplicates.
+            enqueue_inbox_event(obj)
         InboxSyncEngine()._notify_new_message(obj)
 
 

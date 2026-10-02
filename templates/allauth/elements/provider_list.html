@@ -1,7 +1,9 @@
 {% load allauth socialaccount %}
 {% get_providers as socialaccount_providers %}
 {% for provider in socialaccount_providers %}
+    {% if provider.id != "google" or auth_google_login_enabled %}
     {% provider_login_url provider process=process as href %}
     {% element provider id=provider.id name=provider.name href=href %}
     {% endelement %}
+    {% endif %}
 {% endfor %}

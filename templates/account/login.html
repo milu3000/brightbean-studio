@@ -45,7 +45,7 @@
         {% endif %}
 
         <!-- Social Login -->
-        {% if SOCIALACCOUNT_ENABLED %}
+        {% if SOCIALACCOUNT_ENABLED and auth_google_login_enabled %}
             {% get_providers as socialaccount_providers %}
             {% if socialaccount_providers %}
                 <div class="space-y-3 mb-6">
@@ -119,10 +119,14 @@
         {% endif %}
     </div>
 
+    {% if auth_public_signup_enabled or auth_invited_signup_enabled %}
     <!-- Footer link -->
     <p class="text-center text-sm mt-6" style="color: var(--text-secondary);">
         Don't have an account?
         <a href="{{ signup_url }}" class="font-semibold hover:underline" style="color: var(--primary);">Sign up</a>
     </p>
+    {% else %}
+    <p class="text-center text-sm mt-6" style="color: var(--text-secondary);">Accounts are by invitation. Ask your organization administrator for an invitation.</p>
+    {% endif %}
 </div>
 {% endblock %}

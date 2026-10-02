@@ -67,9 +67,14 @@ def _migrate(target: str) -> None:
 
 @pytest.fixture
 def restore_migrations():
-    """Leave the database at the migration head however the test ends."""
+    """Restore all migration heads, including apps depending on inbox history.
+
+    Rewinding inbox also unapplies dependent MCP outbox tables. Restoring only
+    inbox leaves the rest of the suite with missing tables and invalid cascades.
+    """
+    heads = MigrationExecutor(connection).loader.graph.leaf_nodes()
     yield
-    _migrate(_head())
+    MigrationExecutor(connection).migrate(heads)
 
 
 @pytest.mark.django_db(transaction=True)

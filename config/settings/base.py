@@ -90,6 +90,7 @@ MIDDLEWARE = [
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "allauth.account.middleware.AccountMiddleware",
     "apps.accounts.middleware.AuthRateLimitMiddleware",
+    "apps.accounts.middleware.GoogleLoginPolicyMiddleware",
     "apps.accounts.middleware.TosAcceptanceMiddleware",
     "django_htmx.middleware.HtmxMiddleware",
     "apps.members.middleware.RBACMiddleware",
@@ -111,6 +112,7 @@ TEMPLATES = [
                 "django.template.context_processors.request",
                 "django.contrib.auth.context_processors.auth",
                 "django.contrib.messages.context_processors.messages",
+                "apps.accounts.context_processors.auth_policy",
                 "apps.notifications.context_processors.unread_notification_count",
                 "apps.common.context_processors.sidebar_context",
                 "apps.onboarding.context_processors.onboarding_checklist",
@@ -252,7 +254,13 @@ DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 # Sites framework
 SITE_ID = 1
 
+# Authentication policy: secure fork defaults. Existing installations must run
+# `manage.py auth_preflight` and migrate Google-only users before disabling Google.
+AUTH_INVITE_ONLY = env.bool("AUTH_INVITE_ONLY", default=True)
+AUTH_GOOGLE_LOGIN_ENABLED = env.bool("AUTH_GOOGLE_LOGIN_ENABLED", default=False)
+
 # django-allauth
+ACCOUNT_FORMS = {"signup": "apps.accounts.forms.InvitationSignupForm"}
 ACCOUNT_LOGIN_METHODS = {"email"}
 ACCOUNT_SIGNUP_FIELDS = ["email*", "password1*"]
 ACCOUNT_EMAIL_VERIFICATION = "none"
@@ -697,3 +705,9 @@ if INTELLIGENCE_ENABLED:
                 f"localhost / 127.0.0.1 dev tunnels) — current value would "
                 f"leak Intelligence API keys in transit."
             )
+
+# Opt-in per-organization MCP push event subscriptions. An empty allowlist
+# intentionally disallows callback registration even when events are enabled.
+MCP_EVENTS_ENABLED = env.bool("MCP_EVENTS_ENABLED", default=False)
+MCP_EVENTS_ALLOWED_CALLBACK_HOSTS = env.list("MCP_EVENTS_ALLOWED_CALLBACK_HOSTS", default=[])
+MCP_EVENTS_SUBSCRIPTION_TTL_SECONDS = env.int("MCP_EVENTS_SUBSCRIPTION_TTL_SECONDS", default=86400)
