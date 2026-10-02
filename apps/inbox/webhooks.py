@@ -459,7 +459,15 @@ def _create_if_new(
     platform_message_id = str(platform_message_id or "").strip()
     if not platform_message_id:
         return
-    if message_type == InboxMessage.MessageType.DM and _is_outgoing_dm(account, sender_id, extra):
+    if message_type == InboxMessage.MessageType.DM:
+        from .locking import lock_dm_account
+
+        account = lock_dm_account(account.pk, account.workspace_id)
+        if account is None:
+            return
+    if message_type == InboxMessage.MessageType.DM and _is_outgoing_dm(
+        account, sender_id, extra, platform_message_id=platform_message_id
+    ):
         return
     if received_at is None:
         received_at = UNKNOWN_MESSAGE_TIMESTAMP if message_type == InboxMessage.MessageType.DM else timezone.now()

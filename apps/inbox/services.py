@@ -14,13 +14,14 @@ to live in ``apps/inbox/views.py``; it moved here verbatim.
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from django.db import transaction
 from django.utils import timezone
 
 from providers import get_provider
 
+from .locking import lock_dm_account
 from .models import InboxMessage, InboxReply, InboxSLAConfig
 
 logger = logging.getLogger(__name__)
@@ -41,6 +42,22 @@ _SENDABLE_STATUSES = {InboxReply.Status.DRAFT, InboxReply.Status.FAILED}
 
 class ReplyStateError(ValueError):
     """Raised when an operation is not valid for a reply's current status."""
+
+
+def validate_automated_reply_window(message: InboxMessage) -> None:
+    """Meta's HUMAN_AGENT exception is never available to an automated caller."""
+    if message.message_type != InboxMessage.MessageType.DM or message.social_account.platform not in {
+        "facebook",
+        "instagram",
+        "instagram_login",
+    }:
+        return
+    received_at = message.received_at
+    if not isinstance(received_at, datetime) or timezone.is_naive(received_at):
+        raise ReplyStateError("Automated Meta replies require a valid inbound message timestamp.")
+    age = timezone.now() - received_at
+    if age < timedelta(0) or age >= HUMAN_AGENT_AFTER:
+        raise ReplyStateError("Automated Meta replies are only allowed within 24 hours of the inbound message.")
 
 
 # ---------------------------------------------------------------------------
@@ -64,7 +81,7 @@ def reply_failure_reason(exc: Exception) -> str:
     return "the platform rejected it. Try again, or reconnect the account if this keeps happening."
 
 
-def _dispatch_to_platform(message: InboxMessage, body: str) -> str:
+def _dispatch_to_platform(message: InboxMessage, body: str, *, automated: bool = False) -> str:
     """Post ``body`` back to the platform and return the platform's reply ID.
 
     Raises if the platform refuses it, so the caller can avoid recording a
@@ -89,7 +106,11 @@ def _dispatch_to_platform(message: InboxMessage, body: str) -> str:
             extra=extra,
         )
     else:
-        overdue = timezone.now() - message.received_at > HUMAN_AGENT_AFTER
+        if automated:
+            # Recheck immediately before dispatch, including time spent acquiring
+            # locks or resolving credentials. Never label automation as a person.
+            validate_automated_reply_window(message)
+        overdue = not automated and timezone.now() - message.received_at > HUMAN_AGENT_AFTER
         result = provider.reply_to_message(
             access_token=account.oauth_access_token,
             message_id=message.platform_message_id,
@@ -162,18 +183,34 @@ def discard_reply_draft(reply: InboxReply) -> None:
     reply.delete()
 
 
-def send_reply_now(reply: InboxReply, *, actor=None) -> InboxReply:
+def send_reply_now(reply: InboxReply, *, actor=None, automated: bool = False) -> InboxReply:
     """Deliver an existing draft/failed reply to the platform.
 
     On a platform refusal the row is kept and moved to ``failed`` with a
     human-readable ``send_error`` so the team can retry; the underlying
     exception is re-raised for the caller to shape into its own error.
-    ``NotImplementedError`` (provider has no reply API) is not a failure —
-    the reply is recorded locally with an empty ``platform_reply_id``,
-    matching the pre-existing behaviour.
+    Automated callers must pass ``automated=True`` on every attempt, including
+    retries. They cannot use the human-only Meta reply extension, and an
+    unsupported provider is a failure. The explicit human UI keeps its legacy
+    local-record behavior for providers with no reply API.
     """
     failure = None
     with transaction.atomic():
+        # Always acquire a DM's account before its reply/message row. Ingestion
+        # takes the same account lock before testing known outbound IDs, so even
+        # an unmarked echo arriving during the send waits for our committed ID.
+        identity = (
+            InboxReply.objects.filter(pk=reply.pk)
+            .values("inbox_message__message_type", "inbox_message__social_account_id", "inbox_message__workspace_id")
+            .first()
+        )
+        locked_account = None
+        if identity and identity["inbox_message__message_type"] == InboxMessage.MessageType.DM:
+            locked_account = lock_dm_account(
+                identity["inbox_message__social_account_id"], identity["inbox_message__workspace_id"]
+            )
+            if locked_account is None:
+                raise ReplyStateError("The message account changed. Reload before sending.")
         # Keep the lock through delivery and persistence. Every competing send,
         # edit or discard must check the latest state after acquiring this lock.
         _lock_reply(reply)
@@ -181,18 +218,43 @@ def send_reply_now(reply: InboxReply, *, actor=None) -> InboxReply:
             raise ReplyStateError(f"A {reply.get_status_display().lower()} reply cannot be sent again.")
 
         message = reply.inbox_message
+        if locked_account is not None:
+            message = InboxMessage.objects.select_for_update().get(pk=reply.inbox_message_id)
+            if (
+                message.message_type != InboxMessage.MessageType.DM
+                or message.social_account_id != locked_account.pk
+                or message.workspace_id != locked_account.workspace_id
+            ):
+                raise ReplyStateError("The message account changed. Reload before sending.")
+            message.social_account = locked_account
+        elif message.message_type == InboxMessage.MessageType.DM:
+            raise ReplyStateError("The message changed. Reload before sending.")
+        if automated:
+            if message.social_account.connection_status != "connected":
+                raise ReplyStateError("The social account is not connected. Reconnect it before sending.")
+            validate_automated_reply_window(message)
         if actor is not None and reply.author_id is None:
             reply.author = actor
 
         try:
-            platform_reply_id = _dispatch_to_platform(message, reply.body)
-        except NotImplementedError:
-            logger.info(
-                "Provider %s cannot send replies; recording reply %s locally.",
-                message.social_account.platform,
-                reply.id,
+            platform_reply_id = (
+                _dispatch_to_platform(message, reply.body, automated=True)
+                if automated
+                else _dispatch_to_platform(message, reply.body)
             )
-            platform_reply_id = ""
+        except NotImplementedError as exc:
+            if automated:
+                reply.status = InboxReply.Status.FAILED
+                reply.send_error = "this platform does not support sending this reply."
+                reply.save(update_fields=["status", "send_error", "author", "updated_at"])
+                failure = exc
+            else:
+                logger.info(
+                    "Provider %s cannot send replies; recording reply %s locally.",
+                    message.social_account.platform,
+                    reply.id,
+                )
+                platform_reply_id = ""
         except Exception as exc:
             logger.exception("Failed to send inbox reply %s (%s)", reply.id, message.social_account.platform)
             reply.status = InboxReply.Status.FAILED

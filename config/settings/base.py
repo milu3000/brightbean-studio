@@ -708,6 +708,8 @@ if INTELLIGENCE_ENABLED:
 
 # Opt-in per-organization MCP push event subscriptions. An empty allowlist
 # intentionally disallows callback registration even when events are enabled.
+# Optional exact browser origins for MCP; absent Origin is allowed for server clients.
+MCP_ALLOWED_ORIGINS = env.list("MCP_ALLOWED_ORIGINS", default=[])
 MCP_EVENTS_ENABLED = env.bool("MCP_EVENTS_ENABLED", default=False)
 MCP_EVENTS_ALLOWED_CALLBACK_HOSTS = env.list("MCP_EVENTS_ALLOWED_CALLBACK_HOSTS", default=[])
 MCP_EVENTS_SUBSCRIPTION_TTL_SECONDS = env.int("MCP_EVENTS_SUBSCRIPTION_TTL_SECONDS", default=86400)

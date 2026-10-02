@@ -31,7 +31,7 @@ from typing import Any
 MCP_PROTOCOL_VERSION = "2025-03-26"
 
 SERVER_NAME = "brightbean-studio"
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "1.1.0"
 
 
 # ---------------------------------------------------------------------------
@@ -119,7 +119,7 @@ def dispatch(
     method = msg.get("method")
     if not isinstance(method, str):
         return make_error(msg.get("id"), INVALID_REQUEST, "Missing 'method'")
-    params = msg.get("params") or {}
+    params = msg.get("params", {})
     if not isinstance(params, dict):
         return make_error(msg.get("id"), INVALID_PARAMS, "'params' must be an object")
 

@@ -10,6 +10,7 @@ import hashlib
 import logging
 import uuid
 from datetime import timedelta
+from typing import Any
 
 from django.conf import settings
 from django.db import transaction
@@ -26,6 +27,7 @@ from apps.mcp.event_delivery import (
     verify_callback,
 )
 from apps.mcp.models import EventOutbox, EventSubscription
+from apps.mcp.modern import MODERN_PROTOCOL_VERSION  # noqa: F401 - backward-compatible import
 from apps.mcp.protocol import INVALID_PARAMS, METHOD_NOT_FOUND, JsonRpcError
 from apps.members.models import WorkspaceMembership
 from apps.social_accounts.models import SocialAccount
@@ -33,7 +35,6 @@ from apps.social_accounts.models import SocialAccount
 logger = logging.getLogger(__name__)
 EVENT_NAME = "inbox.dm.received"
 CALLBACK_ENDPOINT_ERROR = -32015
-MODERN_PROTOCOL_VERSION = "2026-07-28"
 VERIFICATION_CACHE_SECONDS = 300
 ROTATION_SECONDS = 300
 MAX_TTL_SECONDS = 86400
@@ -125,6 +126,56 @@ def _authorized_account(context, arguments):
     return account
 
 
+def _validate_params(params, method):
+    """Validate lifecycle field types before permissions or network operations.
+
+    maxAgeMs is typed but ignored for this emit-only event (cursor is null).
+    Unknown fields fail closed instead of silently widening a subscription.
+    """
+    properties: dict[str, Any] = {"_meta": {"type": "object"}}
+    if method == "list":
+        properties["cursor"] = {"type": "string"}
+        required = []
+    else:
+        properties.update(
+            {
+                "name": {"type": "string"},
+                "arguments": EVENT_DEFINITION["inputSchema"],
+                "delivery": {
+                    "type": "object",
+                    "properties": {
+                        "mode": {"const": "webhook"},
+                        "url": {"type": "string"},
+                        "secret": {"type": "string"},
+                    },
+                    "required": ["mode", "url"] + (["secret"] if method == "subscribe" else []),
+                    "additionalProperties": False,
+                },
+            }
+        )
+        required = ["name", "arguments", "delivery"]
+        if method == "subscribe":
+            properties.update(
+                {
+                    "cursor": {"type": ["string", "null"]},
+                    "ttlMs": {"type": ["integer", "null"], "minimum": 1, "maximum": 9007199254740991},
+                    "maxAgeMs": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+                }
+            )
+    try:
+        Draft202012Validator(
+            {
+                "type": "object",
+                "properties": properties,
+                "required": required,
+                "additionalProperties": False,
+            },
+            format_checker=FormatChecker(),
+        ).validate(params)
+    except ValidationError as exc:
+        raise JsonRpcError(INVALID_PARAMS, "Invalid event parameters") from exc
+
+
 def _identity_params(params, *, unsubscribing=False):
     if params.get("name") != EVENT_NAME:
         raise JsonRpcError(INVALID_PARAMS, "Unknown event")
@@ -152,6 +203,7 @@ def _subscription_id(principal, url, arguments):
 
 def list_events(params, context):
     _require_enabled()
+    _validate_params(params, "list")
     if params.get("cursor") is not None:
         raise JsonRpcError(INVALID_PARAMS, "Event catalog does not support pagination")
     credential = _credential(context)
@@ -167,6 +219,7 @@ def list_events(params, context):
 
 def subscribe(params, context):
     _require_enabled()
+    _validate_params(params, "subscribe")
     arguments, delivery, url = _identity_params(params)
     account = _authorized_account(context, arguments)
     credential = _credential(context)
@@ -264,6 +317,7 @@ def subscribe(params, context):
 
 
 def unsubscribe(params, context):
+    _validate_params(params, "unsubscribe")
     arguments, _delivery, url = _identity_params(params, unsubscribing=True)
     credential = _credential(context)
     # Cancellation remains available after an OAuth user's selected workspace

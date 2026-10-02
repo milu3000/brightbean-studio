@@ -21,6 +21,7 @@ from apps.mcp.protocol import (
     INVALID_PARAMS,
     METHOD_NOT_FOUND,
     PARSE_ERROR,
+    SERVER_VERSION,
 )
 from apps.members.models import (
     PERMISSION_KEYS,
@@ -219,7 +220,7 @@ class TestProtocolMechanics:
         assert body["result"] == {
             "protocolVersion": "2025-03-26",
             "capabilities": {"tools": {"listChanged": False}},
-            "serverInfo": {"name": "brightbean-studio", "version": "1.0.0"},
+            "serverInfo": {"name": "brightbean-studio", "version": SERVER_VERSION},
         }
         status, body = _post(client_with_token, _rpc("tools/list"))
         assert status == 200

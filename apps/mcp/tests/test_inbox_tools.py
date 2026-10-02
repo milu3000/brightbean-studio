@@ -224,7 +224,7 @@ class TestInboxReplyTools:
         with patch("apps.inbox.services._dispatch_to_platform", return_value="plat-1") as dispatch:
             _s, body = _call(full_client, "send_reply", {"reply_id": str(reply.id)})
         assert _result_json(body)["status"] == "sent"
-        dispatch.assert_called_once_with(message, "ready")
+        dispatch.assert_called_once_with(message, "ready", automated=True)
         assert message.replies.count() == 1
 
     def test_send_reply_create_and_send(self, full_client, message):
@@ -233,7 +233,7 @@ class TestInboxReplyTools:
         data = _result_json(body)
         assert data["status"] == "sent"
         assert data["platform_reply_id"] == "plat-2"
-        dispatch.assert_called_once_with(message, "yo")
+        dispatch.assert_called_once_with(message, "yo", automated=True)
         assert message.replies.count() == 1
 
     @pytest.mark.parametrize("extra_fields", [("message_id",), ("body",), ("message_id", "body")])

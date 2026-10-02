@@ -33,7 +33,11 @@ def process_delivery(delivery_id):
         sub = EventSubscription.objects.select_for_update().filter(pk=sub_id).first()
         if sub is None:
             return
-        delivery = EventOutbox.objects.select_for_update().select_related("message").filter(pk=delivery_id).first()
+        # Only lock the outbox row. Locking the joined message would invert
+        # ingestion's account/message -> outbox order while we hold the sub.
+        delivery = (
+            EventOutbox.objects.select_for_update(of=("self",)).select_related("message").filter(pk=delivery_id).first()
+        )
         now = timezone.now()
         if delivery is None or delivery.status != EventOutbox.Status.PENDING or delivery.next_attempt_at > now:
             return

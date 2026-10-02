@@ -118,6 +118,7 @@ def test_poll_skips_own_sender(inbox_account, sender):
     inbox_account.webhook_target_id = "linked-page"
     if sender == 123:
         inbox_account.account_platform_id = "123"
+    inbox_account.save(update_fields=["webhook_target_id", "account_platform_id"])
     with patch("apps.mcp.events.enqueue_inbox_event") as enqueue:
         InboxSyncEngine()._upsert_message(inbox_account, _polled(sender=sender))
     assert not InboxMessage.objects.exists()

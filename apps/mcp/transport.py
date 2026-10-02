@@ -21,7 +21,14 @@ from ninja import Router
 
 from apps.api.limits import enforce_http_rate_limits
 from apps.api.middleware import log_audit_entry
-from apps.mcp.events import MODERN_PROTOCOL_VERSION, events_enabled, list_events, subscribe, unsubscribe
+from apps.mcp.events import events_enabled, list_events, subscribe, unsubscribe
+from apps.mcp.modern import (
+    MODERN_PROTOCOL_VERSION,
+    complete_result,
+    modern_requested,
+    origin_allowed,
+    validate_request,
+)
 from apps.mcp.protocol import (
     INVALID_PARAMS,
     INVALID_REQUEST,
@@ -52,13 +59,10 @@ def _initialize(params: dict, context: dict[str, Any]) -> dict:
     ``Mcp-Session-Id`` because our bearer token already identifies the
     session — every authenticated request stands on its own.
     """
-    modern = events_enabled() and params.get("protocolVersion") == MODERN_PROTOCOL_VERSION
-    capabilities = {"tools": {"listChanged": False}}
-    if modern:
-        capabilities["events"] = {}
+    # initialize is legacy-only. A modern revision never has a handshake.
     return {
-        "protocolVersion": MODERN_PROTOCOL_VERSION if modern else MCP_PROTOCOL_VERSION,
-        "capabilities": capabilities,
+        "protocolVersion": MCP_PROTOCOL_VERSION,
+        "capabilities": {"tools": {"listChanged": False}},
         "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
     }
 
@@ -89,6 +93,8 @@ def _ping(params: dict, context: dict[str, Any]) -> dict:
 
 
 def _tools_list(params: dict, context: dict[str, Any]) -> dict:
+    if context.get("modern") and "cursor" in params:
+        raise JsonRpcError(INVALID_PARAMS, "Tool catalog does not support pagination")
     return {"tools": [t.to_mcp_dict() for t in all_tools()]}
 
 
@@ -99,7 +105,7 @@ def _tools_call(params: dict, context: dict[str, Any]) -> dict:
     tool = get_tool(name)
     if tool is None:
         raise JsonRpcError(INVALID_PARAMS, f"tools/call: unknown tool '{name}'")
-    arguments = params.get("arguments") or {}
+    arguments = params.get("arguments", {})
     if not isinstance(arguments, dict):
         raise JsonRpcError(INVALID_PARAMS, "tools/call: 'arguments' must be an object")
     # Validate against the tool's published ``inputSchema``. The schema
@@ -184,6 +190,9 @@ def mcp_endpoint(request: HttpRequest):
     Charging both up-front AND per-message would over-bill batches by
     one token, as Codex review flagged.
     """
+    if not origin_allowed(request):
+        return JsonResponse(make_error(None, INVALID_REQUEST, "Origin is not allowed"), status=403)
+
     context: dict[str, Any] = {
         "api_key": request.api_key,  # type: ignore[attr-defined]  # set by ApiKeyAuth
         "workspace": request.workspace,  # type: ignore[attr-defined]
@@ -192,14 +201,20 @@ def mcp_endpoint(request: HttpRequest):
     }
 
     try:
-        body = json.loads(request.body or b"null")
-    except json.JSONDecodeError:
+        body = json.loads(request.body or b"null", parse_constant=_reject_json_constant)
+    except (ValueError, UnicodeError, RecursionError):
         # Charge the bad-request as one HTTP-tier hit so a flood of
         # malformed bodies still trips the throttle.
         enforce_http_rate_limits(request, is_write=True)
         return JsonResponse(make_error(None, PARSE_ERROR, "Invalid JSON"), status=400)
 
-    # Batch.
+    # Feature-off rollout preserves the already deployed legacy fallback.
+    # Cancellation remains available with modern semantics after a rollback.
+    can_use_modern = events_enabled() or isinstance(body, dict) and body.get("method") == "events/unsubscribe"
+    if can_use_modern and modern_requested(body, request):
+        return _modern_endpoint(request, body, context)
+
+    # Batch (legacy only).
     if isinstance(body, list):
         if not body:
             enforce_http_rate_limits(request, is_write=True)
@@ -238,6 +253,40 @@ def mcp_endpoint(request: HttpRequest):
         make_error(None, INVALID_REQUEST, "Body must be a JSON object or array"),
         status=400,
     )
+
+
+def _reject_json_constant(value):
+    raise ValueError("Non-finite numbers are not valid JSON")
+
+
+def _modern_endpoint(request, body, context):
+    enforce_http_rate_limits(request, is_write=True)
+    try:
+        validate_request(body, request)
+    except JsonRpcError as exc:
+        message_id = body.get("id") if isinstance(body, dict) else None
+        response = make_error(message_id, exc.code, exc.message, exc.data)
+        _log_mcp_audit(request, body, status_code=400)
+        return JsonResponse(response, status=400)
+    # Modern has no initialize/initialized or JSON-RPC batch lifecycle. Never
+    # execute a request method from a notification (validated above).
+    modern_methods = {
+        key: value for key, value in METHODS.items() if key not in {"initialize", "notifications/initialized"}
+    }
+    response = dispatch(body, context | {"modern": True}, modern_methods)
+    if response is None:
+        _log_mcp_audit(request, body, status_code=202)
+        return HttpResponse(status=202)
+    if "result" in response:
+        response["result"] = complete_result(response["result"], body["method"])
+        status = 200
+    else:
+        code = response["error"]["code"]
+        status = 404 if code == METHOD_NOT_FOUND else 400 if code in {INVALID_PARAMS, INVALID_REQUEST} else 200
+    _log_mcp_audit(request, body, status_code=status)
+    result = JsonResponse(response, status=status)
+    result["Cache-Control"] = "private, no-store"
+    return result
 
 
 def _status_for_response(response: dict | None) -> int:
@@ -288,7 +337,8 @@ def _log_mcp_audit(request: HttpRequest, msg: dict, *, status_code: int) -> None
     method = msg.get("method", "unknown") if isinstance(msg, dict) else "unknown"
     action = f"mcp.{method}"
     if method == "tools/call":
-        tool_name = ((msg.get("params") or {}) if isinstance(msg, dict) else {}).get("name")
+        params = msg.get("params") if isinstance(msg, dict) else None
+        tool_name = params.get("name") if isinstance(params, dict) else None
         if isinstance(tool_name, str):
             action = f"mcp.tools/call:{tool_name}"
     log_audit_entry(request, action=action, target_id=None, status_code=status_code)

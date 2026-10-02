@@ -19,6 +19,7 @@ from providers import get_provider
 from providers.exceptions import ProviderError, QuotaExceededError, TokenExpiredError
 from providers.google_errors import google_error_reasons
 
+from .locking import lock_dm_account
 from .models import InboxMessage, InboxSLAConfig
 from .sentiment import analyze_sentiment
 
@@ -81,7 +82,7 @@ def _safe_message_timestamp(ts):
     if not isinstance(ts, datetime):
         return UNKNOWN_MESSAGE_TIMESTAMP
     if timezone.is_naive(ts):
-        ts = timezone.make_aware(ts, timezone.get_default_timezone())
+        return UNKNOWN_MESSAGE_TIMESTAMP
     if ts > timezone.now() + _PROVIDER_CLOCK_SKEW:
         return UNKNOWN_MESSAGE_TIMESTAMP
     return ts
@@ -92,9 +93,9 @@ def _is_recent(ts):
     return _safe_message_timestamp(ts) >= timezone.now() - INBOX_BACKLOG_NOTIFY_WINDOW
 
 
-def _is_outgoing_dm(account, sender_id, extra):
+def _is_outgoing_dm(account, sender_id, extra, *, platform_message_id=None):
     """Defend both ingestion paths against our own replies and provider echoes."""
-    extra = extra or {}
+    extra = extra if isinstance(extra, dict) else {}
     message = extra.get("message") or {}
     if (
         extra.get("is_echo")
@@ -109,7 +110,20 @@ def _is_outgoing_dm(account, sender_id, extra):
     sender_ids = [sender_id, extra.get("sender_id")]
     if isinstance(sender, dict):
         sender_ids.append(sender.get("id"))
-    return any(str(value) in own_ids for value in sender_ids if value is not None)
+    if any(str(value) in own_ids for value in sender_ids if value is not None):
+        return True
+    if platform_message_id:
+        from .models import InboxReply
+
+        # Some echoes omit direction/own-sender markers. A provider ID returned
+        # by our send path is authoritative, but only within this same account.
+        return InboxReply.objects.filter(
+            inbox_message__workspace_id=account.workspace_id,
+            inbox_message__social_account_id=account.pk,
+            platform_reply_id=str(platform_message_id),
+            status=InboxReply.Status.SENT,
+        ).exists()
+    return False
 
 
 def _related_post_key(extra: dict | None) -> str:
@@ -534,7 +548,13 @@ class InboxSyncEngine:
         message_id = str(msg.platform_message_id or "").strip()
         if not message_id:
             return
-        if msg.message_type == InboxMessage.MessageType.DM and _is_outgoing_dm(account, msg.sender_id, msg.extra):
+        if msg.message_type == InboxMessage.MessageType.DM:
+            account = lock_dm_account(account.pk, account.workspace_id)
+            if account is None:
+                return
+        if msg.message_type == InboxMessage.MessageType.DM and _is_outgoing_dm(
+            account, msg.sender_id, msg.extra, platform_message_id=message_id
+        ):
             return
         defaults = {
             "workspace": account.workspace,
@@ -549,10 +569,16 @@ class InboxSyncEngine:
         if related_post_id:
             defaults["related_post_id"] = related_post_id
 
+        create_defaults = dict(defaults)
+        if msg.message_type == InboxMessage.MessageType.DM:
+            # Duplicate polls must not rewrite the original inbound timestamp
+            # and accidentally reopen the automated-reply window.
+            defaults.pop("received_at")
         obj, created = InboxMessage.objects.update_or_create(
             social_account=account,
             platform_message_id=message_id,
             defaults=defaults,
+            create_defaults=create_defaults,
         )
         if created:
             obj.sentiment = analyze_sentiment(obj.body)

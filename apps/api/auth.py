@@ -300,6 +300,9 @@ def _resolve_oauth_actor(token: str) -> OAuthMcpActor | None:
         # WARNING: a token row with no user is a data anomaly, not normal traffic.
         LOG.warning("Bearer auth rejected: OAuth access token %s is not bound to a user.", tok.pk)
         return None
+    if not tok.user.is_active:
+        LOG.info("Bearer auth rejected: OAuth user %s is inactive.", tok.user_id)
+        return None
     # is_valid([scope]) == (not is_expired()) and allow_scopes([scope]); split so the
     # log names whether expiry or scope was the cause.
     if tok.is_expired():

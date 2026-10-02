@@ -35,6 +35,7 @@ from apps.inbox.services import (
     discard_reply_draft,
     send_reply_now,
     update_reply_draft,
+    validate_automated_reply_window,
 )
 from apps.mcp.protocol import INVALID_PARAMS, JsonRpcError
 from apps.mcp.tools import Tool, register_tool
@@ -1554,12 +1555,13 @@ def _send_reply(args: dict, context: dict[str, Any]) -> dict:
             )
         message = _get_inbox_message_for_key(api_key, args["message_id"])
         try:
+            validate_automated_reply_window(message)
             reply = create_reply_draft(message=message, body=args["body"], author=actor)
         except ValueError as exc:
             raise JsonRpcError(INVALID_PARAMS, str(exc)) from exc
 
     try:
-        send_reply_now(reply, actor=actor)
+        send_reply_now(reply, actor=actor, automated=True)
     except ReplyStateError as exc:
         raise JsonRpcError(INVALID_PARAMS, str(exc)) from exc
     except Exception as exc:  # platform refused it — reply is left in "failed"
@@ -1575,7 +1577,9 @@ register_tool(
             "Deliver a reply to an inbox message's platform. Either pass `reply_id` to send an "
             "existing draft, or `message_id` + `body` to create and send in one step. On a "
             "platform refusal the reply is kept in `failed` state (retry with the same reply_id) "
-            "and an error is returned. Requires the reply_from_inbox permission."
+            "and an error is returned. Automated Meta DMs require a known original inbound "
+            "timestamp less than 24 hours old; HUMAN_AGENT is never used. Requires the "
+            "reply_from_inbox permission."
         ),
         input_schema={
             "type": "object",

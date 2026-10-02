@@ -438,11 +438,19 @@ class TestOutbox:
 class TestTransport:
     def rpc(self, context, method, params=None):
         client = Client(HTTP_AUTHORIZATION=context["request"].META["HTTP_AUTHORIZATION"])
+        params = dict(params or {})
+        headers = {}
+        if method != "initialize":
+            from apps.mcp.modern import CAPABILITIES_KEY, MODERN_PROTOCOL_VERSION, VERSION_KEY
+
+            params["_meta"] = {VERSION_KEY: MODERN_PROTOCOL_VERSION, CAPABILITIES_KEY: {}}
+            headers = {"HTTP_MCP_PROTOCOL_VERSION": MODERN_PROTOCOL_VERSION, "HTTP_MCP_METHOD": method}
         response = client.post(
             "/api/v1/mcp/",
-            json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params or {}}),
+            json.dumps({"jsonrpc": "2.0", "id": 1, "method": method, "params": params}),
             content_type="application/json",
             secure=True,
+            **headers,
         )
         assert response.status_code == 200
         return response.json()
@@ -452,18 +460,18 @@ class TestTransport:
         assert result["protocolVersion"] == "2025-03-26"
         assert "events" not in result["capabilities"]
 
-    def test_modern_discover_and_initialize(self, context):
+    def test_modern_discover_and_legacy_initialize(self, context):
         result = self.rpc(context, "server/discover")["result"]
         assert "2026-07-28" in result["supportedVersions"]
         assert result["capabilities"]["events"] == {}
         result = self.rpc(context, "initialize", {"protocolVersion": "2026-07-28"})["result"]
-        assert result["protocolVersion"] == "2026-07-28"
-        assert "events" in result["capabilities"]
+        assert result["protocolVersion"] == "2025-03-26"
+        assert "events" not in result["capabilities"]
 
     def test_event_methods_auth_and_dispatch(self, context, params, verify):
         assert self.rpc(context, "events/list")["result"]["events"]
         assert self.rpc(context, "events/subscribe", params)["result"]["id"].startswith("sub_")
-        assert self.rpc(context, "events/unsubscribe", params)["result"] == {}
+        assert self.rpc(context, "events/unsubscribe", params)["result"]["resultType"] == "complete"
 
     def test_feature_disabled_not_advertised(self, context, settings):
         settings.MCP_EVENTS_ENABLED = False
