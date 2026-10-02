@@ -21,6 +21,16 @@
 
 ---
 
+## Fork customizations
+
+This branch adds invitation-only email/password registration and optional MCP Events for new inbound DMs. Google application sign-in is disabled by default; Google Business Profile and YouTube publishing connections are unaffected. MCP Events remain disabled until their callback configuration and staging acceptance tests are approved.
+
+- [Authentication policy and Google-only account migration](docs/invite-only-auth.md)
+- [MCP Events protocol, security, deployment and mock tests](docs/MCP_EVENTS.md)
+- [Weekly upstream maintenance and regression checklist](docs/MAINTAINING_FORK.md)
+
+Read these guides before deploying over an existing installation. This fork's defaults differ from the upstream documentation below.
+
 ## About BrightBean Studio
 
 BrightBean Studio is an open-source, self-hostable social media management platform built for creators, agencies and SMBs. It does what Sendible, SocialPilot, or ContentStudio do, but free and without per-seat, per-channel, or per-workspace limits. Plan, compose, schedule, approve, publish, and monitor content across Facebook, Instagram, LinkedIn, TikTok, YouTube, Pinterest, Threads, Bluesky, Google Business Profile, Mastodon, and DEV.to from a single multi-workspace dashboard.
