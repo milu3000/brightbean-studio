@@ -17,7 +17,7 @@ from django.core.management import call_command
 from django.core.management.base import CommandError
 from django.test import RequestFactory, override_settings
 from django.urls import include, path, reverse
-from django.utils import timezone
+from django.utils import timezone, translation
 
 from apps.accounts.adapters import AccountAdapter, SocialAccountAdapter
 from apps.accounts.middleware import GoogleLoginPolicyMiddleware
@@ -75,12 +75,21 @@ class TestInviteOnlySignup:
         assert b"Invitation required" in response.content
         assert not User.objects.exists()
 
-    def test_login_ui_hides_signup_and_google(self, client):
-        response = client.get("/accounts/login/")
+    @pytest.mark.parametrize("language", ["en", "zh-hant"])
+    def test_login_ui_hides_signup_and_google(self, client, language):
+        with translation.override(language):
+            response = client.get("/accounts/login/")
         assert response.status_code == 200
         assert b"Continue with Google" not in response.content
         assert b">Sign up</a>" not in response.content
-        assert b"Accounts are by invitation" in response.content
+        assert b"Accounts are by invitation" not in response.content
+        assert b"Sign in to BrightBean Studio |" not in response.content
+        assert b"Social media scheduling" not in response.content
+        assert b"<title>Sign in" in response.content
+        assert b'alt="BrightBean Studio logo"' in response.content
+        assert b'for="id_login"' in response.content
+        assert b'for="id_password"' in response.content
+        assert b'type="password"' in response.content
         assert b"Forgot your password?" in response.content
 
     def test_valid_invitation_prefills_email_and_creates_only_invited_membership(self, client, invitation):

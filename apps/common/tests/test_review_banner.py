@@ -1,9 +1,6 @@
-"""Sidebar Trustpilot card — who sees it, and how long a dismissal lasts.
+"""Review solicitations stay removed across pages, workspaces, and logins.
 
-The card asks for a review only once the user has something worth reviewing (a
-connected channel in any of their workspaces), and closing it — or clicking
-through to Trustpilot — hides it for the rest of that login only: the dismissal
-is a timestamp on the user, and the next login's ``last_login`` overtakes it.
+The legacy dismissal field/endpoint remain for schema and old-page compatibility.
 """
 
 import tempfile
@@ -24,7 +21,7 @@ from apps.organizations.models import Organization
 from apps.social_accounts.models import SocialAccount
 from apps.workspaces.models import Workspace
 
-# The card's class also appears in base.html's pre-paint CSS, so match its copy.
+# Neither copy, link, nor script trigger may remain in rendered pages.
 BANNER = "Enjoying BrightBean?"
 TRUSTPILOT_URL = "https://www.trustpilot.com/review/brightbean.xyz"
 
@@ -70,23 +67,23 @@ class ReviewBannerTests(TestCase):
         self._connect(self.ws, status=SocialAccount.ConnectionStatus.DISCONNECTED)
         self.assertNotContains(self._workspace_page(), BANNER)
 
-    def test_shown_with_a_connected_channel(self):
+    def test_hidden_with_a_connected_channel(self):
         self._connect(self.ws)
         resp = self._workspace_page()
-        self.assertContains(resp, BANNER)
-        self.assertContains(resp, f'href="{TRUSTPILOT_URL}" target="_blank"')
-        self.assertContains(resp, reverse("accounts:dismiss_review_banner"))
+        self.assertNotContains(resp, BANNER)
+        self.assertNotContains(resp, TRUSTPILOT_URL)
+        self.assertNotContains(resp, reverse("accounts:dismiss_review_banner"))
 
-    def test_channel_in_another_workspace_counts(self):
+    def test_hidden_with_a_channel_in_another_workspace(self):
         other = self._make_workspace("Other")
         self._connect(other)
-        self.assertContains(self._workspace_page(self.ws), BANNER)
+        self.assertNotContains(self._workspace_page(self.ws), BANNER)
 
-    def test_shown_on_pages_without_a_workspace(self):
+    def test_hidden_on_pages_without_a_workspace(self):
         self._connect(self.ws)
         resp = self.client.get(reverse("accounts:settings"))
         self.assertEqual(resp.status_code, 200)
-        self.assertContains(resp, BANNER)
+        self.assertNotContains(resp, BANNER)
 
     def test_dismiss_hides_it_for_the_rest_of_the_login(self):
         self._connect(self.ws)
@@ -97,12 +94,18 @@ class ReviewBannerTests(TestCase):
         self.assertNotContains(self._workspace_page(), BANNER)
         self.assertNotContains(self.client.get(reverse("accounts:settings")), BANNER)
 
-    def test_next_login_brings_it_back(self):
+    def test_next_login_does_not_bring_it_back(self):
         self._connect(self.ws)
         self.client.post(reverse("accounts:dismiss_review_banner"))
         self.client.get(reverse("accounts:logout"))
         self.client.force_login(self.user)
-        self.assertContains(self._workspace_page(), BANNER)
+        self.assertNotContains(self._workspace_page(), BANNER)
+
+    def test_context_has_no_review_banner_trigger(self):
+        self._connect(self.ws)
+        response = self._workspace_page()
+        self.assertNotIn("show_review_banner", response.context)
+        self.assertNotContains(response, "sidebar-review-banner")
 
     def test_dismiss_requires_post(self):
         resp = self.client.get(reverse("accounts:dismiss_review_banner"))
