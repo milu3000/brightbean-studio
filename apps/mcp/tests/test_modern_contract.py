@@ -334,3 +334,40 @@ def test_mocked_inbound_delivery_fetch_reply_and_echo_lifecycle(context, params,
     assert EventOutbox.objects.count() == 1
     notify.assert_not_called()
     assert rpc(context, "events/unsubscribe", params).status_code == 200
+
+
+@pytest.mark.parametrize("id_value", [None, True, False, [], {}, 1.2])
+def test_invalid_request_ids_use_official_error_schema(context, id_value):
+    response = rpc(context, "ping", id_=id_value)
+    assert response.status_code == 400
+    assert "id" not in response.json()
+    Draft202012Validator({**SCHEMA, "$ref": "#/$defs/JSONRPCErrorResponse"}).validate(response.json())
+
+
+def test_batch_error_uses_official_error_schema(context):
+    response = rpc(context, "ping", body=[{"jsonrpc": "2.0", "id": 1, "method": "ping"}])
+    assert response.status_code == 400
+    assert "id" not in response.json()
+    Draft202012Validator({**SCHEMA, "$ref": "#/$defs/JSONRPCErrorResponse"}).validate(response.json())
+
+
+@pytest.mark.parametrize("notification", [False, True])
+def test_disabled_modern_requests_cannot_fall_through_and_execute(context, settings, notification):
+    settings.MCP_EVENTS_ENABLED = False
+    body = {
+        "jsonrpc": "2.0",
+        "method": "tools/call",
+        "params": {"name": "send_reply", "arguments": {}, "_meta": {VERSION_KEY: "2099-01-01", CAPABILITIES_KEY: {}}},
+    }
+    if not notification:
+        body["id"] = 1
+    with patch("apps.mcp.transport.dispatch") as dispatch:
+        response = rpc(
+            context,
+            "tools/call",
+            headers={"HTTP_MCP_NAME": "wrong", "HTTP_MCP_PROTOCOL_VERSION": "2099-01-01"},
+            body=body,
+        )
+    assert response.status_code == 400
+    dispatch.assert_not_called()
+    Draft202012Validator({**SCHEMA, "$ref": "#/$defs/JSONRPCErrorResponse"}).validate(response.json())

@@ -436,7 +436,7 @@ class TestOutbox:
 
 @pytest.mark.django_db
 class TestTransport:
-    def rpc(self, context, method, params=None):
+    def rpc(self, context, method, params=None, *, expected_status=200):
         client = Client(HTTP_AUTHORIZATION=context["request"].META["HTTP_AUTHORIZATION"])
         params = dict(params or {})
         headers = {}
@@ -452,7 +452,7 @@ class TestTransport:
             secure=True,
             **headers,
         )
-        assert response.status_code == 200
+        assert response.status_code == expected_status
         return response.json()
 
     def test_legacy_initialize_unchanged(self, context):
@@ -476,7 +476,7 @@ class TestTransport:
     def test_feature_disabled_not_advertised(self, context, settings):
         settings.MCP_EVENTS_ENABLED = False
         assert self.rpc(context, "server/discover")["error"]["code"] == -32601
-        assert self.rpc(context, "events/list")["error"]["code"] == -32601
+        assert self.rpc(context, "events/list", expected_status=400)["error"]["code"] == -32601
 
 
 @pytest.mark.django_db

@@ -24,6 +24,7 @@ from apps.mcp.protocol import (
     SERVER_NAME,
     SERVER_VERSION,
     JsonRpcError,
+    make_error,
 )
 
 MODERN_PROTOCOL_VERSION = "2026-07-28"
@@ -161,3 +162,12 @@ def complete_result(result: dict, method: str) -> dict:
         # Avoid stale permission/config snapshots or cache sharing across users.
         result.update(ttlMs=0, cacheScope="private")
     return result
+
+
+def error_response(body, code, message, data=None):
+    """Modern error envelopes omit an unavailable/invalid request identifier."""
+    message_id = body.get("id") if isinstance(body, dict) else None
+    response = make_error(message_id, code, message, data)
+    if isinstance(message_id, bool) or not isinstance(message_id, (str, int)):
+        response.pop("id")
+    return response

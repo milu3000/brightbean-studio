@@ -25,6 +25,7 @@ from apps.mcp.events import events_enabled, list_events, subscribe, unsubscribe
 from apps.mcp.modern import (
     MODERN_PROTOCOL_VERSION,
     complete_result,
+    error_response,
     modern_requested,
     origin_allowed,
     validate_request,
@@ -191,7 +192,7 @@ def mcp_endpoint(request: HttpRequest):
     one token, as Codex review flagged.
     """
     if not origin_allowed(request):
-        return JsonResponse(make_error(None, INVALID_REQUEST, "Origin is not allowed"), status=403)
+        return JsonResponse(error_response(None, INVALID_REQUEST, "Origin is not allowed"), status=403)
 
     context: dict[str, Any] = {
         "api_key": request.api_key,  # type: ignore[attr-defined]  # set by ApiKeyAuth
@@ -206,13 +207,26 @@ def mcp_endpoint(request: HttpRequest):
         # Charge the bad-request as one HTTP-tier hit so a flood of
         # malformed bodies still trips the throttle.
         enforce_http_rate_limits(request, is_write=True)
-        return JsonResponse(make_error(None, PARSE_ERROR, "Invalid JSON"), status=400)
+        error = (
+            error_response(None, PARSE_ERROR, "Invalid JSON")
+            if modern_requested(None, request)
+            else make_error(None, PARSE_ERROR, "Invalid JSON")
+        )
+        return JsonResponse(error, status=400)
 
-    # Feature-off rollout preserves the already deployed legacy fallback.
+    # Feature-off rollout preserves the already deployed discover fallback,
+    # but must never execute other modern requests through legacy semantics.
     # Cancellation remains available with modern semantics after a rollback.
-    can_use_modern = events_enabled() or isinstance(body, dict) and body.get("method") == "events/unsubscribe"
-    if can_use_modern and modern_requested(body, request):
-        return _modern_endpoint(request, body, context)
+    if modern_requested(body, request):
+        method = body.get("method") if isinstance(body, dict) else None
+        if events_enabled() or method == "events/unsubscribe":
+            return _modern_endpoint(request, body, context)
+        if method != "server/discover":
+            enforce_http_rate_limits(request, is_write=True)
+            _log_mcp_audit(request, body, status_code=400)
+            return JsonResponse(
+                error_response(body, METHOD_NOT_FOUND, "Modern MCP is disabled; use legacy initialize"), status=400
+            )
 
     # Batch (legacy only).
     if isinstance(body, list):
@@ -264,8 +278,7 @@ def _modern_endpoint(request, body, context):
     try:
         validate_request(body, request)
     except JsonRpcError as exc:
-        message_id = body.get("id") if isinstance(body, dict) else None
-        response = make_error(message_id, exc.code, exc.message, exc.data)
+        response = error_response(body, exc.code, exc.message, exc.data)
         _log_mcp_audit(request, body, status_code=400)
         return JsonResponse(response, status=400)
     # Modern has no initialize/initialized or JSON-RPC batch lifecycle. Never
