@@ -43,6 +43,8 @@ An intermediate concurrent mypy invocation crashed within django-stubs. A subseq
 
 ## Publication state
 
-The fork and remote customization branch were created and verified. At report time, the remote branch still points to the upstream baseline: the completed implementation is in the accompanying local commit, patch and source package. The cloud GitHub browser upload route timed out repeatedly and its next upload waited for approval for approximately 21 minutes. No partial application-code change was committed remotely, no PR was opened, and no deployment occurred. Do not treat the fork branch URL alone as the completed implementation until its tree/commit is verified after upload.
+The full implementation is published to the `milu/invite-only-mcp-events` branch of `milu3000/brightbean-studio`. Draft PR: https://github.com/milu3000/brightbean-studio/pull/1 . The upstream-tracking `main` branch is unchanged; nothing is merged or deployed.
 
-Apply the delivered patch to the exact baseline or fetch the accompanying Git bundle, then run the documented gates and open a draft PR in this fork. Do not merge or deploy without the separate approved rollout.
+The authenticated publishing identity was `milu3000`. The original browser commits are preserved without force push. Implementation commit `4d4dcc0edc4c9113ca08c39b72e70e58e272c777` was read back from GitHub and its tree equals the tested local tree `add5fdc4295bdf5dffaddfaf187b797965a8b392`. Later changes to this report are documentation-only. The requested `mics8128` collaborator has accepted write access; administrative access was not granted.
+
+The source package includes a baseline-applicable patch, a Git bundle and the full tracked source, without credentials or private data. The patch is verified by applying it to the baseline and comparing the resulting Git tree. GitHub workflow state is reported on the PR separately; passing local tests is not a claim of deployed or live-provider verification.
