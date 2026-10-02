@@ -194,7 +194,7 @@ def send_reply_now(reply: InboxReply, *, actor=None, automated: bool = False) ->
     unsupported provider is a failure. The explicit human UI keeps its legacy
     local-record behavior for providers with no reply API.
     """
-    failure = None
+    failure: Exception | None = None
     with transaction.atomic():
         # Always acquire a DM's account before its reply/message row. Ingestion
         # takes the same account lock before testing known outbound IDs, so even
