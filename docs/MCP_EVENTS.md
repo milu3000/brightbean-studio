@@ -122,7 +122,7 @@ or deviations from the user's SOP.
    tools. Do not claim that disabling the flag deletes existing subscriptions:
    they remain stored until unsubscribe or the expiry cleanup can run again.
 
-The root automation owner must preserve the user's exact reply authority,
+The automation owner must preserve the user's exact reply authority,
 recipient/account scope, and semantic conditions. The server emits identifiers
 only; it does not itself choose or send the assistant's reply.
 

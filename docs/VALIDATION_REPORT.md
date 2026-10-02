@@ -1,3 +1,33 @@
+# MCP 2.0 and automated inbox safety update (2026-10-02)
+
+This section supersedes the historical initial-build report below for the Events
+wire contract and programmatic inbox sending behavior. Production activation is
+not implied by a source or test result.
+
+## Scope and verification
+
+- Dual-era MCP transport: modern per-request version/capability metadata, mirrored
+  HTTP headers (including encoded names), typed results, private cache hints,
+  origin checks, and preserved legacy fallback
+- Event lifecycle parameter validation and a mocked complete subscribe → inbound
+  ingestion → outbox delivery → authoritative fetch → reply → no echo → cancel flow
+- Dated official MCP core schemas are vendored with upstream licensing notices;
+  locally authored Events tests are not represented as official certification
+- Programmatic MCP and REST Meta DM replies reject unknown/future/expired original
+  timestamps, never claim HUMAN_AGENT, and reject disconnected accounts
+- Inactive/archived principals are rejected even after API-key cache warming
+- DM poll timestamps are immutable; same-account outbound IDs and PostgreSQL row
+  locks suppress unmarked echoes racing a successful send response
+- Unsupported automated sends remain failures, not locally fabricated success
+
+All provider and callback traffic in tests is mocked. No live credentials,
+callback grants, subscriptions, customer messages or external replies are created.
+A genuine user-approved inbound event → assistant wake → authorized response
+cycle, plugin capability refresh, and callback access approval remain live gates.
+See [MCP_EVENTS.md](MCP_EVENTS.md) for rollout, rollback and uncertainty handling.
+
+## Historical initial build
+
 # Validation report — 2026-10-02 UTC
 
 ## Scope
