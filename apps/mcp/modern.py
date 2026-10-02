@@ -47,7 +47,12 @@ _META_VALIDATOR = Draft202012Validator(
 def modern_requested(body, request: HttpRequest) -> bool:
     """Recognize modern intent, including incomplete metadata (fail closed)."""
     if isinstance(body, list):
-        return any(modern_requested(item, request) for item in body)
+        header = request.headers.get("MCP-Protocol-Version")
+        return (
+            header is not None
+            and header != MCP_PROTOCOL_VERSION
+            or any(modern_requested(item, request) for item in body)
+        )
     params = body.get("params") if isinstance(body, dict) else None
     meta = params.get("_meta") if isinstance(params, dict) else None
     has_protocol_meta = isinstance(meta, dict) and any(key.startswith(META_PREFIX) for key in meta)

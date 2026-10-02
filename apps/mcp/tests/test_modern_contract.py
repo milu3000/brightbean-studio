@@ -344,8 +344,9 @@ def test_invalid_request_ids_use_official_error_schema(context, id_value):
     Draft202012Validator({**SCHEMA, "$ref": "#/$defs/JSONRPCErrorResponse"}).validate(response.json())
 
 
-def test_batch_error_uses_official_error_schema(context):
-    response = rpc(context, "ping", body=[{"jsonrpc": "2.0", "id": 1, "method": "ping"}])
+@pytest.mark.parametrize("body", [[], [{"jsonrpc": "2.0", "id": 1, "method": "ping"}]])
+def test_batch_error_uses_official_error_schema(context, body):
+    response = rpc(context, "ping", body=body)
     assert response.status_code == 400
     assert "id" not in response.json()
     Draft202012Validator({**SCHEMA, "$ref": "#/$defs/JSONRPCErrorResponse"}).validate(response.json())
