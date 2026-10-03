@@ -253,7 +253,9 @@ def subscribe(params, context):
             # branch. Echo its normalized HOST only, never the callback path,
             # query, signing key, or configured allowlist. This is a candidate,
             # not verified ownership or permission to change the allowlist.
-            details.update(candidateHost=urlsplit(url).hostname, requiresApproval=True)
+            candidate_host = urlsplit(url).hostname
+            details.update(candidateHost=candidate_host, requiresApproval=True)
+            logger.warning("MCP_EVENT_CALLBACK_HOST_REJECTED candidateHost=%s requiresApproval=true", candidate_host)
         raise JsonRpcError(CALLBACK_ENDPOINT_ERROR, "Callback endpoint rejected", details) from exc
     sub_id = _subscription_id(credential["principal"], url, arguments)
     now = timezone.now()

@@ -7,8 +7,10 @@ import pytest
 from django.test import Client
 from django.utils import timezone
 
+from apps.mcp import events
 from apps.mcp.models import EventSubscription
 from apps.mcp.modern import CAPABILITIES_KEY, MODERN_PROTOCOL_VERSION, VERSION_KEY
+from apps.mcp.protocol import JsonRpcError
 from apps.mcp.tests import test_events
 from apps.mcp.tests.test_modern_contract import rpc
 from apps.social_accounts.models import SocialAccount
@@ -19,6 +21,11 @@ enabled = test_events.enabled
 params = test_events.params
 verify = test_events.verify
 pytestmark = pytest.mark.django_db
+LOG_MARKER = "MCP_EVENT_CALLBACK_HOST_REJECTED"
+
+
+def diagnostic_messages(caplog):
+    return [record.getMessage() for record in caplog.records if record.name == "apps.mcp.events"]
 
 
 @pytest.fixture(autouse=True)
@@ -26,7 +33,9 @@ def unconfigured(settings):
     settings.MCP_EVENTS_ALLOWED_CALLBACK_HOSTS = ["private-configured.example.test"]
 
 
-def test_hint_is_only_normalized_candidate_host(context, params, verify, settings):
+@pytest.mark.parametrize("allowlist", [[], ["private-configured.example.test"]])
+def test_hint_is_only_normalized_candidate_host(context, params, verify, settings, caplog, allowlist):
+    settings.MCP_EVENTS_ALLOWED_CALLBACK_HOSTS = allowlist
     params["delivery"]["url"] = "https://CALLBACK.EXAMPLE.TEST:443/private-path-token?token=private-query-token"
     with patch("socket.getaddrinfo") as dns, patch("apps.mcp.transport._log_mcp_audit") as audit:
         response = rpc(context, "events/subscribe", params)
@@ -40,6 +49,7 @@ def test_hint_is_only_normalized_candidate_host(context, params, verify, setting
         "requiresApproval": True,
     }
     serialized = response.content.decode()
+    assert diagnostic_messages(caplog) == [f"{LOG_MARKER} candidateHost=callback.example.test requiresApproval=true"]
     for forbidden in (
         "https://",
         ":443",
@@ -49,7 +59,11 @@ def test_hint_is_only_normalized_candidate_host(context, params, verify, setting
         "private-configured",
     ):
         assert forbidden not in serialized
-    assert settings.MCP_EVENTS_ALLOWED_CALLBACK_HOSTS == ["private-configured.example.test"]
+        assert forbidden not in caplog.text
+    assert context["request"].META["HTTP_AUTHORIZATION"] not in caplog.text
+    for private_id in (context["workspace"].pk, context["account"].pk, context["api_key"].pk):
+        assert str(private_id) not in caplog.text
+    assert allowlist == settings.MCP_EVENTS_ALLOWED_CALLBACK_HOSTS
     assert not EventSubscription.objects.exists()
     verify.assert_not_called()
     dns.assert_not_called()
@@ -67,7 +81,7 @@ def test_hint_is_only_normalized_candidate_host(context, params, verify, setting
         "https://callback.example.test\\@private-host.test/path",
     ],
 )
-def test_malformed_or_sensitive_url_not_reflected(context, params, verify, url):
+def test_malformed_or_sensitive_url_not_reflected(context, params, verify, url, caplog):
     params["delivery"]["url"] = url
     response = rpc(context, "events/subscribe", params)
     error = response.json()["error"]
@@ -75,6 +89,7 @@ def test_malformed_or_sensitive_url_not_reflected(context, params, verify, url):
     assert "candidateHost" not in response.content.decode()
     assert "private-" not in response.content.decode()
     assert test_events.SECRET not in response.content.decode()
+    assert not diagnostic_messages(caplog)
     verify.assert_not_called()
 
 
@@ -89,7 +104,7 @@ def test_malformed_or_sensitive_url_not_reflected(context, params, verify, url):
         "archived_workspace",
     ],
 )
-def test_no_hint_without_current_scope(context, params, verify, state):
+def test_no_hint_without_current_scope(context, params, verify, state, caplog):
     if state in {"foreign_workspace", "unallowed_account"}:
         workspace = context["workspace"]
         if state == "foreign_workspace":
@@ -118,12 +133,13 @@ def test_no_hint_without_current_scope(context, params, verify, state):
     assert "candidateHost" not in response.content.decode()
     assert "callback.example.test" not in response.content.decode()
     assert "private-configured" not in response.content.decode()
+    assert not diagnostic_messages(caplog)
     assert not EventSubscription.objects.exists()
     verify.assert_not_called()
 
 
 @pytest.mark.parametrize("invalid", ["secret", "metadata", "event_name"])
-def test_hint_requires_valid_subscribe_request(context, params, verify, invalid):
+def test_hint_requires_valid_subscribe_request(context, params, verify, invalid, caplog):
     kwargs = {}
     if invalid == "secret":
         params["delivery"]["secret"] = "not-a-signing-key"
@@ -134,11 +150,12 @@ def test_hint_requires_valid_subscribe_request(context, params, verify, invalid)
     response = rpc(context, "events/subscribe", params, **kwargs)
     assert response.status_code == 400
     assert "candidateHost" not in response.content.decode()
+    assert not diagnostic_messages(caplog)
     assert not EventSubscription.objects.exists()
     verify.assert_not_called()
 
 
-def test_unauthenticated_request_has_no_callback_diagnostics(params):
+def test_unauthenticated_request_has_no_callback_diagnostics(params, caplog):
     body = {
         "jsonrpc": "2.0",
         "id": 1,
@@ -154,5 +171,24 @@ def test_unauthenticated_request_has_no_callback_diagnostics(params):
         HTTP_MCP_METHOD="events/subscribe",
     )
     assert response.status_code == 401
+    assert not diagnostic_messages(caplog)
     for forbidden in ("candidateHost", "callback.example.test", "private-configured", test_events.SECRET):
         assert forbidden not in response.content.decode()
+
+
+def test_legacy_rejection_does_not_log_candidate(context, params, verify, caplog):
+    with pytest.raises(JsonRpcError) as raised:
+        events.subscribe(params, context)
+    assert raised.value.data == {"reason": "callback_host_not_allowed"}
+    assert not diagnostic_messages(caplog)
+    assert not EventSubscription.objects.exists()
+    verify.assert_not_called()
+
+
+def test_allowed_host_does_not_log_candidate(context, params, verify, settings, caplog):
+    settings.MCP_EVENTS_ALLOWED_CALLBACK_HOSTS = ["callback.example.test"]
+    response = rpc(context, "events/subscribe", params)
+    assert "result" in response.json()
+    assert not diagnostic_messages(caplog)
+    assert EventSubscription.objects.count() == 1
+    verify.assert_called_once()

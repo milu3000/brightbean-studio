@@ -52,6 +52,14 @@ change occurs. The host is **unverified and unapproved**: confirm it came from t
 intended platform setup, verify the destination, and obtain the required approval
 before configuring it. There is no assumed fixed OpenAI callback hostname.
 
+The same authorized rejection emits a warning with the fixed marker
+`MCP_EVENT_CALLBACK_HOST_REJECTED`, `candidateHost=<normalized hostname>`, and
+`requiresApproval=true`. This allows operators to inspect the candidate when a
+client hides the RPC error. The log omits the URL path/query, signing secret,
+credentials, account identifiers, and configured allowlist. Malformed,
+unauthenticated, unauthorized, legacy, and allowed-host requests do not emit
+this diagnostic. A logged candidate is not verified ownership or approval.
+
 Optional `MCP_EVENTS_SUBSCRIPTION_TTL_SECONDS` lowers the default granted TTL. The code still caps grants to 24 hours and credential expiry. No callback is sent merely by enabling the feature or migrating an empty database.
 
 ## Delivery and recovery
