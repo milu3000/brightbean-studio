@@ -496,11 +496,28 @@ def _create_if_new(
         if related_id:
             defaults["related_post_id"] = related_id
 
+    if message_type == InboxMessage.MessageType.DM:
+        from providers.meta_inbox_content import is_deleted_content, merge_message_extra
+
+        defaults["extra"] = merge_message_extra({}, extra)
+        if is_deleted_content(defaults["extra"]):
+            # An unknown withdrawal is a silent tombstone, not a fresh inbound
+            # message. Retaining it prevents delayed deliveries resurrecting it.
+            defaults["status"] = InboxMessage.Status.ARCHIVED
+            defaults["received_at"] = UNKNOWN_MESSAGE_TIMESTAMP
+            defaults["body"] = ""
+            notify = False
     obj, created = InboxMessage.objects.get_or_create(
         social_account=account,
         platform_message_id=platform_message_id,
         defaults=defaults,
     )
+    if not created and message_type == InboxMessage.MessageType.DM:
+        # Account lock above serializes webhook/poll/send. Enrichment is not a
+        # new arrival: never change status/time or replay notifications/events.
+        obj.extra = merge_message_extra(obj.extra, extra)
+        obj.body = "" if is_deleted_content(obj.extra) else body or obj.body
+        obj.save(update_fields=["extra", "body"])
     if created and notify:
         from .tasks import InboxSyncEngine
 

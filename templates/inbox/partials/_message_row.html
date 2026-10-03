@@ -38,7 +38,7 @@
             {% endif %}
             <span class="text-[11px] text-stone-400 ml-auto flex-shrink-0" title="{{ message.received_at|date:'N j, Y g:i A' }}">{{ message.received_at|timesince }} ago</span>
         </div>
-        <p class="inbox-row-preview text-[12px] text-stone-500 truncate leading-snug">{{ message.body|truncatewords:20 }}</p>
+        <p class="inbox-row-preview text-[12px] text-stone-500 truncate leading-snug">{{ message.content_preview|truncatewords:20 }}</p>
         <div class="flex items-center gap-1.5 mt-1.5">
             <!-- Type badge -->
             <span class="badge-pill badge-type">{{ message.get_message_type_display }}</span>

@@ -18,6 +18,7 @@ from apps.social_accounts.models import SocialAccount
 from providers import get_provider
 from providers.exceptions import ProviderError, QuotaExceededError, TokenExpiredError
 from providers.google_errors import google_error_reasons
+from providers.meta_inbox_content import is_deleted_content, merge_message_extra
 
 from .locking import lock_dm_account
 from .models import InboxMessage, InboxSLAConfig
@@ -569,6 +570,17 @@ class InboxSyncEngine:
         if related_post_id:
             defaults["related_post_id"] = related_post_id
 
+        if msg.message_type == InboxMessage.MessageType.DM:
+            previous = InboxMessage.objects.filter(social_account=account, platform_message_id=message_id).first()
+            defaults["extra"] = merge_message_extra(previous.extra if previous else {}, msg.extra)
+            if is_deleted_content(defaults["extra"]):
+                if previous is None:
+                    defaults["status"] = InboxMessage.Status.ARCHIVED
+                    defaults["received_at"] = UNKNOWN_MESSAGE_TIMESTAMP
+                    notify = False
+                defaults["body"] = ""
+            elif previous and not msg.text:
+                defaults["body"] = previous.body
         create_defaults = dict(defaults)
         if msg.message_type == InboxMessage.MessageType.DM:
             # Duplicate polls must not rewrite the original inbound timestamp

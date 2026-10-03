@@ -10,6 +10,12 @@ from .base import SocialProvider
 from .exceptions import APIError, OAuthError, ProviderError, PublishError
 from .meta_accounts import fetch_me_accounts, page_can_publish
 from .meta_comments import parse_graph_time
+from .meta_inbox_content import (
+    BASIC_MESSAGE_FIELDS,
+    CONTENT_MESSAGE_FIELDS,
+    polled_message_extra,
+    request_with_content_fields,
+)
 from .meta_insights import fetch_insights_safe, parse_insights_response
 from .meta_messaging import build_send_payload, resolve_recipient_id
 from .meta_oauth import facebook_login_params
@@ -884,11 +890,12 @@ class FacebookProvider(SocialProvider):
         messages: list[InboxMessage] = []
         for convo in conversations:
             convo_id = convo["id"]
-            msg_resp = self._request(
-                "GET",
+            msg_resp = request_with_content_fields(
+                self._request,
                 f"{BASE_URL}/{convo_id}/messages",
                 access_token=access_token,
-                params={"fields": "id,message,from,created_time"},
+                params={"fields": CONTENT_MESSAGE_FIELDS},
+                basic_fields=BASIC_MESSAGE_FIELDS,
             )
             for msg in msg_resp.json().get("data", []):
                 sender = msg.get("from", {})
@@ -907,7 +914,7 @@ class FacebookProvider(SocialProvider):
                         timestamp=datetime.fromisoformat(msg["created_time"].replace("+0000", "+00:00")),
                         message_type="dm",
                         # sender_id is the PSID the Send API needs to reply.
-                        extra={"conversation_id": convo_id, "sender_id": sender_id},
+                        extra=polled_message_extra(msg, conversation_id=convo_id, sender_id=sender_id),
                     )
                 )
         return messages

@@ -727,6 +727,21 @@ class InboxReplyResponse(Schema):
         )
 
 
+class AttachmentResponse(Schema):
+    """Safe, normalized metadata for an inbound attachment or shared item.
+
+    Media may expire or require a platform login; ``available`` only means
+    the platform supplied a usable link, not that its contents were fetched.
+    Raw provider payloads and internal attachment IDs are never exposed.
+    """
+
+    type: Literal["image", "video", "audio", "file", "share", "unknown"] = "unknown"
+    url: str = Field("", description="Safe HTTPS link to open the attachment or shared content, if supplied.")
+    title: str = ""
+    preview_url: str = Field("", description="Safe Meta-hosted image preview URL, if supplied. May expire.")
+    availability: Literal["available", "unavailable"] = "unavailable"
+
+
 class InboxMessageResponse(Schema):
     """An inbound comment / mention / DM / review in the unified inbox."""
 
@@ -740,6 +755,9 @@ class InboxMessageResponse(Schema):
     sender_name: str
     sender_handle: str = ""
     body: str
+    content_type: Literal["text", "attachment", "mixed", "unknown"] = "unknown"
+    content_preview: str = Field("", description="Message text or a truthful label for non-text content.")
+    attachments: list[AttachmentResponse] = Field(default_factory=list)
     related_post_id: uuid.UUID | None = None
     received_at: dt.datetime
     created_at: dt.datetime
@@ -769,6 +787,9 @@ class InboxMessageResponse(Schema):
             sender_name=message.sender_name,
             sender_handle=message.sender_handle or "",
             body=message.body or "",
+            content_type=message.content_type,
+            content_preview=message.content_preview,
+            attachments=message.attachments,
             related_post_id=message.related_post_id,
             received_at=message.received_at,
             created_at=message.created_at,

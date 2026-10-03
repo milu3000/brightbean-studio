@@ -25,6 +25,12 @@ from .meta_comments import (
     find_own_instagram_comment,
     resolve_comment_reply_target,
 )
+from .meta_inbox_content import (
+    BASIC_MESSAGE_FIELDS,
+    CONTENT_MESSAGE_FIELDS,
+    polled_message_extra,
+    request_with_content_fields,
+)
 from .meta_insights import fetch_insights_safe
 from .meta_messaging import build_send_payload, resolve_recipient_id
 from .types import (
@@ -578,15 +584,16 @@ class InstagramLoginProvider(SocialProvider):
         )
 
     def _fetch_direct_messages(self, access_token: str, since: datetime | None = None) -> list[InboxMessage]:
-        params: dict = {"fields": "id,participants,messages{id,message,from,created_time}"}
+        params: dict = {"fields": f"id,participants,messages{{{CONTENT_MESSAGE_FIELDS}}}"}
         if since:
             params["since"] = int(since.timestamp())
 
-        resp = self._request(
-            "GET",
+        resp = request_with_content_fields(
+            self._request,
             f"{API_BASE}/me/conversations",
             access_token=access_token,
             params=params,
+            basic_fields=f"id,participants,messages{{{BASIC_MESSAGE_FIELDS}}}",
         )
         conversations = resp.json().get("data", [])
 
@@ -611,7 +618,7 @@ class InstagramLoginProvider(SocialProvider):
                         timestamp=datetime.fromisoformat(msg["created_time"].replace("+0000", "+00:00")),
                         message_type="dm",
                         # sender_id is the IGSID the messaging endpoint replies to.
-                        extra={"conversation_id": convo["id"], "sender_id": sender_id},
+                        extra=polled_message_extra(msg, conversation_id=convo["id"], sender_id=sender_id),
                     )
                 )
         return messages

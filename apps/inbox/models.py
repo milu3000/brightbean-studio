@@ -119,6 +119,26 @@ class InboxMessage(models.Model):
         return f"{self.get_message_type_display()} from {self.sender_name}"
 
     @property
+    def attachments(self):
+        from providers.meta_inbox_content import normalize_attachments
+
+        return normalize_attachments(self.extra)
+
+    @property
+    def content_type(self):
+        if self.attachments:
+            return "mixed" if self.body else "attachment"
+        return "text" if self.body else "unknown"
+
+    @property
+    def content_preview(self):
+        if self.body:
+            return self.body
+        labels = {"share": "Shared content", "image": "Photo", "video": "Video", "audio": "Audio", "file": "File"}
+        attachments = self.attachments
+        return labels.get(attachments[0]["type"], "Non-text message") if attachments else "Non-text message"
+
+    @property
     def platform(self):
         return self.social_account.platform
 
