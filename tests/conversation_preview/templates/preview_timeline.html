@@ -1,0 +1,41 @@
+<!doctype html>
+<html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>{{ current.label }} · BrightBean 只讀預覽</title>{% include "preview_style.html" %}</head>
+<body>
+<a class="skip" href="#timeline">跳至對話紀錄</a>
+<header><div class="top"><div class="brand">BrightBean <span>Conversation V2</span></div><span class="pill">本地合成資料 · 只讀預覽</span></div></header>
+<main class="shell">
+<p class="eyebrow">一個工作項目，加上可核對的脈絡</p>
+<h1>{{ current.label }}</h1><p class="intro">{{ current.description }}</p>
+<nav class="scenarios" aria-label="合成情境">{% for item in navigation %}<a href="{{ item.url }}" {% if current.key == item.key %}aria-current="page"{% endif %}>{{ item.label }}</a>{% endfor %}</nav>
+<div class="notice">所有內容都是匿名合成資料。此頁只讀，不會發送訊息或改變工作狀態。</div>
+<div class="layout">
+<aside class="side" aria-label="工作項目與回覆流程">
+<section class="panel"><div class="panel-head"><p class="eyebrow">EXISTING WORK ITEM</p><h2>既有收件工作</h2></div><div class="panel-body">
+<div class="stack"><strong>匿名對象</strong><span class="tag">DM</span><span class="tag">{{ work.status }}</span></div>
+<p class="work-body">{{ work.body }}</p>{% if work.text_truncated %}<p class="small">文字已截斷</p>{% endif %}
+<p class="meta">原始時間 {{ work.received_at|date:"Y-m-d H:i:s" }} UTC<br>{% if platform == 'instagram_login' %}Instagram{% elif platform == 'facebook' %}Facebook{% else %}平台未知{% endif %}</p>
+<div class="divider"></div><p class="small">仍是同一個工作項目。閱讀對話不會標為已讀、解決或建立新工作。</p></div>
+</section>
+<section class="panel"><div class="panel-head"><p class="eyebrow">OBSERVED COORDINATION</p><h2>新回覆流程狀態</h2></div><div class="panel-body">
+<p class="status">{{ coordination.label }}</p><p class="small">{{ coordination.operation }}</p>
+{% if coordination.state %}<dl><dt>世代 / 對話版本</dt><dd>{{ coordination.state.generation }} / {{ coordination.state.revision }}</dd><dt>最新回覆目標</dt><dd>{% if coordination.latest_deleted %}內容已撤回{% elif coordination.latest_id %}已記錄於本地{% else %}尚無可驗證目標{% endif %}</dd><dt>版本是否相符</dt><dd>{{ coordination.state.revision_matches|yesno:"相符,不相符" }}</dd></dl>
+{% if coordination.state.history_gap %}<p class="small"><span class="tag warn">歷史有缺口</span></p>{% endif %}{% if coordination.state.identity_quarantined %}<p class="small"><span class="tag warn">身分隔離中</span></p>{% endif %}{% if coordination.state.ordering_uncertain %}<p class="small"><span class="tag warn">順序未確認</span></p>{% endif %}
+{% if coordination.state.due_at %}<p class="small">本地等待時間 {{ coordination.state.due_at|date:"H:i:s" }} UTC；不是排程承諾或發送授權</p>{% endif %}{% endif %}
+<div class="divider"></div><p class="small">「暫停」只代表新回覆流程；其他自動回覆流程與 IG／FB 原生 App 仍可能發送。本頁沒有發送或暫停控制。</p>
+</div></section>
+<section class="panel"><div class="panel-body"><h3>資料涵蓋程度</h3><dl><dt>帳號 DM 觀測</dt><dd>{{ sync.status }}</dd><dt>歷史覆蓋</dt><dd>{{ sync.coverage }}</dd></dl>{% if sync.last_success_at %}<p class="small">上次成功觀測 {{ sync.last_success_at|date:"Y-m-d H:i:s" }} UTC</p>{% endif %}<p class="small">帳號層級觀測不代表整段對話最新或完整；沒有傳出紀錄也不能證明尚未回覆。</p></div></section>
+</aside>
+<section class="panel" id="timeline" aria-label="已保存的對話紀錄">
+<div class="panel-head"><div class="stack"><h2>已保存的對話紀錄</h2><span class="tag">只讀</span></div><p class="small">{{ identity_label }}</p></div>
+<div class="limit">依首次觀測時間由新到舊排列 · 每頁最多 {{ page_size }} 則<details><summary>資料範圍說明</summary><p>觀測順序不一定是平台發送順序。每則最多 {{ text_limit }} 字、{{ attachment_limit }} 個附件；超過會標示截斷。</p><p>分頁固定新觀測的截止點，不凍結既有內容的更正。身分、權限或對話歸屬改變時，分頁會失效。</p></details></div>
+{% if messages %}<ol class="messages">{% for message in messages %}
+<li class="message {{ message.direction }}"><div class="stack"><span class="tag {% if message.direction == 'outbound' %}out{% endif %}">{{ message.direction_label }}</span><strong>{{ message.author }}</strong>{% if message.latest_target %}<span class="tag target">{% if message.deleted %}原目標（已撤回）{% else %}最新回覆目標{% endif %}</span>{% endif %}</div>
+{% if message.deleted %}<p class="message-body">內容已撤回，文字與附件不再顯示</p>{% elif message.body %}<p class="message-body">{{ message.body }}</p>{% elif not message.attachments %}<p class="message-body">沒有可顯示的文字或附件資料</p>{% endif %}
+{% for attachment in message.attachments %}<div class="attachment"><strong>{{ attachment.title }}</strong><p>{{ attachment.kind }} · {{ attachment.availability }}</p><p>預覽不載入遠端媒體或開啟附件網址</p></div>{% endfor %}
+{% if message.text_truncated %}<p class="small"><span class="tag warn">文字已截斷：僅顯示前 {{ text_limit }} 字</span></p>{% endif %}{% if message.attachments_truncated %}<p class="small"><span class="tag warn">附件已截斷：僅顯示前 {{ attachment_limit }} 個</span></p>{% endif %}
+<p class="meta">原始時間 {% if message.occurred_at %}<time datetime="{{ message.occurred_at|date:'c' }}">{{ message.occurred_at|date:"Y-m-d H:i:s" }}</time> UTC{% else %}未知{% endif %}<br>首次觀測 {{ message.first_seen_at|date:"Y-m-d H:i:s" }} UTC · 來源 {{ message.sources }}<br>{{ message.delivery }}{% if message.direction == 'outbound' %} · 不推定作者身分或工作已解決{% endif %}</p>
+</li>{% endfor %}</ol>{% else %}<div class="empty"><h3>尚無可顯示的對話紀錄</h3><p>這個工作項目仍存在，但沒有可確認歸屬的歷史。這不代表平台上沒有其他訊息或回覆。</p></div>{% endif %}
+<div class="boundary">{% if next_cursor %}<a href="?cursor={{ next_cursor|urlencode }}">查看更早的本地觀測 →</a><p>還有較早紀錄未顯示；此按鈕不會向平台補抓歷史</p>{% else %}<p>已到此頁可讀的本地紀錄邊界，並不代表平台歷史完整</p>{% endif %}<a href="{{ current.url }}">回到此情境第一頁</a></div>
+</section></div>
+<p class="footer">觀測限制：原生端活動可能延遲出現；傳出不等於已送達、不代表回覆了哪一則訊息，也不會自動解決工作。此預覽不提供即時或完整歷史保證。</p>
+</main></body></html>
