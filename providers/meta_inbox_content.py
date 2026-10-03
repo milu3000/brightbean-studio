@@ -242,9 +242,79 @@ def merge_message_extra(existing: object, incoming: object) -> dict:
     return merged
 
 
-def polled_message_extra(message: dict, *, conversation_id: str, sender_id: str) -> dict:
-    """Preserve only needed Graph attachment metadata and existing reply addressing."""
+def _provider_id(value: object) -> str:
+    """Keep opaque provider IDs intact; never coerce objects into identities."""
+    if isinstance(value, bool) or not isinstance(value, str | int):
+        return ""
+    value = str(value)
+    return value if value and len(value) <= 255 and not any(char.isspace() for char in value) else ""
+
+
+def _identity_ids(value: object) -> list[str] | None:
+    """Read a complete, small identity list, preserving ambiguity as unknown."""
+    if isinstance(value, dict):
+        if _dict(value.get("paging")).get("next"):
+            return None
+        value = value.get("data")
+    if not isinstance(value, list) or len(value) > 100:
+        return None
+    ids = [_provider_id(item.get("id") if isinstance(item, dict) else item) for item in value]
+    if any(not item for item in ids) or len(set(ids)) != len(ids):
+        return None
+    return ids
+
+
+def _polled_message_identity(message: dict, *, own_id: str, sender_id: str, participant_ids: object) -> dict:
+    """Project only proven one-to-one addressing, never handles or time proximity."""
+    own_id, sender_id = _provider_id(own_id), _provider_id(sender_id)
+    extra: dict = {}
+    if own_id and sender_id == own_id:
+        extra["direction"] = "outbound"
+
+    participants = _identity_ids(participant_ids) if participant_ids is not None else []
+    if participants is None:
+        return extra
+    # A known group cannot be converted to one-to-one by a message's `to` edge.
+    if len(participants) > 2:
+        extra["participant_ids"] = participants
+        return extra
+    if not sender_id:
+        return extra
+
+    recipients = _identity_ids(message["to"]) if "to" in message else None
+    if "to" in message and (recipients is None or len(recipients) != 1):
+        return extra
+    recipient_id = recipients[0] if recipients else ""
+    if recipient_id:
+        if recipient_id == sender_id or (own_id and own_id not in (sender_id, recipient_id)):
+            return extra
+        if participants and set(participants) != {sender_id, recipient_id}:
+            return extra
+    elif len(participants) == 2 and own_id in participants and sender_id in participants:
+        recipient_id = next(item for item in participants if item != sender_id)
+
+    if recipient_id:
+        if participants:
+            extra["participant_ids"] = participants
+        # `recipient_id` is the legacy reply target, not the message addressee.
+        extra["message_recipient_id"] = recipient_id
+    return extra
+
+
+def polled_message_extra(
+    message: dict,
+    *,
+    conversation_id: str,
+    sender_id: str,
+    own_id: str | None = None,
+    participant_ids: object = None,
+) -> dict:
+    """Preserve content/reply addressing and optional verified history identities."""
     extra = {"conversation_id": conversation_id, "sender_id": sender_id}
+    if own_id is not None:
+        extra.update(
+            _polled_message_identity(message, own_id=own_id, sender_id=sender_id, participant_ids=participant_ids)
+        )
     for field in ("attachments", "shares", "story", "is_deleted", "is_unsupported"):
         if field in message:
             extra[field] = message[field]

@@ -713,3 +713,6 @@ MCP_ALLOWED_ORIGINS = env.list("MCP_ALLOWED_ORIGINS", default=[])
 MCP_EVENTS_ENABLED = env.bool("MCP_EVENTS_ENABLED", default=False)
 MCP_EVENTS_ALLOWED_CALLBACK_HOSTS = env.list("MCP_EVENTS_ALLOWED_CALLBACK_HOSTS", default=[])
 MCP_EVENTS_SUBSCRIPTION_TTL_SECONDS = env.int("MCP_EVENTS_SUBSCRIPTION_TTL_SECONDS", default=86400)
+
+# Additive, read-only conversation history rollout; legacy inbox stays unchanged.
+INBOX_CONVERSATION_V2_ENABLED = env.bool("INBOX_CONVERSATION_V2_ENABLED", default=False)

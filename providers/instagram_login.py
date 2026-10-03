@@ -553,11 +553,23 @@ class InstagramLoginProvider(SocialProvider):
         """
         messages: list[InboxMessage] = []
         failures: list[Exception] = []
+        self.last_inbox_stream_results = {}
 
         for label, fetch in (("DM", self._fetch_direct_messages), ("comment", self._fetch_media_comments)):
+            stream = label.lower()
             try:
                 messages.extend(fetch(access_token, since))
+                self.last_inbox_stream_results[stream] = {
+                    "status": "success",
+                    "coverage": "partial",
+                    "error_code": "",
+                }
             except Exception as exc:
+                self.last_inbox_stream_results[stream] = {
+                    "status": "failed",
+                    "coverage": "unknown",
+                    "error_code": "provider_error",
+                }
                 failures.append(exc)
                 logger.warning("Instagram Login %s poll failed: %s", label, exc)
 
@@ -584,7 +596,11 @@ class InstagramLoginProvider(SocialProvider):
         )
 
     def _fetch_direct_messages(self, access_token: str, since: datetime | None = None) -> list[InboxMessage]:
-        params: dict = {"fields": f"id,participants,messages{{{CONTENT_MESSAGE_FIELDS}}}"}
+        from django.conf import settings
+
+        conversation_v2 = getattr(settings, "INBOX_CONVERSATION_V2_ENABLED", False)
+        identity_fields = ",to" if conversation_v2 else ""
+        params: dict = {"fields": f"id,participants,messages{{{CONTENT_MESSAGE_FIELDS}{identity_fields}}}"}
         if since:
             params["since"] = int(since.timestamp())
 
@@ -593,7 +609,7 @@ class InstagramLoginProvider(SocialProvider):
             f"{API_BASE}/me/conversations",
             access_token=access_token,
             params=params,
-            basic_fields=f"id,participants,messages{{{BASIC_MESSAGE_FIELDS}}}",
+            basic_fields=f"id,participants,messages{{{BASIC_MESSAGE_FIELDS}{identity_fields}}}",
         )
         conversations = resp.json().get("data", [])
 
@@ -606,8 +622,9 @@ class InstagramLoginProvider(SocialProvider):
                 sender_id = str(sender.get("id", ""))
                 # A conversation contains both sides. Without this the account's
                 # own replies come back on the next poll as fresh inbound DMs,
-                # re-notifying the team and restarting their SLA clock.
-                if own_id and sender_id == own_id:
+                # re-notifying the team and restarting their SLA clock. V2 keeps
+                # them for the history ledger; the sync engine separates them.
+                if own_id and sender_id == own_id and not conversation_v2:
                     continue
                 messages.append(
                     InboxMessage(
@@ -618,7 +635,13 @@ class InstagramLoginProvider(SocialProvider):
                         timestamp=datetime.fromisoformat(msg["created_time"].replace("+0000", "+00:00")),
                         message_type="dm",
                         # sender_id is the IGSID the messaging endpoint replies to.
-                        extra=polled_message_extra(msg, conversation_id=convo["id"], sender_id=sender_id),
+                        extra=polled_message_extra(
+                            msg,
+                            conversation_id=convo["id"],
+                            sender_id=sender_id,
+                            own_id=str(self.credentials.get("ig_user_id") or "") if conversation_v2 else None,
+                            participant_ids=convo.get("participants") if conversation_v2 else None,
+                        ),
                     )
                 )
         return messages

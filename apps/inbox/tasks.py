@@ -114,7 +114,20 @@ def _is_outgoing_dm(account, sender_id, extra, *, platform_message_id=None):
     if any(str(value) in own_ids for value in sender_ids if value is not None):
         return True
     if platform_message_id:
-        from .models import InboxReply
+        from .conversations import enabled
+        from .models import ConversationMessage, InboxReply
+
+        if (
+            enabled()
+            and ConversationMessage.objects.filter(
+                workspace_id=account.workspace_id,
+                social_account_id=account.pk,
+                platform=account.platform,
+                platform_message_id=str(platform_message_id),
+                direction=ConversationMessage.Direction.OUTBOUND,
+            ).exists()
+        ):
+            return True
 
         # Some echoes omit direction/own-sender markers. A provider ID returned
         # by our send path is authoritative, but only within this same account.
@@ -347,6 +360,9 @@ class InboxSyncEngine:
 
         deep = self._deep_sweep_due(account) and self._claim_deep_sweep(budget)
         poll_started_at = timezone.now()
+        from .conversations import begin_sync, finish_sync
+
+        conversation_attempt = begin_sync(account, started_at=poll_started_at)
         # The sweep exists to find what the routine poll's early exit missed —
         # which is, by definition, older than the newest message already
         # imported. Reusing that high-water mark as ``since`` would filter those
@@ -379,14 +395,37 @@ class InboxSyncEngine:
             else:
                 messages = provider.get_messages(access_token=account.oauth_access_token, since=since)
         except NotImplementedError:
+            finish_sync(
+                account,
+                started_at=conversation_attempt,
+                stream_results=getattr(provider, "last_inbox_stream_results", None),
+                imported=True,
+                error_code="unsupported",
+            )
             return
         except QuotaExceededError as exc:
+            finish_sync(
+                account,
+                started_at=conversation_attempt,
+                stream_results=getattr(provider, "last_inbox_stream_results", None),
+                imported=True,
+                error_code="provider_error",
+            )
             # Must precede ProviderError: QuotaExceededError subclasses
             # RateLimitError, so the broader clause would swallow it and the
             # next poll five minutes later would spend another doomed request.
             quota.trip_from_exception(account.platform, credential, exc, cache=quota_cache)
             return
         except ProviderError as exc:
+            # A provider may raise because one stream failed after the other
+            # succeeded with zero messages. Preserve that explicit empty result.
+            finish_sync(
+                account,
+                started_at=conversation_attempt,
+                stream_results=getattr(provider, "last_inbox_stream_results", None),
+                imported=True,
+                error_code="provider_error",
+            )
             status, reason = _provider_failure_details(exc)
             logger.warning(
                 "get_messages() failed for account %s (%s): status=%s reason=%s",
@@ -398,6 +437,13 @@ class InboxSyncEngine:
             self._mark_polled(account)
             return
         except Exception:
+            finish_sync(
+                account,
+                started_at=conversation_attempt,
+                stream_results=getattr(provider, "last_inbox_stream_results", None),
+                imported=True,
+                error_code="provider_error",
+            )
             logger.exception(
                 "get_messages() failed for account %s (%s)",
                 account.id,
@@ -413,6 +459,7 @@ class InboxSyncEngine:
             self._record_spend(provider, account, spend)
 
         if messages is None:
+            finish_sync(account, started_at=conversation_attempt, error_code="provider_error")
             self._mark_polled(account)
             return
         if account.platform == "youtube":
@@ -420,20 +467,30 @@ class InboxSyncEngine:
 
         related_posts = resolve_related_posts(account, messages)
 
-        for msg in messages:
-            # Suppress notifications for the historical backlog pulled the first
-            # time we see a message type, but still alert for genuinely recent
-            # messages: a long-quiet account's first real message also looks like
-            # a backlog, so a blanket mute would silently swallow it.
-            # backfill_inbox seeds explicit history silently (notify=False).
-            is_backlog = msg.message_type not in seen_types
-            notify_new = (not is_backlog or _is_recent(msg.timestamp)) and id(msg) not in history_message_ids
-            self._upsert_message(
-                account,
-                msg,
-                notify=notify_new,
-                related_post_id=related_posts.get(_related_post_key(msg.extra)),
-            )
+        try:
+            for msg in messages:
+                # Suppress notifications for the historical backlog pulled the first
+                # time we see a message type, but still alert for genuinely recent
+                # messages: a long-quiet account's first real message also looks like
+                # a backlog, so a blanket mute would silently swallow it.
+                # backfill_inbox seeds explicit history silently (notify=False).
+                is_backlog = msg.message_type not in seen_types
+                notify_new = (not is_backlog or _is_recent(msg.timestamp)) and id(msg) not in history_message_ids
+                self._upsert_message(
+                    account,
+                    msg,
+                    notify=notify_new,
+                    related_post_id=related_posts.get(_related_post_key(msg.extra)),
+                )
+        except Exception:
+            finish_sync(account, started_at=conversation_attempt, error_code="import_error")
+            raise
+        finish_sync(
+            account,
+            started_at=conversation_attempt,
+            stream_results=getattr(provider, "last_inbox_stream_results", None),
+            imported=True,
+        )
 
         self._mark_polled(
             account,
@@ -550,13 +607,26 @@ class InboxSyncEngine:
         if not message_id:
             return
         if msg.message_type == InboxMessage.MessageType.DM:
+            expected_platform = account.platform
             account = lock_dm_account(account.pk, account.workspace_id)
-            if account is None:
+            if account is None or account.platform != expected_platform:
                 return
-        if msg.message_type == InboxMessage.MessageType.DM and _is_outgoing_dm(
-            account, msg.sender_id, msg.extra, platform_message_id=message_id
-        ):
-            return
+        ledger = None
+        if msg.message_type == InboxMessage.MessageType.DM:
+            from .conversations import link_legacy_message, upsert_conversation_message
+
+            ledger = upsert_conversation_message(
+                account,
+                platform_message_id=message_id,
+                sender_id=msg.sender_id,
+                sender_name=msg.sender_name,
+                body=msg.text,
+                extra=msg.extra,
+                occurred_at=msg.timestamp,
+                source="poll",
+            )
+            if _is_outgoing_dm(account, msg.sender_id, msg.extra, platform_message_id=message_id):
+                return
         defaults = {
             "workspace": account.workspace,
             "sender_name": msg.sender_name,
@@ -592,6 +662,8 @@ class InboxSyncEngine:
             defaults=defaults,
             create_defaults=create_defaults,
         )
+        if msg.message_type == InboxMessage.MessageType.DM:
+            link_legacy_message(ledger, obj)
         if created:
             obj.sentiment = analyze_sentiment(obj.body)
             obj.save(update_fields=["sentiment"])
