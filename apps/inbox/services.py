@@ -269,6 +269,16 @@ def send_reply_now(reply: InboxReply, *, actor=None, automated: bool = False) ->
             reply.sent_at = timezone.now()
             reply.save(update_fields=["status", "platform_reply_id", "send_error", "sent_at", "author", "updated_at"])
 
+            # Keep provider acceptance even if the optional history projection
+            # fails; an externally sent message must never become sendable again.
+            from .conversations import record_reply
+
+            try:
+                with transaction.atomic():
+                    record_reply(reply)
+            except Exception:
+                logger.exception("Conversation history write failed for inbox reply %s", reply.id)
+
     # Raising inside atomic would roll back the failed status and its reason.
     if failure is not None:
         raise failure

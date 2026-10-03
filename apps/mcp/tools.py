@@ -18,6 +18,8 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
+from django.conf import settings
+
 
 @dataclass(frozen=True)
 class Tool:
@@ -25,6 +27,10 @@ class Tool:
     description: str
     input_schema: dict
     handler: Callable[[dict, Any], dict]
+    enabled_setting: str | None = None
+
+    def is_enabled(self) -> bool:
+        return self.enabled_setting is None or bool(getattr(settings, self.enabled_setting, False))
 
     def to_mcp_dict(self) -> dict:
         """Wire shape returned by ``tools/list`` per the MCP spec."""
@@ -46,11 +52,12 @@ def register_tool(tool: Tool) -> None:
 
 def all_tools() -> list[Tool]:
     """Sorted catalog — sort is stable so ``tools/list`` is deterministic."""
-    return sorted(_REGISTRY.values(), key=lambda t: t.name)
+    return sorted((tool for tool in _REGISTRY.values() if tool.is_enabled()), key=lambda t: t.name)
 
 
 def get_tool(name: str) -> Tool | None:
-    return _REGISTRY.get(name)
+    tool = _REGISTRY.get(name)
+    return tool if tool is not None and tool.is_enabled() else None
 
 
 def _reset_registry_for_tests() -> None:  # pragma: no cover

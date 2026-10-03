@@ -859,11 +859,23 @@ class FacebookProvider(SocialProvider):
         """
         messages: list[InboxMessage] = []
         failures: list[Exception] = []
+        self.last_inbox_stream_results = {}
 
         for label, fetch in (("DM", self._fetch_direct_messages), ("comment", self._fetch_post_comments)):
+            stream = label.lower()
             try:
                 messages.extend(fetch(access_token, since))
+                self.last_inbox_stream_results[stream] = {
+                    "status": "success",
+                    "coverage": "partial",
+                    "error_code": "",
+                }
             except Exception as exc:
+                self.last_inbox_stream_results[stream] = {
+                    "status": "failed",
+                    "coverage": "unknown",
+                    "error_code": "provider_error",
+                }
                 failures.append(exc)
                 logger.warning("Facebook %s poll failed: %s", label, exc)
 
@@ -874,8 +886,14 @@ class FacebookProvider(SocialProvider):
         return messages
 
     def _fetch_direct_messages(self, access_token: str, since: datetime | None = None) -> list[InboxMessage]:
+        from django.conf import settings
+
+        conversation_v2 = getattr(settings, "INBOX_CONVERSATION_V2_ENABLED", False)
+        identity_fields = ",to" if conversation_v2 else ""
         page_id = self.credentials.get("page_id", "me")
         params: dict = {}
+        if conversation_v2:
+            params["fields"] = "id,participants"
         if since:
             params["since"] = int(since.timestamp())
 
@@ -894,16 +912,17 @@ class FacebookProvider(SocialProvider):
                 self._request,
                 f"{BASE_URL}/{convo_id}/messages",
                 access_token=access_token,
-                params={"fields": CONTENT_MESSAGE_FIELDS},
-                basic_fields=BASIC_MESSAGE_FIELDS,
+                params={"fields": CONTENT_MESSAGE_FIELDS + identity_fields},
+                basic_fields=BASIC_MESSAGE_FIELDS + identity_fields,
             )
             for msg in msg_resp.json().get("data", []):
                 sender = msg.get("from", {})
                 sender_id = str(sender.get("id", ""))
                 # A conversation contains both sides. Without this the Page's
                 # own replies come back on the next poll as fresh inbound DMs,
-                # re-notifying the team and restarting their SLA clock.
-                if sender_id and sender_id == str(page_id):
+                # re-notifying the team and restarting their SLA clock. V2 keeps
+                # them for the history ledger; the sync engine separates them.
+                if sender_id and sender_id == str(page_id) and not conversation_v2:
                     continue
                 messages.append(
                     InboxMessage(
@@ -914,7 +933,13 @@ class FacebookProvider(SocialProvider):
                         timestamp=datetime.fromisoformat(msg["created_time"].replace("+0000", "+00:00")),
                         message_type="dm",
                         # sender_id is the PSID the Send API needs to reply.
-                        extra=polled_message_extra(msg, conversation_id=convo_id, sender_id=sender_id),
+                        extra=polled_message_extra(
+                            msg,
+                            conversation_id=convo_id,
+                            sender_id=sender_id,
+                            own_id=str(self.credentials.get("page_id") or "") if conversation_v2 else None,
+                            participant_ids=convo.get("participants") if conversation_v2 else None,
+                        ),
                     )
                 )
         return messages

@@ -23,11 +23,16 @@
 
 ## Fork customizations
 
+This independent deployment fork uses `milu/stable` as its own release line.
+`main` is an upstream reference, not the production source. Feature work targets
+`milu/stable`; upstream fixes are selected and tested rather than merged automatically.
+
+
 This branch adds invitation-only email/password registration and optional MCP Events for new inbound DMs. Google application sign-in is disabled by default; Google Business Profile and YouTube publishing connections are unaffected. MCP Events remain disabled until their callback configuration and staging acceptance tests are approved.
 
 - [Authentication policy and Google-only account migration](docs/invite-only-auth.md)
 - [MCP Events protocol, security, deployment and mock tests](docs/MCP_EVENTS.md)
-- [Weekly upstream maintenance and regression checklist](docs/MAINTAINING_FORK.md)
+- [Own-project branches, selective updates and release gates](docs/MAINTAINING_FORK.md)
 
 Read these guides before deploying over an existing installation. This fork's defaults differ from the upstream documentation below.
 

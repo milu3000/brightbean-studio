@@ -406,7 +406,11 @@ def _handle_facebook_messaging(account, messaging: dict):
         return
 
     sender = messaging.get("sender") or {}
-    if not isinstance(sender, dict) or _is_outgoing_dm(account, sender.get("id"), messaging):
+    if not isinstance(sender, dict):
+        return
+    from .conversations import enabled
+
+    if not enabled() and _is_outgoing_dm(account, sender.get("id"), messaging):
         return
     text = message_data.get("text") or ""
 
@@ -462,13 +466,26 @@ def _create_if_new(
     if message_type == InboxMessage.MessageType.DM:
         from .locking import lock_dm_account
 
+        expected_platform = account.platform
         account = lock_dm_account(account.pk, account.workspace_id)
-        if account is None:
+        if account is None or account.platform != expected_platform:
             return
-    if message_type == InboxMessage.MessageType.DM and _is_outgoing_dm(
-        account, sender_id, extra, platform_message_id=platform_message_id
-    ):
-        return
+    ledger = None
+    if message_type == InboxMessage.MessageType.DM:
+        from .conversations import link_legacy_message, upsert_conversation_message
+
+        ledger = upsert_conversation_message(
+            account,
+            platform_message_id=platform_message_id,
+            sender_id=sender_id,
+            sender_name=sender_name,
+            body=body,
+            extra=extra,
+            occurred_at=received_at,
+            source="webhook",
+        )
+        if _is_outgoing_dm(account, sender_id, extra, platform_message_id=platform_message_id):
+            return
     if received_at is None:
         received_at = UNKNOWN_MESSAGE_TIMESTAMP if message_type == InboxMessage.MessageType.DM else timezone.now()
 
@@ -518,6 +535,8 @@ def _create_if_new(
         obj.extra = merge_message_extra(obj.extra, extra)
         obj.body = "" if is_deleted_content(obj.extra) else body or obj.body
         obj.save(update_fields=["extra", "body"])
+    if message_type == InboxMessage.MessageType.DM:
+        link_legacy_message(ledger, obj)
     if created and notify:
         from .tasks import InboxSyncEngine
 

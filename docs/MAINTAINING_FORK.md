@@ -1,39 +1,90 @@
-# Maintaining the invite-only / MCP Events fork
+# Maintaining the BrightBean deployment fork
 
-## Branches and baseline
+## Own-project branch policy
 
-- Upstream: `https://github.com/brightbeanxyz/brightbean-studio`
-- Fork: `https://github.com/milu3000/brightbean-studio`
-- Customization branch: `milu/invite-only-mcp-events`
-- Last verified upstream baseline: `96ccc1e88fefa171c4e5ca981dc9f289bdf60d39` (2026-10-02 UTC)
-- Keep `main` as the upstream tracking branch. Keep these customizations on their own branch until a deployment decision is explicitly approved.
+This repository is maintained as an independent BrightBean deployment fork.
+Upstream remains a source of selected fixes, not an automatic release train.
 
-## Weekly upstream review
+- Production/integration branch: `milu/stable`. It starts at the verified deployed
+  customization commit `a02661642c4a98cdbc805387018ac3b55989283e`, preserving the
+  login, invitation, Events, attachment and cancelled-UI history
+- Short-lived feature branches: `milu/<topic>-YYYYMMDD`, created from current
+  `milu/stable`, with draft PRs targeting `milu/stable`
+- Upstream source: `https://github.com/brightbeanxyz/brightbean-studio`; the
+  `upstream` remote is read-only for maintenance. No work is pushed upstream
+- `main` remains an upstream-reference baseline and is **not deployable** for this
+  installation. Its last verified baseline is
+  `96ccc1e88fefa171c4e5ca981dc9f289bdf60d39`. Never reset stable or production to it
+- The proposed default branch is `milu/stable` so new PRs naturally target the
+  own-project line. The verified GitHub default is currently `main`; this
+  document does not change it. Confirm any settings change separately and record
+  its readback. Default branch selection does not grant deployment rights
+- Release records identify exact commit SHA, CI run, web and worker deployment
+  IDs, migration result, feature flags, acceptance evidence and rollback target
 
-The safe weekly outcome is a reviewed, tested update branch and a draft pull request in **this fork**, not an automatic production deployment.
+Keep stable history append-only. Do not force-push, rewrite accepted commits or
+squash old cumulative PRs independently. Use a reviewed merge commit to preserve
+provenance. Keep rollback source refs; deleting branches or database backups is
+not part of routine PR cleanup. Branch protection, credentials and permissions
+are separate security decisions, not silently changed by this policy.
 
-1. Fetch upstream without changing a deployed worktree:
-   ```sh
-   git fetch upstream main
-   git log --oneline HEAD..upstream/main
-   git diff --stat HEAD...upstream/main
-   ```
-2. Start a temporary update branch from the latest accepted customization branch:
-   ```sh
-   git switch milu/invite-only-mcp-events
-   git switch -c maintenance/upstream-YYYY-MM-DD
-   git merge --no-commit --no-ff upstream/main
-   ```
-3. Review conflicts. Preserve the authentication controls, invite validation, Google **application login** gate, and MCP Events outbox/scoping controls. Do not choose an entire side of a conflict blindly. Google Business Profile and YouTube account connections must remain available independently of Google application login.
-4. Inspect upstream migrations, dependencies, OAuth changes and new account-creation entry points. Never overwrite an applied migration. Add a new migration when a model changes.
-5. Run the gates below, and summarize upstream commits, conflicts, changed behavior and test results in a draft PR targeted at the fork's customization branch. Avoid posting security-sensitive reports to the upstream public issue tracker.
-6. Do not reset, force-push, delete customization commits, merge the PR, or deploy automatically. A failing or unverified gate remains a blocker.
+## Selective upstream review
 
-## GitHub CI activation and target branches
+Review upstream periodically and when a security/provider compatibility fix is
+relevant. Reviewing a change does not authorize merging or deploying it.
 
-The inherited workflow has been reviewed and enabled for this fork. It has read-only repository permissions, pinned official GitHub/Docker actions, and a Docker build with `push: false`; it does not deploy. It has no `workflow_dispatch` entry. Its existing triggers are pushes to `main` and pull requests targeting `main`.
+1. Fetch upstream without changing deployed worktrees. Inspect commits and diffs
+   against the last reviewed upstream SHA; record what was accepted, deferred or
+   rejected and why
+2. Create `maintenance/upstream-YYYY-MM-DD` from current `milu/stable`. Select only
+   justified commits and their necessary dependencies, using `git cherry-pick -x`
+   or a documented equivalent patch with the original source reference
+3. Do not bulk-merge upstream by default. Preserve invite/password login policy,
+   Google application-login restrictions, provider connection routes, workspace
+   and account isolation, Events contracts and the explicit grouped-UI revert
+4. Review migrations, dependencies, authentication and OAuth scope changes.
+   Never edit an applied migration. Any new persistent access, credential or
+   security policy still needs its required approval
+5. Keep original copyright notices and the AGPL-3.0 license. Maintain source
+   provenance and make the corresponding fork source available as the license
+   requires; selecting patches does not remove upstream obligations
+6. Run the full gates below. Open a draft PR in this fork targeting `milu/stable`
+   with upstream references, conflicts, behavior changes and real test evidence.
+   Merge/deploy only under a specific release approval; never infer approval from
+   the review cadence or a green CI result
 
-The initial customization draft PR targets `main`, so a new commit on that PR starts the existing CI. A later maintenance PR targeting the customization branch does **not** match the inherited branch filter: run all local regression gates and do not interpret absent checks as success. Expanding that filter or adding manual dispatch is a separate, deliberate CI change; keep the upstream-tracking branch and deployment gate intact.
+## GitHub CI and PR hygiene
+
+CI runs on PRs targeting exactly `main` or `milu/stable`, and on pushes to those
+same two branches. Feature-branch pushes alone do not deploy or run this workflow;
+opening their draft PR is the normal validation path. The stable push reruns CI
+for the exact merged commit before deployment.
+
+The workflow keeps read-only repository permissions, pinned actions, isolated
+PostgreSQL 16 tests, Ruff, mypy, gitleaks and Docker build with `push: false`.
+There is no deployment job, wildcard branch trigger, `pull_request_target` or new
+manual dispatch permission. External service integrations must be checked
+separately; the workflow is not proof of their behavior.
+
+For cumulative PRs already included in the deployed baseline, verify each head is
+an ancestor of stable and leave a cross-reference before closing it as superseded.
+Do not claim it was newly merged if it was only adopted through existing history.
+Keep cancelled work closed. Open work lacking ancestry or with unique changes
+requires a separate review, not automatic closure. No branch deletion is implied.
+
+## Conversation V2 release boundaries
+
+Phase 1 retains authorized bidirectional DM observations and exposes bounded
+read-only context. Phase 2 provides local-only coordination contracts, safety
+holds and a read-only state projection. Neither introduces an external dispatcher
+or silently changes the legacy per-message event/send contracts.
+
+Both flags default off. Deploy additive migrations first and verify both web and
+worker. Activate history only after readback and separate provider acceptance;
+keep coordination shadow/local-only until its documented gates are satisfied.
+Never treat a stored debounce deadline as an automatic reply or use an unknown
+outcome to justify a retry. See [phase 1](CONVERSATION_V2_PHASE1.md) and
+[phase 2](CONVERSATION_V2_PHASE2.md) for exact limitations.
 
 ## Regression gates
 
