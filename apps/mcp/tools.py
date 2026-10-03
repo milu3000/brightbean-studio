@@ -28,9 +28,11 @@ class Tool:
     input_schema: dict
     handler: Callable[[dict, Any], dict]
     enabled_setting: str | None = None
+    enabled_predicate: Callable[[], bool] | None = None
 
     def is_enabled(self) -> bool:
-        return self.enabled_setting is None or bool(getattr(settings, self.enabled_setting, False))
+        setting_enabled = self.enabled_setting is None or bool(getattr(settings, self.enabled_setting, False))
+        return setting_enabled and (self.enabled_predicate is None or self.enabled_predicate())
 
     def to_mcp_dict(self) -> dict:
         """Wire shape returned by ``tools/list`` per the MCP spec."""

@@ -21,6 +21,7 @@ from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 
+from .conversation_policy import capture_allowed
 from .locking import lock_dm_account
 from .models import ConversationMessage, ConversationSyncState, ConversationWorkState, InboxConversation, SendOperation
 
@@ -83,9 +84,23 @@ def _account(scope, account_id, platform):
         or account.platform != platform
         or platform not in _PLATFORMS
         or account.connection_status not in {"connected", "token_expiring"}
+        or not capture_allowed(account)
     ):
         raise ReplyCoordinationError("not_found_or_denied")
     return account
+
+
+def _capture_account(account):
+    """Refresh enrollment and identity before internal coordination mutations."""
+    current = lock_dm_account(account.pk, account.workspace_id)
+    if (
+        current is None
+        or current.platform != account.platform
+        or current.platform not in _PLATFORMS
+        or not capture_allowed(current)
+    ):
+        return None
+    return current
 
 
 def _scope(account):
@@ -160,6 +175,9 @@ def invalidate_conversations(account, conversation_ids):
     """Internal identity-withdrawal hook; preserve unknown outcomes and pause."""
     if not enabled():
         return
+    account = _capture_account(account)
+    if account is None:
+        return
     for conversation in (
         InboxConversation.objects.select_for_update().filter(pk__in=conversation_ids, **_scope(account)).order_by("pk")
     ):
@@ -185,9 +203,12 @@ def quarantine_transferred_uncertainty(account, source_conversation_ids, destina
     Propagate existing quarantine too, so a second identity move cannot erase
     the blocker. Clearing it needs a future explicit reconciliation workflow.
     """
-    # Preserve existing safety records during flag rollback too. This creates
-    # no due work; otherwise a flag-off identity move could launder uncertainty.
+    # Capture must remain enrolled, but this safety hook deliberately ignores
+    # the coordination flag. It creates no due work and cannot clear old holds.
     if not source_conversation_ids or destination_conversation_id is None:
+        return
+    account = _capture_account(account)
+    if account is None:
         return
     uncertain = (
         SendOperation.objects.filter(**_scope(account), conversation_id__in=source_conversation_ids)
@@ -239,7 +260,13 @@ def observe_message(
         return None
     row = ConversationMessage.objects.get(pk=message_id)
     account = lock_dm_account(row.social_account_id, row.workspace_id)
-    if account is None or row.platform != account.platform or row.platform not in _PLATFORMS or not row.conversation_id:
+    if (
+        account is None
+        or row.platform != account.platform
+        or row.platform not in _PLATFORMS
+        or not row.conversation_id
+        or not capture_allowed(account)
+    ):
         return None
     conversation = _conversation(account, row.conversation_id)
     state = ConversationWorkState.objects.select_for_update().filter(conversation=conversation).first()

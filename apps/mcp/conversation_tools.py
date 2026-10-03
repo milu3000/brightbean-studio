@@ -17,7 +17,7 @@ from django.db.models import F, Q
 from django.utils import timezone
 
 from apps.inbox.conversation_capabilities import conversation_capabilities
-from apps.inbox.conversations import enabled
+from apps.inbox.conversation_policy import enrollment_identity, read_allowed, read_available
 from apps.inbox.models import ConversationMessage, ConversationSyncState, InboxConversation, InboxMessage
 from apps.mcp.handlers import _parse_uuid, _require_perm, _wrap_text
 from apps.mcp.protocol import INVALID_PARAMS, JsonRpcError
@@ -49,19 +49,30 @@ def _limit(args, default=50):
 
 def _scope(context):
     _require_perm(context, "use_inbox")
-    if not enabled():
+    if not read_available():
         raise JsonRpcError(INVALID_PARAMS, "Conversation history is not enabled")
     key = context["api_key"]
     # Re-check the current account workspace as well as the ledger snapshot.
     # OAuth's ApiKey-shaped actor intentionally exposes only .all() on its
     # account shim. Use the shared contract, then filter the returned QuerySet.
-    accounts = list(key.social_accounts.all().filter(workspace_id=key.workspace_id).values_list("id", flat=True))
+    allowed_accounts = key.social_accounts.all().filter(workspace_id=key.workspace_id)
+    accounts = {}
+    identities = Q(pk__in=[])
+    for account in allowed_accounts.only("id", "workspace_id", "platform"):
+        identity = enrollment_identity(account)
+        if identity is not None and read_allowed(account):
+            accounts[account.pk] = identity
+            identities |= Q(pk=identity[1], workspace_id=identity[0], platform=identity[2])
+    # Keep this lazy: each protected SQL statement must prove the account is
+    # still allowlisted and still has the exact identity enrolled above. A
+    # platform=F(current account platform) check alone follows reassignment.
+    eligible_accounts = allowed_accounts.filter(identities).values("pk")
     return (
         key,
         accounts,
         {
             "workspace_id": key.workspace_id,
-            "social_account_id__in": accounts,
+            "social_account_id__in": eligible_accounts,
             "social_account__workspace_id": key.workspace_id,
             "platform": F("social_account__platform"),
         },
@@ -70,10 +81,12 @@ def _scope(context):
 
 def _cursor_scope(key, accounts, kind, filters):
     return {
-        "v": 1,
+        "v": 2,
         "key": str(key.id),
         "workspace": str(key.workspace_id),
-        "accounts": hashlib.sha256(",".join(sorted(str(value) for value in accounts)).encode()).hexdigest(),
+        # IDs alone do not capture enrollment: the same account can be moved
+        # between workspaces or platforms and later enrolled under its new identity.
+        "accounts": hashlib.sha256(json.dumps(sorted(accounts.values()), separators=(",", ":")).encode()).hexdigest(),
         "kind": kind,
         "filters": filters,
     }
@@ -277,7 +290,14 @@ def _get_conversation_messages(args: dict, context: dict[str, Any]) -> dict:
         account_id = _parse_uuid(args.get("social_account_id"), "social_account_id")
         if account_id not in accounts:
             raise JsonRpcError(INVALID_PARAMS, "Account not found")
-        account = key.social_accounts.all().get(pk=account_id, workspace_id=key.workspace_id)
+        account = (
+            key.social_accounts.all()
+            .filter(pk=account_id, pk__in=scoped["social_account_id__in"])
+            .only("id", "workspace_id", "platform")
+            .first()
+        )
+        if account is None:
+            raise JsonRpcError(INVALID_PARAMS, "Account not found")
         filters = {"account": str(account.pk), "unassigned_only": True}
     limit = _limit(args)
     scope = _cursor_scope(key, accounts, "messages", filters)
@@ -433,5 +453,6 @@ for _name, _description, _properties, _required, _handler in (
             },
             handler=_handler,
             enabled_setting=_FLAG,
+            enabled_predicate=read_available,
         )
     )

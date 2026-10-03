@@ -12,6 +12,10 @@ Both `INBOX_CONVERSATION_V2_ENABLED` and
 `INBOX_REPLY_COORDINATION_ENABLED` must be enabled; both default to false.
 Turning either off disables the new coordinator and its read-only MCP tool.
 There is no flag that enables external dispatch in this slice.
+The internal coordinator additionally requires the exact account's capture
+enrollment. Its MCP projection requires read enrollment too. Empty enrollment
+is disabled, not a fallback to all accounts. See the
+[scoped rollout contract](CONVERSATION_V2_SCOPED_ROLLOUT.md).
 
 The new local objects separate coordination from history and old inbox work:
 

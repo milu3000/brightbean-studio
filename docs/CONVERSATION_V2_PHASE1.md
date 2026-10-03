@@ -5,10 +5,16 @@ InboxMessage work state, the existing UI, reply authorization, or MCP inbound
 Events. It does not implement V2 send-version preconditions or guaranteed full
 platform history.
 
+Capture and reads also require explicit pinned account enrollment. Empty
+capture/read lists enroll nobody, even if the master flag is true. See
+[scoped rollout and live acceptance](CONVERSATION_V2_SCOPED_ROLLOUT.md) for the
+current contract; global enablement alone is not an activation instruction.
+
 ## Scope
 
 - Facebook Page Messenger and Instagram Login DM observations are retained in
-  both directions when `INBOX_CONVERSATION_V2_ENABLED=true`.
+  both directions only when the master flag and exact capture enrollment allow
+  that account. New MCP reads additionally require read enrollment.
 - Native outgoing/echoes never become legacy inbound work or emit new-inbound
   notifications/events. No inbound parent is invented for outgoing messages.
 - Real provider conversation IDs are scoped to workspace/account/platform.
@@ -33,6 +39,7 @@ Use the opt-in `backfill_conversation_history` command only for a separately
 reviewed local/database migration. Inspect its help and dry run first. It reads
 existing local DM/reply rows; it is not remote platform history import. It never
 replays inbound events or creates new legacy inbox work.
+Applying it requires an exact enrolled account within the selected workspace.
 
 Disable `INBOX_CONVERSATION_V2_ENABLED` to stop V2 capture and hide the three new
 MCP tools. Existing inbox tools, sends and inbound-event schema remain present.

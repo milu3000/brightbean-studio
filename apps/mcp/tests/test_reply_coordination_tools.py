@@ -3,13 +3,15 @@
 import json
 import uuid
 from copy import deepcopy
+from unittest.mock import patch
 
 import pytest
 from django.utils import timezone
 
 from apps.api_keys.services import issue_api_key
 from apps.inbox.models import ConversationMessage, ConversationWorkState, InboxConversation, SendOperation
-from apps.mcp.tests.test_conversation_tools import call, observation
+from apps.mcp.protocol import JsonRpcError
+from apps.mcp.tests.test_conversation_tools import call, observation, reassign_before_select
 from apps.mcp.tests.test_conversation_tools import conversation as _conversation
 from apps.mcp.tests.test_inbox_tools import _call, _SecureClient
 from apps.mcp.tests.test_inbox_tools import account as _account
@@ -20,6 +22,7 @@ from apps.mcp.tests.test_inbox_tools import other_account as _other_account
 from apps.mcp.tests.test_inbox_tools import user as _user
 from apps.mcp.tests.test_inbox_tools import workspace as _workspace
 from apps.mcp.tools import all_tools, get_tool
+from apps.social_accounts.models import SocialAccount
 
 pytestmark = pytest.mark.django_db
 conversation = _conversation
@@ -33,9 +36,10 @@ workspace = _workspace
 
 
 @pytest.fixture(autouse=True)
-def flags(settings):
+def flags(settings, account, other_account, enroll_conversation_accounts):
     settings.INBOX_CONVERSATION_V2_ENABLED = True
     settings.INBOX_REPLY_COORDINATION_ENABLED = True
+    enroll_conversation_accounts(account, other_account, read=True)
 
 
 def read(client, conversation):
@@ -80,6 +84,70 @@ def operation(conversation, state):
     return row
 
 
+@pytest.mark.parametrize("changed_field", ["workspace", "platform"])
+def test_coordination_pins_enrollment_across_scope_to_query_reassignment(
+    full_client, conversation, state, operation, organization, changed_field
+):
+    from apps.mcp import reply_coordination_tools
+    from apps.workspaces.models import Workspace
+
+    account = conversation.social_account
+    if changed_field == "platform":
+        conversation.platform = "instagram_login"
+        conversation.save(update_fields=["platform"])
+        changes = {"platform": "instagram_login"}
+    else:
+        changes = {"workspace_id": Workspace.objects.create(name="Moved", organization=organization).pk}
+    original_scope = reply_coordination_tools._scope
+
+    def scope_then_reassign(context):
+        result = original_scope(context)
+        SocialAccount.objects.filter(pk=account.pk).update(**changes)
+        return result
+
+    with patch.object(reply_coordination_tools, "_scope", side_effect=scope_then_reassign):
+        _, result = _call(full_client, "get_reply_coordination", {"conversation_id": str(conversation.pk)})
+    assert result["error"]["message"] == "Conversation not found"
+
+
+@pytest.mark.parametrize("changed_field", ["workspace", "platform"])
+@pytest.mark.parametrize("query", ["work", "operations"])
+def test_coordination_queries_revalidate_current_identity_inside_sql(
+    full_client, conversation, organization, changed_field, query
+):
+    from apps.workspaces.models import Workspace
+
+    account = conversation.social_account
+    changes = (
+        {"platform": "instagram_login"}
+        if changed_field == "platform"
+        else {"workspace_id": Workspace.objects.create(name="Moved at query", organization=organization).pk}
+    )
+    if query == "work":
+        protected_model = ConversationWorkState
+        ConversationWorkState.objects.create(conversation=conversation, generation=41, owner_paused=True)
+    else:
+        protected_model = SendOperation
+        SendOperation.objects.create(
+            workspace=conversation.workspace,
+            social_account=account,
+            platform=changes.get("platform", account.platform),
+            conversation=conversation,
+            actor_scope="private-interleaving-actor",
+            idempotency_key="private-interleaving-operation",
+            payload_fingerprint="private-interleaving-fingerprint",
+            body="Private interleaving draft",
+            expected_revision=0,
+            expected_generation=0,
+            status="prepared",
+        )
+    with reassign_before_select(protected_model, account, **changes):
+        result = read(full_client, conversation)
+    assert result["coordination_status"] == "not_started"
+    assert result["work"] is None
+    assert result["active_operation"] is None
+
+
 @pytest.mark.parametrize("history,coordination", [(False, False), (False, True), (True, False)])
 def test_both_flags_required_for_catalog_and_cached_call(settings, full_client, conversation, history, coordination):
     settings.INBOX_CONVERSATION_V2_ENABLED = history
@@ -94,6 +162,56 @@ def test_old_tool_wire_schemas_unchanged_by_coordination_flag(settings):
     enabled = {tool.name: deepcopy(tool.to_mcp_dict()) for tool in all_tools() if tool.name != "get_reply_coordination"}
     settings.INBOX_REPLY_COORDINATION_ENABLED = False
     assert {tool.name: tool.to_mcp_dict() for tool in all_tools()} == enabled
+
+
+def test_capture_only_hides_all_v2_tools_and_denies_cached_coordination_handler(
+    settings, user, memberships, workspace, account, conversation, state, operation
+):
+    names = {"list_conversations", "get_conversation_messages", "get_reply_context", "get_reply_coordination"}
+    tool = get_tool("get_reply_coordination")
+    original = {item.name: deepcopy(item.to_mcp_dict()) for item in all_tools() if item.name not in names}
+    key = issue_api_key(
+        workspace=workspace, social_accounts=[account], issued_by=user, name="cached-read", permissions=["use_inbox"]
+    )
+    before_state = list(ConversationWorkState.objects.values())
+    before_operations = list(SendOperation.objects.values())
+    settings.INBOX_CONVERSATION_V2_READ_ACCOUNTS = []
+    assert not names & {item.name for item in all_tools()}
+    assert get_tool("get_reply_coordination") is None
+    assert {item.name: item.to_mcp_dict() for item in all_tools()} == original
+    with pytest.raises(JsonRpcError, match="Conversation history is not enabled"):
+        tool.handler({"conversation_id": str(conversation.pk)}, {"api_key": key.api_key, "membership": memberships})
+    assert list(ConversationWorkState.objects.values()) == before_state
+    assert list(SendOperation.objects.values()) == before_operations
+
+
+@pytest.mark.parametrize("setting", ["INBOX_CONVERSATION_V2_CAPTURE_ACCOUNTS", "INBOX_CONVERSATION_V2_READ_ACCOUNTS"])
+@pytest.mark.parametrize("exclusion", ["removed", "workspace", "platform"])
+def test_coordination_read_requires_exact_account_capture_and_read_enrollment(
+    settings, full_client, conversation, account, state, operation, setting, exclusion
+):
+    entries = deepcopy(getattr(settings, setting))
+    if exclusion == "removed":
+        entries = [entry for entry in entries if entry["social_account_id"] != str(account.pk)]
+    else:
+        for entry in entries:
+            if entry["social_account_id"] == str(account.pk):
+                if exclusion == "workspace":
+                    entry["workspace_id"] = str(account.pk)
+                else:
+                    entry["platform"] = "instagram_login"
+    setattr(settings, setting, entries)
+    # Another account remains readable so this reaches account authorization,
+    # instead of being rejected by the global tool catalog gate.
+    assert get_tool("get_reply_coordination") is not None
+    before_state = list(ConversationWorkState.objects.values())
+    before_operations = list(SendOperation.objects.values())
+    _, excluded = _call(full_client, "get_reply_coordination", {"conversation_id": str(conversation.pk)})
+    _, missing = _call(full_client, "get_reply_coordination", {"conversation_id": str(uuid.uuid4())})
+    assert excluded["error"] == missing["error"]
+    assert "Conversation not found" in excluded["error"]["message"]
+    assert list(ConversationWorkState.objects.values()) == before_state
+    assert list(SendOperation.objects.values()) == before_operations
 
 
 def test_read_without_state_never_creates_work(full_client, conversation):

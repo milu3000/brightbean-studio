@@ -1,14 +1,21 @@
 """Opt-in V2 DM reads preserve work state and enforce scoped, bounded history."""
 
 import json
+from contextlib import contextmanager
 from datetime import timedelta
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
+from django.db import connection
+from django.test.utils import CaptureQueriesContext
 from django.utils import timezone
 
 from apps.inbox.conversation_capabilities import conversation_capabilities
 from apps.inbox.models import ConversationMessage, ConversationSyncState, InboxConversation, InboxMessage
+from apps.mcp.protocol import JsonRpcError
 from apps.mcp.tests.test_inbox_tools import (
+    MCP_URL,
     _call,
     _result_json,
     _SecureClient,
@@ -31,10 +38,12 @@ from apps.mcp.tests.test_inbox_tools import (
 from apps.mcp.tests.test_inbox_tools import (
     workspace as _workspace,
 )
-from apps.mcp.tools import all_tools, get_tool
+from apps.mcp.tools import Tool, all_tools, get_tool
+from apps.social_accounts.models import SocialAccount
 
 pytestmark = pytest.mark.django_db
 TOOLS = {"list_conversations", "get_conversation_messages", "get_reply_context"}
+V2_TOOLS = TOOLS | {"get_reply_coordination"}
 account = _account
 full_client = _full_client
 memberships = _memberships
@@ -44,8 +53,25 @@ workspace = _workspace
 
 
 @pytest.fixture(autouse=True)
-def flag(settings):
+def flag(settings, account, other_account):
     settings.INBOX_CONVERSATION_V2_ENABLED = True
+    # Enroll even the account outside the caller's allowlist so authorization
+    # tests cannot accidentally pass merely because rollout scope excluded it.
+    settings.INBOX_CONVERSATION_V2_CAPTURE_ACCOUNTS = enrollment(account, other_account)
+    settings.INBOX_CONVERSATION_V2_READ_ACCOUNTS = enrollment(account, other_account)
+
+
+def enrollment(*accounts):
+    return json.dumps(
+        [
+            {
+                "workspace_id": str(account.workspace_id),
+                "social_account_id": str(account.pk),
+                "platform": account.platform,
+            }
+            for account in accounts
+        ]
+    )
 
 
 @pytest.fixture
@@ -82,6 +108,149 @@ def call(client, name, args):
     return _result_json(body)
 
 
+@contextmanager
+def reassign_before_select(model, account, **changes):
+    """Mutate after SQL construction, immediately before its database read."""
+    changed = False
+
+    def execute(execute, sql, params, many, context):
+        nonlocal changed
+        if not changed and sql.lstrip().upper().startswith("SELECT") and f'FROM "{model._meta.db_table}"' in sql:
+            changed = True
+            SocialAccount.objects.filter(pk=account.pk).update(**changes)
+        return execute(sql, params, many, context)
+
+    with connection.execute_wrapper(execute):
+        yield
+    assert changed, "The intended protected query was not exercised"
+
+
+@pytest.mark.parametrize("changed_field", ["workspace", "platform"])
+@pytest.mark.parametrize("tool", ["list", "messages", "context", "unassigned", "sync"])
+def test_pinned_enrollment_survives_scope_to_query_reassignment(
+    full_client, conversation, organization, changed_field, tool
+):
+    from apps.mcp import conversation_tools
+    from apps.workspaces.models import Workspace
+
+    account = conversation.social_account
+    original = InboxMessage.objects.create(
+        workspace=conversation.workspace,
+        social_account=account,
+        platform_message_id="interleaving-target",
+        message_type="dm",
+        received_at=timezone.now(),
+    )
+    # A second namespace already exists under this account ID, but only its
+    # original Facebook identity is enrolled when _scope captures the grant.
+    if changed_field == "platform":
+        conversation.platform = "instagram_login"
+        conversation.save(update_fields=["platform"])
+        changes = {"platform": "instagram_login"}
+    else:
+        changes = {"workspace_id": Workspace.objects.create(name="Reassigned", organization=organization).pk}
+    observation(conversation, "interleaving-target", legacy_message=original, body="Unenrolled namespace content")
+    unassigned = observation(conversation, "interleaving-unassigned", body="Unenrolled namespace content")
+    unassigned.conversation = None
+    unassigned.save(update_fields=["conversation"])
+    ConversationSyncState.objects.create(
+        workspace=conversation.workspace,
+        social_account=account,
+        platform=conversation.platform,
+        stream="dm",
+        status="failed",
+        last_error_code="unenrolled-sync-detail",
+    )
+    original_scope = conversation_tools._scope
+
+    def scope_then_reassign(context):
+        scoped = original_scope(context)
+        SocialAccount.objects.filter(pk=account.pk).update(**changes)
+        return scoped
+
+    with patch.object(conversation_tools, "_scope", side_effect=scope_then_reassign):
+        if tool == "sync":
+            from apps.api_keys.models import ApiKey
+
+            context = {
+                "api_key": ApiKey.objects.get(name="full"),
+                "membership": SimpleNamespace(effective_permissions={"use_inbox": True}),
+            }
+            _, _, scoped = conversation_tools._scope(context)
+            data = conversation_tools._sync(account, scoped)
+            assert data["status"] == "unknown"
+            assert data["last_error_code"] == ""
+            return
+        name, args = {
+            "list": ("list_conversations", {}),
+            "messages": ("get_conversation_messages", {"conversation_id": str(conversation.pk)}),
+            "context": ("get_reply_context", {"message_id": str(original.pk)}),
+            "unassigned": (
+                "get_conversation_messages",
+                {"social_account_id": str(account.pk), "unassigned_only": True},
+            ),
+        }[tool]
+        _, result = _call(full_client, name, args)
+    if tool == "list":
+        data = _result_json(result)
+        assert data["items"] == []
+        assert data["unassigned_message_count"] == 0
+    else:
+        assert "error" in result
+    assert "Unenrolled namespace content" not in json.dumps(result)
+    assert "unenrolled-sync-detail" not in json.dumps(result)
+
+
+@pytest.mark.parametrize("changed_field", ["workspace", "platform"])
+@pytest.mark.parametrize("query", ["messages", "unassigned_count", "sync"])
+def test_each_ledger_query_revalidates_identity_inside_sql(
+    full_client, conversation, organization, changed_field, query
+):
+    from apps.workspaces.models import Workspace
+
+    account = conversation.social_account
+    changes = (
+        {"platform": "instagram_login"}
+        if changed_field == "platform"
+        else {"workspace_id": Workspace.objects.create(name="Moved at query", organization=organization).pk}
+    )
+    # The initially authorized conversation can be read first; later queries
+    # must not follow the account into another namespace.
+    future_platform = changes.get("platform", account.platform)
+    if query != "sync":
+        ConversationMessage.objects.create(
+            workspace=conversation.workspace,
+            social_account=account,
+            platform=future_platform,
+            conversation=conversation if query == "messages" else None,
+            platform_message_id="late-private-row",
+            body="Late namespace content",
+        )
+    ConversationSyncState.objects.create(
+        workspace=conversation.workspace,
+        social_account=account,
+        platform=future_platform,
+        stream="dm",
+        status="failed",
+        last_error_code="late-private-sync",
+    )
+    protected_model = ConversationSyncState if query == "sync" else ConversationMessage
+    with reassign_before_select(protected_model, account, **changes):
+        result = call(
+            full_client,
+            "list_conversations" if query == "unassigned_count" else "get_conversation_messages",
+            {} if query == "unassigned_count" else {"conversation_id": str(conversation.pk)},
+        )
+    if query == "unassigned_count":
+        assert result["unassigned_message_count"] == 0
+    else:
+        assert result["items"] == []
+        assert result["sync"]["status"] == "unknown"
+        assert result["sync"]["last_error_code"] == ""
+    assert "Late namespace content" not in json.dumps(result)
+    assert "late-private-sync" not in json.dumps(result)
+
+
 def test_flag_hides_catalog_and_rejects_cached_calls(settings, full_client):
     assert {tool.name for tool in all_tools()} >= TOOLS
     settings.INBOX_CONVERSATION_V2_ENABLED = False
@@ -90,6 +259,154 @@ def test_flag_hides_catalog_and_rejects_cached_calls(settings, full_client):
     _, body = _call(full_client, "list_conversations", {})
     assert "error" in body
     assert get_tool("list_inbox_messages") is not None
+
+
+@pytest.mark.parametrize("mode", ["empty", "shadow", "read_without_capture", "disjoint", "malformed"])
+def test_catalog_requires_valid_capture_and_read_intersection(settings, full_client, account, other_account, mode):
+    cached = [get_tool(name) for name in TOOLS]
+    settings.INBOX_REPLY_COORDINATION_ENABLED = True
+    settings.INBOX_CONVERSATION_V2_CAPTURE_ACCOUNTS = enrollment(account)
+    settings.INBOX_CONVERSATION_V2_READ_ACCOUNTS = enrollment(account)
+    if mode == "empty":
+        settings.INBOX_CONVERSATION_V2_CAPTURE_ACCOUNTS = "[]"
+        settings.INBOX_CONVERSATION_V2_READ_ACCOUNTS = "[]"
+    elif mode == "shadow":
+        settings.INBOX_CONVERSATION_V2_READ_ACCOUNTS = "[]"
+    elif mode == "read_without_capture":
+        settings.INBOX_CONVERSATION_V2_CAPTURE_ACCOUNTS = "[]"
+    elif mode == "disjoint":
+        settings.INBOX_CONVERSATION_V2_READ_ACCOUNTS = enrollment(other_account)
+    else:
+        settings.INBOX_CONVERSATION_V2_READ_ACCOUNTS = "not valid JSON"
+
+    response = full_client.post(
+        MCP_URL,
+        data=json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+        content_type="application/json",
+    )
+    assert response.status_code == 200
+    assert not V2_TOOLS & {tool["name"] for tool in response.json()["result"]["tools"]}
+    assert not V2_TOOLS & {tool.name for tool in all_tools()}
+    for tool in cached:
+        assert get_tool(tool.name) is None
+        _, result = _call(full_client, tool.name, {})
+        assert "error" in result
+        # A previously resolved handler must also fail before any data read.
+        with CaptureQueriesContext(connection) as queries, pytest.raises(JsonRpcError, match="not enabled"):
+            tool.handler({}, {"membership": SimpleNamespace(effective_permissions={"use_inbox": True})})
+        assert len(queries) == 0
+    assert get_tool("list_inbox_messages") is not None
+
+
+def test_tool_registry_preserves_legacy_constructor_and_wire_shape(settings):
+    tool = Tool("example", "Example", {"type": "object"}, lambda args, context: {})
+    assert tool.is_enabled()
+    assert tool.to_mcp_dict() == {"name": "example", "description": "Example", "inputSchema": {"type": "object"}}
+    gated = Tool("gated", "Gated", {}, tool.handler, "INBOX_CONVERSATION_V2_ENABLED", enabled_predicate=lambda: False)
+    assert not gated.is_enabled()
+    settings.INBOX_CONVERSATION_V2_ENABLED = False
+    assert tool.is_enabled()
+    assert not Tool("disabled", "Disabled", {}, tool.handler, "INBOX_CONVERSATION_V2_ENABLED").is_enabled()
+
+
+def test_capture_only_account_is_hidden_from_all_read_paths(settings, full_client, conversation, other_account):
+    from apps.api_keys.models import ApiKey
+
+    ApiKey.objects.get(name="full").social_accounts.add(other_account)
+    settings.INBOX_CONVERSATION_V2_READ_ACCOUNTS = enrollment(conversation.social_account)
+    foreign = InboxConversation.objects.create(
+        workspace=other_account.workspace,
+        social_account=other_account,
+        platform=other_account.platform,
+        platform_conversation_id="shadow-thread",
+        identity_kind="platform",
+    )
+    original = InboxMessage.objects.create(
+        workspace=other_account.workspace,
+        social_account=other_account,
+        platform_message_id="shadow-inbound",
+        message_type="dm",
+        received_at=timezone.now(),
+    )
+    observation(foreign, "shadow-inbound", legacy_message=original, body="Capture-only private history")
+    row = observation(foreign, "shadow-unassigned", direction="outbound")
+    row.conversation = None
+    row.save(update_fields=["conversation"])
+    ConversationSyncState.objects.create(
+        workspace=other_account.workspace,
+        social_account=other_account,
+        platform=other_account.platform,
+        stream="dm",
+        status="failed",
+        last_error_code="private-sync-detail",
+    )
+
+    listed = call(full_client, "list_conversations", {})
+    assert [item["id"] for item in listed["items"]] == [str(conversation.pk)]
+    assert listed["unassigned_message_count"] == 0
+    for name, args, message in [
+        ("list_conversations", {"social_account_id": str(other_account.pk)}, "Account not found"),
+        ("get_conversation_messages", {"conversation_id": str(foreign.pk)}, "Conversation not found"),
+        (
+            "get_conversation_messages",
+            {"social_account_id": str(other_account.pk), "unassigned_only": True},
+            "Account not found",
+        ),
+        ("get_reply_context", {"message_id": str(original.pk)}, "Inbox message not found"),
+    ]:
+        _, result = _call(full_client, name, args)
+        assert result["error"]["message"] == message
+        assert "Capture-only" not in json.dumps(result)
+        assert "private-sync-detail" not in json.dumps(result)
+
+
+@pytest.mark.parametrize(
+    "revoked_setting", ["INBOX_CONVERSATION_V2_CAPTURE_ACCOUNTS", "INBOX_CONVERSATION_V2_READ_ACCOUNTS"]
+)
+def test_enrollment_revocation_blocks_existing_rows_and_saved_cursors(
+    settings, full_client, conversation, other_account, revoked_setting
+):
+    original = InboxMessage.objects.create(
+        workspace=conversation.workspace,
+        social_account=conversation.social_account,
+        platform_message_id="revoke-target",
+        message_type="dm",
+        received_at=timezone.now(),
+    )
+    observation(conversation, "revoke-target", legacy_message=original)
+    observation(conversation, "revoke-second")
+    InboxConversation.objects.create(
+        workspace=conversation.workspace,
+        social_account=conversation.social_account,
+        platform=conversation.platform,
+        platform_conversation_id="second-thread",
+        identity_kind="platform",
+    )
+    listed = call(full_client, "list_conversations", {"limit": 1})
+    history = call(full_client, "get_conversation_messages", {"conversation_id": str(conversation.pk), "limit": 1})
+    assert listed["next_cursor"] and history["next_cursor"]
+    setattr(settings, revoked_setting, enrollment(other_account))
+    assert get_tool("list_conversations") is not None
+    with CaptureQueriesContext(connection) as queries:
+        assert call(full_client, "list_conversations", {})["items"] == []
+        for name, args in [
+            ("list_conversations", {"cursor": listed["next_cursor"]}),
+            (
+                "get_conversation_messages",
+                {"conversation_id": str(conversation.pk), "cursor": history["next_cursor"]},
+            ),
+            (
+                "get_conversation_messages",
+                {"social_account_id": str(conversation.social_account_id), "unassigned_only": True},
+            ),
+            ("get_reply_context", {"message_id": str(original.pk)}),
+        ]:
+            _, result = _call(full_client, name, args)
+            assert "error" in result
+    protected_tables = [
+        model._meta.db_table for model in (InboxConversation, ConversationMessage, ConversationSyncState, InboxMessage)
+    ]
+    assert not any(f'"{table}"' in query["sql"] for query in queries for table in protected_tables)
 
 
 def test_bidirectional_context_keeps_archive_and_never_creates_work(full_client, conversation):
@@ -272,14 +589,152 @@ def test_corrupt_legacy_fk_cannot_mix_two_allowlisted_accounts(full_client, conv
     assert "Must not appear" not in json.dumps(data)
 
 
-def test_stale_account_workspace_and_platform_never_leak(full_client, conversation, organization):
+@pytest.mark.parametrize("changed_field", ["workspace", "platform"])
+def test_stale_account_workspace_and_platform_never_leak(full_client, conversation, organization, changed_field):
     from apps.workspaces.models import Workspace
 
-    moved = Workspace.objects.create(name="Moved", organization=organization)
     account = conversation.social_account
-    account.workspace = moved
-    account.save(update_fields=["workspace"])
+    original = InboxMessage.objects.create(
+        workspace=conversation.workspace,
+        social_account=account,
+        platform_message_id="before-reassignment",
+        message_type="dm",
+        received_at=timezone.now(),
+    )
+    observation(conversation, "before-reassignment", legacy_message=original)
+    if changed_field == "workspace":
+        account.workspace = Workspace.objects.create(name="Moved", organization=organization)
+    else:
+        account.platform = "instagram_login"
+    account.save(update_fields=[changed_field])
     assert call(full_client, "list_conversations", {})["items"] == []
+    for name, args in [
+        ("get_conversation_messages", {"conversation_id": str(conversation.pk)}),
+        ("get_conversation_messages", {"social_account_id": str(account.pk), "unassigned_only": True}),
+        ("get_reply_context", {"message_id": str(original.pk)}),
+    ]:
+        _, result = _call(full_client, name, args)
+        assert "error" in result
+
+
+def test_platform_reenrollment_never_exposes_stale_ledger_or_sync(settings, full_client, conversation, other_account):
+    account = conversation.social_account
+    original = InboxMessage.objects.create(
+        workspace=conversation.workspace,
+        social_account=account,
+        platform_message_id="old-platform-target",
+        message_type="dm",
+        received_at=timezone.now(),
+    )
+    observation(conversation, "old-platform-target", legacy_message=original, body="Stale platform private content")
+    unassigned = observation(conversation, "old-platform-unassigned")
+    unassigned.conversation = None
+    unassigned.save(update_fields=["conversation"])
+    ConversationSyncState.objects.create(
+        workspace=conversation.workspace,
+        social_account=account,
+        platform=conversation.platform,
+        stream="dm",
+        status="success",
+        last_success_at=timezone.now(),
+    )
+    account.platform = "instagram_login"
+    account.save(update_fields=["platform"])
+    settings.INBOX_CONVERSATION_V2_CAPTURE_ACCOUNTS = enrollment(account, other_account)
+    settings.INBOX_CONVERSATION_V2_READ_ACCOUNTS = enrollment(account, other_account)
+
+    listed = call(full_client, "list_conversations", {})
+    assert listed["items"] == []
+    assert listed["unassigned_message_count"] == 0
+    _, result = _call(full_client, "get_conversation_messages", {"conversation_id": str(conversation.pk)})
+    assert result["error"]["message"] == "Conversation not found"
+    page = call(
+        full_client, "get_conversation_messages", {"social_account_id": str(account.pk), "unassigned_only": True}
+    )
+    context = call(full_client, "get_reply_context", {"message_id": str(original.pk)})
+    assert context["context_status"] == "not_imported"
+    assert context["target"] is None
+    for result in (page, context):
+        assert result["items"] == []
+        assert result["sync"]["status"] == "unknown"
+        assert result["sync"]["last_success_at"] is None
+        assert "Stale platform private content" not in json.dumps(result)
+
+
+def test_current_workspace_is_required_even_when_moved_account_is_reenrolled(
+    settings, full_client, conversation, other_account, organization
+):
+    from apps.workspaces.models import Workspace
+
+    account = conversation.social_account
+    original = InboxMessage.objects.create(
+        workspace=conversation.workspace,
+        social_account=account,
+        platform_message_id="moved-legacy-target",
+        message_type="dm",
+        received_at=timezone.now(),
+    )
+    observation(conversation, "moved-legacy-target", legacy_message=original)
+    account.workspace = Workspace.objects.create(name="New owner", organization=organization)
+    account.save(update_fields=["workspace"])
+    settings.INBOX_CONVERSATION_V2_CAPTURE_ACCOUNTS = enrollment(account, other_account)
+    settings.INBOX_CONVERSATION_V2_READ_ACCOUNTS = enrollment(account, other_account)
+    assert call(full_client, "list_conversations", {})["items"] == []
+    for name, args in [
+        ("get_conversation_messages", {"conversation_id": str(conversation.pk)}),
+        ("get_conversation_messages", {"social_account_id": str(account.pk), "unassigned_only": True}),
+        ("get_reply_context", {"message_id": str(original.pk)}),
+    ]:
+        _, result = _call(full_client, name, args)
+        assert "error" in result
+
+
+@pytest.mark.parametrize("changed_field", ["workspace", "platform"])
+def test_saved_cursors_reject_account_reassignment_even_after_reenrollment(
+    settings, full_client, conversation, other_account, organization, changed_field
+):
+    from apps.api_keys.models import ApiKey
+    from apps.workspaces.models import Workspace
+
+    ApiKey.objects.get(name="full").social_accounts.add(other_account)
+    InboxConversation.objects.create(
+        workspace=conversation.workspace,
+        social_account=conversation.social_account,
+        platform=conversation.platform,
+        platform_conversation_id="another-accessible-thread",
+        identity_kind="platform",
+    )
+    for index in range(2):
+        observation(conversation, f"still-readable-{index}")
+        unassigned = observation(conversation, f"unassigned-still-readable-{index}")
+        unassigned.conversation = None
+        unassigned.save(update_fields=["conversation"])
+    saved = []
+    for name, args in [
+        ("list_conversations", {}),
+        ("get_conversation_messages", {"conversation_id": str(conversation.pk)}),
+        (
+            "get_conversation_messages",
+            {"social_account_id": str(conversation.social_account_id), "unassigned_only": True},
+        ),
+    ]:
+        page = call(full_client, name, {**args, "limit": 1})
+        assert page["next_cursor"]
+        saved.append((name, args, page["next_cursor"]))
+
+    # With a platform change the effective account IDs are unchanged. Only a
+    # cursor bound to the full enrollment identity rejects the previous grant.
+    if changed_field == "workspace":
+        other_account.workspace = Workspace.objects.create(name="Reassigned", organization=organization)
+    else:
+        other_account.platform = "instagram_login"
+    other_account.save(update_fields=[changed_field])
+    settings.INBOX_CONVERSATION_V2_CAPTURE_ACCOUNTS = enrollment(conversation.social_account, other_account)
+    settings.INBOX_CONVERSATION_V2_READ_ACCOUNTS = enrollment(conversation.social_account, other_account)
+    for name, args, cursor in saved:
+        _, result = _call(full_client, name, {**args, "cursor": cursor})
+        assert "cursor" in result["error"]["message"]
+        assert call(full_client, name, args)["items"]
 
 
 def test_message_cursor_is_signed_and_bound_to_conversation(full_client, conversation, account):

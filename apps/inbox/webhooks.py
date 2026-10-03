@@ -408,9 +408,9 @@ def _handle_facebook_messaging(account, messaging: dict):
     sender = messaging.get("sender") or {}
     if not isinstance(sender, dict):
         return
-    from .conversations import enabled
+    from .conversation_policy import capture_allowed
 
-    if not enabled() and _is_outgoing_dm(account, sender.get("id"), messaging):
+    if not capture_allowed(account) and _is_outgoing_dm(account, sender.get("id"), messaging, platform_message_id=mid):
         return
     text = message_data.get("text") or ""
 

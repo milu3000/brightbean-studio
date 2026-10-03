@@ -114,19 +114,17 @@ def _is_outgoing_dm(account, sender_id, extra, *, platform_message_id=None):
     if any(str(value) in own_ids for value in sender_ids if value is not None):
         return True
     if platform_message_id:
-        from .conversations import enabled
         from .models import ConversationMessage, InboxReply
 
-        if (
-            enabled()
-            and ConversationMessage.objects.filter(
-                workspace_id=account.workspace_id,
-                social_account_id=account.pk,
-                platform=account.platform,
-                platform_message_id=str(platform_message_id),
-                direction=ConversationMessage.Direction.OUTBOUND,
-            ).exists()
-        ):
+        # Safety-only ID membership survives rollout removal. It exposes no
+        # content and prevents replay of a known native outbound as new work.
+        if ConversationMessage.objects.filter(
+            workspace_id=account.workspace_id,
+            social_account_id=account.pk,
+            platform=account.platform,
+            platform_message_id=str(platform_message_id),
+            direction=ConversationMessage.Direction.OUTBOUND,
+        ).exists():
             return True
 
         # Some echoes omit direction/own-sender markers. A provider ID returned
@@ -309,13 +307,16 @@ class InboxSyncEngine:
 
     def _sync_account(self, account, *, quota_cache=None, spend=None, budget=None):
         """Sync messages for a single social account."""
+        from apps.inbox.conversation_policy import provider_options
         from apps.publisher.engine import _resolve_publish_credentials
 
         if self._poll_is_too_soon(account):
             return
 
         try:
-            provider = get_provider(account.platform, _resolve_publish_credentials(account))
+            provider = get_provider(
+                account.platform, {**_resolve_publish_credentials(account), **provider_options(account)}
+            )
         except ValueError:
             logger.warning("No provider for platform %s", account.platform)
             return
@@ -601,8 +602,12 @@ class InboxSyncEngine:
         return messages
 
     @transaction.atomic
-    def _upsert_message(self, account, msg, notify=True, related_post_id=None):
+    def _upsert_message(self, account, msg, notify=True, related_post_id=None, *, source="poll"):
         """Create or update an inbox message, deduplicating by platform_message_id."""
+        # Notification suppression is independent of historical provenance:
+        # ordinary polls may be silent and still observe live inbound work.
+        if source not in {"poll", "legacy_backfill"}:
+            raise ValueError("Unsupported inbox poll source.")
         message_id = str(msg.platform_message_id or "").strip()
         if not message_id:
             return
@@ -623,7 +628,7 @@ class InboxSyncEngine:
                 body=msg.text,
                 extra=msg.extra,
                 occurred_at=msg.timestamp,
-                source="poll",
+                source=source,
             )
             if _is_outgoing_dm(account, msg.sender_id, msg.extra, platform_message_id=message_id):
                 return

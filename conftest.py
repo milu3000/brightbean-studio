@@ -8,6 +8,28 @@ from apps.organizations.models import Organization
 
 
 @pytest.fixture
+def enroll_conversation_accounts(settings):
+    """Explicit synthetic account enrollment, never an authorization bypass."""
+
+    def enroll(*accounts, read=False):
+        entries = [
+            {
+                "workspace_id": str(account.workspace_id),
+                "social_account_id": str(account.pk),
+                "platform": account.platform,
+            }
+            for account in accounts
+        ]
+        capture = settings.INBOX_CONVERSATION_V2_CAPTURE_ACCOUNTS
+        settings.INBOX_CONVERSATION_V2_CAPTURE_ACCOUNTS = (capture if isinstance(capture, list) else []) + entries
+        if read:
+            readable = settings.INBOX_CONVERSATION_V2_READ_ACCOUNTS
+            settings.INBOX_CONVERSATION_V2_READ_ACCOUNTS = (readable if isinstance(readable, list) else []) + entries
+
+    return enroll
+
+
+@pytest.fixture
 def user(db):
     return User.objects.create_user(
         email="test@example.com", password="testpass123", name="Test User", tos_accepted_at=timezone.now()

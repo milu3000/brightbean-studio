@@ -8,6 +8,7 @@ from typing import Any
 
 from django.utils import timezone
 
+from apps.inbox.conversation_policy import read_allowed, read_available
 from apps.inbox.models import ConversationMessage, ConversationWorkState, InboxConversation, SendOperation
 from apps.inbox.reply_coordination import enabled
 from apps.mcp.conversation_tools import _iso, _scope, _sync
@@ -39,6 +40,8 @@ def _get_reply_coordination(args: dict, context: dict[str, Any]) -> dict:
         )
     except InboxConversation.DoesNotExist as exc:
         raise JsonRpcError(INVALID_PARAMS, "Conversation not found") from exc
+    if not read_allowed(conversation.social_account):
+        raise JsonRpcError(INVALID_PARAMS, "Conversation not found")
     result: dict[str, Any] = {
         "conversation_id": str(conversation.pk),
         "social_account_id": str(conversation.social_account_id),
@@ -62,10 +65,14 @@ def _get_reply_coordination(args: dict, context: dict[str, Any]) -> dict:
             "Fields are observed local state, not an atomic snapshot or proof of complete platform history.",
         ],
     }
-    state = ConversationWorkState.objects.filter(conversation_id=conversation.pk).first()
+    authorized_conversations = InboxConversation.objects.filter(**scoped, pk=conversation.pk).values("pk")
+    state = ConversationWorkState.objects.filter(conversation_id__in=authorized_conversations).first()
     active_ids = list(
         SendOperation.objects.filter(
-            conversation_id=conversation.pk, status__in=["prepared", "claimed", "outcome_unknown"]
+            **scoped,
+            social_account_id=conversation.social_account_id,
+            conversation_id__in=authorized_conversations,
+            status__in=["prepared", "claimed", "outcome_unknown"],
         ).values_list("pk", flat=True)[:2]
     )
     if state is None:
@@ -82,7 +89,7 @@ def _get_reply_coordination(args: dict, context: dict[str, Any]) -> dict:
         operation = SendOperation.objects.filter(
             **scoped,
             pk=state.active_operation_id,
-            conversation_id=conversation.pk,
+            conversation_id__in=authorized_conversations,
             social_account_id=conversation.social_account_id,
         ).first()
         if operation:
@@ -132,7 +139,7 @@ def _get_reply_coordination(args: dict, context: dict[str, Any]) -> dict:
 
 class _CoordinationTool(Tool):
     def is_enabled(self) -> bool:
-        return enabled()
+        return enabled() and read_available()
 
 
 register_tool(
