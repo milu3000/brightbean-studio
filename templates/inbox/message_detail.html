@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% load humanize %}
+{% load humanize static %}
 
 {% block title %}{{ message.sender_name }} - Inbox - {{ workspace.name }} - Brightbean{% endblock %}
 
@@ -27,7 +27,8 @@
 {% endblock %}
 
 {% block content %}
-<div class="inbox-detail-full" x-data="{
+<div class="inbox-detail-full" hx-history="false" x-data="{
+    ...inboxNavigation(),
     slaTarget: {{ sla_config.target_response_minutes|default:'0' }},
     getSlaClass(receivedAt) {
         if (!this.slaTarget) return '';
@@ -45,7 +46,12 @@
         if (diff < 0) return mins < 60 ? mins + 'm overdue' : Math.floor(mins/60) + 'h overdue';
         return mins < 60 ? mins + 'm left' : Math.floor(mins/60) + 'h ' + (mins%60) + 'm left';
     }
-}">
+}"
+     @htmx:before-request.window="beforeDetailRequest($event)"
+     @htmx:before-swap.window="beforeDetailSwap($event)"
+     @htmx:after-request.window="afterDetailRequest($event)"
+     @htmx:after-swap.window="afterDetailSwap($event)"
+     @popstate.window="restoreDetailHistory($event)">
     <!-- Back link -->
     <div class="px-5 py-2.5 border-b border-stone-100 flex-shrink-0">
         <a href="{% url 'inbox:feed' workspace_id=workspace.id %}"
@@ -54,8 +60,18 @@
             Back to Inbox
         </a>
     </div>
-    <div id="inbox-detail-panel" class="flex-1" style="height: calc(100% - 41px);">
+    <p x-show="detailLoading" x-cloak class="px-5 py-2 text-sm text-stone-500" role="status">Loading message…</p>
+    <div x-show="detailError" x-cloak class="px-5 py-3 text-sm text-red-700" role="alert">
+        Could not load this message.
+        <button type="button" @click="retryDetail()" class="underline font-semibold">Retry</button>
+    </div>
+    <div id="inbox-detail-panel" class="flex-1" style="height: calc(100% - 41px);"
+         x-show="detailReady" :inert="!detailReady" :aria-busy="detailLoading">
         {% include "inbox/partials/_message_panel.html" %}
     </div>
 </div>
+{% endblock %}
+
+{% block extra_js %}
+<script src="{% static 'js/inbox-navigation.js' %}"></script>
 {% endblock %}

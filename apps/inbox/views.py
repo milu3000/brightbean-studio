@@ -9,6 +9,7 @@ from django.db.models import Q
 from django.http import HttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.views.decorators.http import require_POST
+from django.views.decorators.vary import vary_on_headers
 
 from apps.members.decorators import require_permission
 from apps.members.models import WorkspaceMembership
@@ -134,6 +135,7 @@ def _get_workspace(request, workspace_id):
 
 @login_required
 @require_permission("use_inbox")
+@vary_on_headers("HX-Request", "HX-History-Restore-Request")
 def inbox_feed(request, workspace_id):
     """Main inbox feed with filtering, pagination, and split-panel layout."""
     workspace = _get_workspace(request, workspace_id)
@@ -227,7 +229,7 @@ def inbox_feed(request, workspace_id):
         },
     }
 
-    if request.htmx:
+    if request.htmx and not request.htmx.history_restore_request:
         return render(request, "inbox/partials/_message_list.html", context)
     return render(request, "inbox/feed.html", context)
 
@@ -237,6 +239,7 @@ def inbox_feed(request, workspace_id):
 
 @login_required
 @require_permission("use_inbox")
+@vary_on_headers("HX-Request", "HX-History-Restore-Request")
 def message_detail(request, workspace_id, message_id):
     """Message detail with thread, replies, notes, and reply composer."""
     workspace = _get_workspace(request, workspace_id)
@@ -266,7 +269,7 @@ def message_detail(request, workspace_id, message_id):
                 member["status"] = InboxMessage.Status.OPEN
         context["conversation"] = entry_for(shown, context["conversation_members"])
 
-    if request.htmx:
+    if request.htmx and not request.htmx.history_restore_request:
         return render(request, "inbox/partials/_message_panel.html", context)
     return render(request, "inbox/message_detail.html", context)
 

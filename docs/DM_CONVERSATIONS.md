@@ -101,3 +101,31 @@ migration check. No schema migration is expected.
   existing GitHub OAuth authorization lacks workflow scope. No permissions,
   credentials, workflow or deploy settings were expanded. GitHub CI must not be
   represented as passed if no checks were triggered; local results are separate.
+
+## Combined release integration, 2026-10-03
+
+The combined release retains the separate Events and conversation commits and
+adds navigation safeguards discovered during integration review:
+
+- Mobile Back remains outside the HTMX replacement target.
+- Superseded detail GETs are cancelled; older responses cannot overwrite a
+  newer conversation. Submitted sends are not aborted.
+- The previous composer is hidden/inert during navigation and stays hidden on
+  errors or no-swap responses; Retry reloads the requested conversation.
+- A stable request source survives list filters replacing rows.
+- Native/hash history changes do not blank standalone details. Inbox pages do
+  not create new HTMX history snapshots containing private composer markup;
+  history misses return full pages and vary on both HTMX headers. Existing
+  browser history caches are not erased; reload the Inbox after upgrading.
+
+Validation of the navigation patch: 12 executable Node state regressions,
+54 focused Django regressions, and 24 synthetic route/database checks passed.
+These verify login error visibility/password clearing, grouping, original IDs,
+saved draft associations, newest-message reply targets, history pagination,
+page-specific read state, and read-not-resolved behavior. The final combined
+commit must also pass the full PostgreSQL suite and all CI jobs before release.
+
+Real-browser desktop/mobile visual and interaction QA remains **unverified**:
+the cloud browser explicitly blocked the local preview origin. The restriction
+was not bypassed, and no public preview or real provider message was created.
+Source review and synthetic tests do not substitute for that acceptance step.
