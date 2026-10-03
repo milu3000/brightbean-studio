@@ -15,8 +15,10 @@ Upstream remains a source of selected fixes, not an automatic release train.
 - `main` remains an upstream-reference baseline and is **not deployable** for this
   installation. Its last verified baseline is
   `96ccc1e88fefa171c4e5ca981dc9f289bdf60d39`. Never reset stable or production to it
-- The fork's default branch should be `milu/stable` so new PRs naturally target
-  the own-project line. Default branch selection does not grant deployment rights
+- The proposed default branch is `milu/stable` so new PRs naturally target the
+  own-project line. The verified GitHub default is currently `main`; this
+  document does not change it. Confirm any settings change separately and record
+  its readback. Default branch selection does not grant deployment rights
 - Release records identify exact commit SHA, CI run, web and worker deployment
   IDs, migration result, feature flags, acceptance evidence and rollback target
 
