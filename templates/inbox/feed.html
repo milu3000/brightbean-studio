@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% load humanize static %}
+{% load humanize %}
 
 {% block title %}Inbox - {{ workspace.name }} - Brightbean{% endblock %}
 
@@ -123,12 +123,7 @@
 {% endblock %}
 
 {% block content %}
-<div class="inbox-shell" x-data="inboxController()" hx-history="false"
-     @htmx:before-request.window="beforeDetailRequest($event)"
-     @htmx:before-swap.window="beforeDetailSwap($event)"
-     @htmx:after-request.window="afterDetailRequest($event)"
-     @htmx:after-swap.window="afterDetailSwap($event)"
-     @popstate.window="restoreDetailHistory($event)">
+<div class="inbox-shell" x-data="inboxController()">
 
     <!-- Header -->
     <div class="flex flex-wrap items-center justify-between gap-2 px-3 sm:px-5 py-3 border-b border-stone-200 flex-shrink-0">
@@ -200,29 +195,20 @@
         </div>
 
         <!-- Right: Detail Panel -->
-        <div class="inbox-detail-pane"
+        <div class="inbox-detail-pane" id="inbox-detail-panel"
              :data-mobile-visible="activePanel === 'detail' ? '' : undefined">
             <!-- Mobile back button -->
             <div class="flex md:hidden items-center gap-2 px-3 py-2.5 border-b border-stone-200 flex-shrink-0">
-                <button @click="closeDetail()"
+                <button @click="activePanel = 'list'"
                         class="flex items-center gap-1.5 text-sm font-medium text-stone-600 hover:text-stone-900 transition-colors cursor-pointer">
                     <svg width="16" height="16" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>
                     Back
                 </button>
             </div>
-            <p x-show="detailLoading" x-cloak class="px-5 py-2 text-sm text-stone-500" role="status">Loading message…</p>
-            <div x-show="detailError" x-cloak class="px-5 py-3 text-sm text-red-700" role="alert">
-                Could not load this message.
-                <button type="button" @click="retryDetail()" class="underline font-semibold">Retry</button>
-            </div>
-            <!-- Only this child is swapped; mobile Back must survive. -->
-            <div id="inbox-detail-panel" class="flex flex-col flex-1 min-h-0"
-                 x-show="detailReady" :inert="!detailReady" :aria-busy="detailLoading">
-                <!-- Empty state shown when no message is selected -->
-                <div class="inbox-empty-detail">
-                    <svg class="w-12 h-12" style="color: var(--neutral-300);" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg>
-                    <p class="text-sm font-medium" style="color: var(--text-tertiary);">Select a message to view details</p>
-                </div>
+            <!-- Empty state shown when no message is selected -->
+            <div class="inbox-empty-detail">
+                <svg class="w-12 h-12" style="color: var(--neutral-300);" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg>
+                <p class="text-sm font-medium" style="color: var(--text-tertiary);">Select a message to view details</p>
             </div>
         </div>
 
@@ -231,11 +217,10 @@
 {% endblock %}
 
 {% block extra_js %}
-<script src="{% static 'js/inbox-navigation.js' %}"></script>
 <script nonce="{{ request.csp_nonce }}">
 function inboxController() {
     return {
-        ...inboxNavigation(),
+        activePanel: 'list',
         selected: new Set(),
         get selectedCount() { return this.selected.size; },
 
@@ -282,12 +267,11 @@ function inboxController() {
         },
 
         selectMessage(id, url) {
-            this.cancelDetailNavigation();
-            const row = document.getElementById('msg-' + id);
             /* Load detail panel via HTMX */
-            htmx.ajax('GET', url, { source: '#inbox-detail-panel', target: '#inbox-detail-panel', swap: 'innerHTML' }).catch(() => {});
+            htmx.ajax('GET', url, { target: '#inbox-detail-panel', swap: 'innerHTML' });
             /* Highlight active row */
             document.querySelectorAll('.inbox-row').forEach(el => el.classList.remove('is-active'));
+            const row = document.getElementById('msg-' + id);
             if (row) {
                 row.classList.add('is-active');
                 row.classList.remove('is-unread');

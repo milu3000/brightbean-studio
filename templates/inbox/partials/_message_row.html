@@ -1,11 +1,10 @@
 {% load humanize %}
 <div id="msg-{{ message.id }}"
-     class="inbox-row {% if entry.unread_count %}is-unread{% endif %}"
+     class="inbox-row {% if message.status == 'unread' %}is-unread{% endif %}"
      @click="selectMessage('{{ message.id }}', '{% url 'inbox:message_detail' workspace_id=workspace.id message_id=message.id %}')"
      role="button"
      tabindex="0">
 
-    {% if not entry.is_conversation %}
     <!-- Checkbox -->
     <div class="flex-shrink-0 pt-0.5" @click.stop>
         <input type="checkbox"
@@ -14,7 +13,6 @@
                class="w-3.5 h-3.5 rounded border-stone-300 text-orange-500 focus:ring-orange-200 cursor-pointer">
     </div>
 
-    {% endif %}
     <!-- Platform icon -->
     <div class="flex-shrink-0 pt-0.5">
         {% include "partials/_platform_icon.html" with platform=message.social_account.platform size="sm" %}
@@ -38,31 +36,28 @@
             {% if message.sender_handle %}
             <span class="text-[11px] text-stone-400 truncate">@{{ message.sender_handle }}</span>
             {% endif %}
-            <span class="text-[11px] text-stone-400 ml-auto flex-shrink-0" title="{{ entry.last_activity|date:'N j, Y g:i A' }}">{{ entry.last_activity|timesince }} ago</span>
+            <span class="text-[11px] text-stone-400 ml-auto flex-shrink-0" title="{{ message.received_at|date:'N j, Y g:i A' }}">{{ message.received_at|timesince }} ago</span>
         </div>
-        <p class="inbox-row-preview text-[12px] text-stone-500 truncate leading-snug">{% if entry.is_conversation %}Latest received: {% endif %}{{ message.body|truncatewords:20 }}</p>
-        <div class="flex flex-wrap items-center gap-1.5 mt-1.5">
+        <p class="inbox-row-preview text-[12px] text-stone-500 truncate leading-snug">{{ message.body|truncatewords:20 }}</p>
+        <div class="flex items-center gap-1.5 mt-1.5">
             <!-- Type badge -->
             <span class="badge-pill badge-type">{{ message.get_message_type_display }}</span>
             <!-- Status badge -->
-            <span class="badge-pill badge-status-{{ entry.status }}">{{ entry.status_label }}</span>
-            {% if entry.is_conversation %}
-            <span class="badge-pill badge-type">{{ entry.count }} messages · {{ entry.unread_count }} unread · {{ entry.pending_count }} need attention</span>
-            {% endif %}
+            <span class="badge-pill badge-status-{{ message.status }}">{{ message.get_status_display }}</span>
             <!-- Sentiment badge -->
             {% include "inbox/partials/_sentiment_badge.html" %}
             <!-- Assignment -->
-            {% if message.assigned_to and not entry.is_conversation %}
+            {% if message.assigned_to %}
             <span class="badge-pill" style="background: var(--accent-indigo-soft); color: var(--accent-indigo);">
                 <svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"/></svg>
                 {{ message.assigned_to.get_short_name|default:message.assigned_to.email|truncatechars:10 }}
             </span>
             {% endif %}
             <!-- SLA -->
-            {% if not entry.is_conversation and sla_config and sla_config.is_active and message.status != 'resolved' and message.status != 'archived' %}
+            {% if sla_config and sla_config.is_active and message.status != 'resolved' and message.status != 'archived' %}
             <span class="sla-countdown ml-auto"
-                  :class="getSlaClass('{{ entry.last_activity|date:'c' }}')"
-                  x-text="formatSla('{{ entry.last_activity|date:'c' }}')"></span>
+                  :class="getSlaClass('{{ message.received_at|date:'c' }}')"
+                  x-text="formatSla('{{ message.received_at|date:'c' }}')"></span>
             {% endif %}
         </div>
     </div>

@@ -1,15 +1,8 @@
 {% load humanize %}
-{% if inbox_entries %}
-{% for entry in inbox_entries %}
-{% include "inbox/partials/_message_row.html" with message=entry.message %}
+{% if inbox_messages %}
+{% for msg in inbox_messages %}
+{% include "inbox/partials/_message_row.html" with message=msg %}
 {% endfor %}
 {% else %}
 {% include "inbox/partials/_empty_state.html" %}
-{% endif %}
-{% if page_obj.has_other_pages %}
-<nav class="flex items-center justify-between p-3 text-sm" aria-label="Inbox pages">
-    {% if page_obj.has_previous %}<a href="?{{ page_query }}&page={{ page_obj.previous_page_number }}" hx-get="?{{ page_query }}&page={{ page_obj.previous_page_number }}" hx-target="#inbox-message-list" hx-push-url="true">Previous</a>{% endif %}
-    <span>Page {{ page_obj.number }} of {{ page_obj.paginator.num_pages }}</span>
-    {% if page_obj.has_next %}<a href="?{{ page_query }}&page={{ page_obj.next_page_number }}" hx-get="?{{ page_query }}&page={{ page_obj.next_page_number }}" hx-target="#inbox-message-list" hx-push-url="true">Next</a>{% endif %}
-</nav>
 {% endif %}

@@ -17,7 +17,7 @@
         <!-- Unassign option -->
         {% if message.assigned_to %}
         <button hx-post="{% url 'inbox:assign' workspace_id=workspace.id message_id=message.id %}"
-                hx-vals='{"assigned_to": "", "single": "1"}'
+                hx-vals='{"assigned_to": ""}'
                 hx-target="#inbox-detail-panel"
                 hx-swap="innerHTML"
                 @click="assignOpen = false"
@@ -29,7 +29,7 @@
         {% endif %}
         {% for membership in team_members %}
         <button hx-post="{% url 'inbox:assign' workspace_id=workspace.id message_id=message.id %}"
-                hx-vals='{"assigned_to": "{{ membership.user.id }}", "single": "1"}'
+                hx-vals='{"assigned_to": "{{ membership.user.id }}"}'
                 hx-target="#inbox-detail-panel"
                 hx-swap="innerHTML"
                 @click="assignOpen = false"

@@ -7,7 +7,7 @@
         {% else %}
         <span class="badge-pill" style="background: var(--surface-2); color: var(--stone-600, #57534e);">Draft</span>
         {% endif %}
-        <span class="text-[11px] text-stone-500">{% if draft.author %}{{ draft.author.get_short_name|default:draft.author.email }}{% else %}Studio{% endif %}</span>
+        <span class="text-[11px] text-stone-500">{{ draft.author.get_short_name|default:draft.author.email|default:"—" }}</span>
         <span class="text-[11px] text-stone-400 ml-auto">{{ draft.created_at|timesince }} ago</span>
     </div>
     <p class="text-[13px] text-stone-700 leading-relaxed whitespace-pre-wrap">{{ draft.body }}</p>

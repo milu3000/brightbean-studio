@@ -55,7 +55,6 @@
               hx-swap="beforeend"
               @htmx:after-request="if (!$event.detail.xhr.getResponseHeader('HX-Reply-Failed')) replyText = ''">
             {% csrf_token %}
-            {% if single_message_mode %}<input type="hidden" name="single" value="1">{% endif %}
             <textarea name="body"
                       x-model="replyText"
                       placeholder="Write a reply..."
@@ -91,7 +90,6 @@
               hx-swap="beforeend"
               @htmx:after-request="noteText = ''">
             {% csrf_token %}
-            {% if single_message_mode %}<input type="hidden" name="single" value="1">{% endif %}
             <textarea name="body"
                       x-model="noteText"
                       placeholder="Add an internal note (only visible to your team)..."
