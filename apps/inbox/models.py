@@ -409,3 +409,89 @@ class ConversationSyncState(models.Model):
         constraints = [
             models.UniqueConstraint(fields=["social_account", "platform", "stream"], name="inbox_convo_sync_unique"),
         ]
+
+
+class ConversationWorkState(models.Model):
+    """Optional local coordination, separate from history and legacy inbox work."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    conversation = models.OneToOneField(InboxConversation, on_delete=models.CASCADE, related_name="reply_work_state")
+    generation = models.PositiveBigIntegerField(default=0)
+    conversation_revision = models.PositiveBigIntegerField(default=0)
+    latest_incoming = models.ForeignKey(
+        ConversationMessage, on_delete=models.SET_NULL, null=True, blank=True, related_name="latest_reply_work_states"
+    )
+    burst_started_at = models.DateTimeField(null=True, blank=True)
+    latest_incoming_at = models.DateTimeField(null=True, blank=True)
+    due_at = models.DateTimeField(null=True, blank=True)
+    owner_paused = models.BooleanField(default=False)
+    # Identity transfer involving uncertain delivery must survive ordinary
+    # resume and even deletion of the transferred target. No clearing API yet.
+    identity_quarantined = models.BooleanField(default=False)
+    ordering_uncertain = models.BooleanField(default=False)
+    history_gap = models.BooleanField(default=False)
+    pause_reason = models.CharField(max_length=40, blank=True, default="")
+    active_operation = models.ForeignKey(
+        "SendOperation", on_delete=models.SET_NULL, null=True, blank=True, related_name="active_work_states"
+    )
+    fencing_counter = models.PositiveBigIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "inbox_conversation_work_state"
+        indexes = [models.Index(fields=["owner_paused", "due_at"], name="inbox_work_pause_due")]
+
+
+class SendOperation(models.Model):
+    """Stable local intent. A claim is a dry-run reservation, never a send."""
+
+    class Status(models.TextChoices):
+        PREPARED = "prepared", "Prepared locally"
+        CLAIMED = "claimed", "Claimed locally (dry run)"
+        CONFIRMED = "confirmed", "Explicitly reconciled"
+        FAILED = "failed", "Explicitly known not sent"
+        OUTCOME_UNKNOWN = "outcome_unknown", "Outcome unknown; reconciliation required"
+        SUPERSEDED = "superseded", "Superseded before dispatch"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    workspace = models.ForeignKey("workspaces.Workspace", on_delete=models.CASCADE, related_name="send_operations")
+    social_account = models.ForeignKey(
+        "social_accounts.SocialAccount", on_delete=models.CASCADE, related_name="send_operations"
+    )
+    platform = models.CharField(max_length=30)
+    conversation = models.ForeignKey(InboxConversation, on_delete=models.CASCADE, related_name="send_operations")
+    actor_scope = models.CharField(max_length=255)
+    idempotency_key = models.CharField(max_length=128)
+    payload_fingerprint = models.CharField(max_length=64)
+    body = models.TextField()
+    target = models.ForeignKey(
+        ConversationMessage, on_delete=models.SET_NULL, null=True, related_name="reply_send_operations"
+    )
+    expected_revision = models.PositiveBigIntegerField()
+    expected_generation = models.PositiveBigIntegerField()
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.PREPARED)
+    claim_token = models.UUIDField(null=True, blank=True)
+    fencing_token = models.PositiveBigIntegerField(default=0)
+    lease_expires_at = models.DateTimeField(null=True, blank=True)
+    # Reserved for explicit uncertainty evidence. Nothing in this phase calls a
+    # provider or turns this field into permission to dispatch.
+    external_attempted_at = models.DateTimeField(null=True, blank=True)
+    outcome_code = models.CharField(max_length=40, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    objects = WorkspaceScopedManager()
+
+    class Meta:
+        db_table = "inbox_send_operation"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["conversation", "actor_scope", "idempotency_key"], name="inbox_send_idempotency_unique"
+            ),
+            models.UniqueConstraint(
+                fields=["conversation"],
+                condition=models.Q(status__in=["prepared", "claimed", "outcome_unknown"]),
+                name="inbox_send_single_active",
+            ),
+        ]

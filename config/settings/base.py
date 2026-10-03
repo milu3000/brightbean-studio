@@ -716,3 +716,5 @@ MCP_EVENTS_SUBSCRIPTION_TTL_SECONDS = env.int("MCP_EVENTS_SUBSCRIPTION_TTL_SECON
 
 # Additive, read-only conversation history rollout; legacy inbox stays unchanged.
 INBOX_CONVERSATION_V2_ENABLED = env.bool("INBOX_CONVERSATION_V2_ENABLED", default=False)
+# Local prepare/claim only; requires Conversation V2 and never enables dispatch.
+INBOX_REPLY_COORDINATION_ENABLED = env.bool("INBOX_REPLY_COORDINATION_ENABLED", default=False)

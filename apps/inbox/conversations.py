@@ -10,13 +10,21 @@ from datetime import UTC, datetime, timedelta
 
 from django.conf import settings
 from django.db import transaction
-from django.db.models import F
+from django.db.models import F, Q
 from django.utils import timezone
 
 from providers.meta_inbox_content import is_deleted_content, merge_message_extra, normalize_attachments
 
 from .locking import lock_dm_account
-from .models import ConversationMessage, ConversationSyncState, InboxConversation, InboxMessage, InboxReply
+from .models import (
+    ConversationMessage,
+    ConversationSyncState,
+    ConversationWorkState,
+    InboxConversation,
+    InboxMessage,
+    InboxReply,
+    SendOperation,
+)
 
 _SOURCES = {"poll", "webhook", "app_send", "legacy_backfill"}
 _META_PLATFORMS = {"instagram_login", "facebook", "instagram"}
@@ -94,6 +102,9 @@ def _clear_ambiguous_peer_links(account, peer_id):
     affected = list(inferred.values_list("conversation_id", flat=True).distinct())
     inferred.update(conversation=None, conversation_attribution="", updated_at=timezone.now())
     conversations.filter(pk__in=affected).update(revision=F("revision") + 1, updated_at=timezone.now())
+    from .reply_coordination import invalidate_conversations
+
+    invalidate_conversations(account, list(conversations.values_list("pk", flat=True)))
 
 
 def _conversation(account, provider_id, peer_id, *, group_evidence=False):
@@ -117,6 +128,9 @@ def _conversation(account, provider_id, peer_id, *, group_evidence=False):
                 ConversationMessage.objects.filter(
                     **_scope(account), conversation=conversation, conversation_attribution="verified_peer"
                 ).update(conversation=None, conversation_attribution="", updated_at=timezone.now())
+                from .reply_coordination import invalidate_conversations
+
+                invalidate_conversations(account, [conversation.pk])
             if conversation.peer_ambiguous:
                 return conversation
             if peer_id and not conversation.peer_id:
@@ -126,13 +140,21 @@ def _conversation(account, provider_id, peer_id, *, group_evidence=False):
             _clear_ambiguous_peer_links(account, peer_id)
             if peer_id and scoped.filter(peer_id=peer_id, platform_conversation_id__isnull=False).count() == 1:
                 fallback = scoped.filter(peer_id=peer_id, platform_conversation_id__isnull=True).first()
-                if fallback:
+                if fallback and not (
+                    # Preserve local uncertainty/pause records across identity
+                    # changes. Never move an operation onto another thread.
+                    fallback.send_operations.exists() or hasattr(fallback, "reply_work_state")
+                ):
                     moved = ConversationMessage.objects.filter(**_scope(account), conversation=fallback).update(
                         conversation=conversation, updated_at=timezone.now()
                     )
                     if moved:
                         scoped.filter(pk=conversation.pk).update(revision=F("revision") + 1, updated_at=timezone.now())
                     fallback.delete()
+                elif fallback:
+                    from .reply_coordination import invalidate_conversations
+
+                    invalidate_conversations(account, [fallback.pk, conversation.pk])
             return conversation
         if (
             peer_id
@@ -246,6 +268,13 @@ def upsert_conversation_message(
     )
     previous = {field: deepcopy(getattr(row, field)) for field in meaningful_fields} if not row._state.adding else None
     previous_conversation_id = row.conversation_id
+    # Canonical target provenance survives attribution withdrawal to null.
+    # Capture before merging/deleting a local row, whose FK may be SET_NULL.
+    uncertain_source_ids = set(
+        SendOperation.objects.filter(**_scope(account), target_id__in={row.pk, local_row.pk if local_row else None})
+        .filter(Q(status="outcome_unknown") | Q(external_attempted_at__isnull=False))
+        .values_list("conversation_id", flat=True)
+    )
     removed_conversation_id = None
     if local_row and local_row.pk != row.pk:
         # Only an explicit reply link and its exact provider ID permits this
@@ -342,29 +371,67 @@ def upsert_conversation_message(
     if legacy_reply:
         row.legacy_reply = legacy_reply
     row.save()
-    if (
+    changed = bool(
         removed_conversation_id
         or previous is None
         or any(getattr(row, field) != previous[field] for field in meaningful_fields)
-    ):
+    )
+    if changed:
         InboxConversation.objects.filter(
             **_scope(account), pk__in={removed_conversation_id, previous_conversation_id, row.conversation_id} - {None}
         ).update(revision=F("revision") + 1, updated_at=timezone.now())
+    from .reply_coordination import invalidate_conversations, observe_message, quarantine_transferred_uncertainty
+
+    old_conversation_ids = ({removed_conversation_id, previous_conversation_id} | uncertain_source_ids) - {
+        None,
+        row.conversation_id,
+    }
+    # Historical identity changes cannot erase uncertain outcomes either.
+    # Quarantine is a safety hold with no due time, not queued inbound work.
+    quarantine_transferred_uncertainty(account, old_conversation_ids, row.conversation_id)
+    if source != "legacy_backfill":
+        invalidate_conversations(account, old_conversation_ids)
+    observe_message(
+        row.pk,
+        source=source,
+        is_new=previous is None,
+        previous_direction=previous["direction"] if previous else None,
+        previous_conversation_id=previous_conversation_id,
+        previous_attribution=previous["conversation_attribution"] if previous else "",
+        changed=changed,
+    )
     return row
 
 
+@transaction.atomic
 def link_legacy_message(row, message):
     """Link a freshly created legacy work item without replaying ingestion."""
     if row is None or row.legacy_message_id == message.pk:
         return
     if (row.workspace_id, row.social_account_id) != (message.workspace_id, message.social_account_id):
         raise ValueError("Legacy message is outside the conversation scope.")
+    account = lock_dm_account(row.social_account_id, row.workspace_id)
+    if account is None or account.platform != row.platform:
+        return
+    row = ConversationMessage.objects.filter(pk=row.pk, **_scope(account)).first()
+    if row is None or row.legacy_message_id == message.pk:
+        return
+    conversation = (
+        InboxConversation.objects.select_for_update().filter(pk=row.conversation_id, **_scope(account)).first()
+        if row.conversation_id
+        else None
+    )
     row.legacy_message = message
     row.save(update_fields=["legacy_message", "updated_at"])
-    if row.conversation_id:
-        InboxConversation.objects.filter(pk=row.conversation_id).update(
+    if conversation:
+        InboxConversation.objects.filter(pk=conversation.pk).update(
             revision=F("revision") + 1, updated_at=timezone.now()
         )
+        # Metadata-only linking may advance an already-current snapshot, but
+        # must never hide observations missed while coordination was disabled.
+        ConversationWorkState.objects.filter(
+            conversation=conversation, conversation_revision=conversation.revision, history_gap=False
+        ).update(conversation_revision=F("conversation_revision") + 1, updated_at=timezone.now())
 
 
 def record_reply(reply, *, source="app_send"):
