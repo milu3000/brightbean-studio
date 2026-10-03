@@ -8,13 +8,13 @@ only a small normalized projection is retained.
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 
-from django.conf import settings
 from django.db import transaction
 from django.db.models import F, Q
 from django.utils import timezone
 
 from providers.meta_inbox_content import is_deleted_content, merge_message_extra, normalize_attachments
 
+from .conversation_policy import capture_allowed, enabled  # noqa: F401 (compatibility import)
 from .locking import lock_dm_account
 from .models import (
     ConversationMessage,
@@ -27,11 +27,6 @@ from .models import (
 )
 
 _SOURCES = {"poll", "webhook", "app_send", "legacy_backfill"}
-_META_PLATFORMS = {"instagram_login", "facebook", "instagram"}
-
-
-def enabled():
-    return bool(getattr(settings, "INBOX_CONVERSATION_V2_ENABLED", False))
 
 
 def _id(value):
@@ -210,11 +205,11 @@ def upsert_conversation_message(
     reconcile only within that account/platform/workspace. Missing IDs require
     a linked SENT legacy reply and stay delivery-unverified, never fabricated.
     """
-    if not enabled() or source not in _SOURCES:
+    if not capture_allowed(account) or source not in _SOURCES:
         return None
     expected_platform = account.platform
     account = lock_dm_account(account.pk, account.workspace_id)
-    if account is None or account.platform != expected_platform:
+    if account is None or account.platform != expected_platform or not capture_allowed(account):
         return None
     extra = _dict(extra)
     provider_id = _id(platform_message_id)
@@ -411,7 +406,7 @@ def link_legacy_message(row, message):
     if (row.workspace_id, row.social_account_id) != (message.workspace_id, message.social_account_id):
         raise ValueError("Legacy message is outside the conversation scope.")
     account = lock_dm_account(row.social_account_id, row.workspace_id)
-    if account is None or account.platform != row.platform:
+    if account is None or account.platform != row.platform or not capture_allowed(account):
         return
     row = ConversationMessage.objects.filter(pk=row.pk, **_scope(account)).first()
     if row is None or row.legacy_message_id == message.pk:
@@ -436,7 +431,7 @@ def link_legacy_message(row, message):
 
 def record_reply(reply, *, source="app_send"):
     """Mirror a legacy send without upgrading unsupported/local delivery claims."""
-    if not enabled() or reply.status != InboxReply.Status.SENT:
+    if not capture_allowed(reply.inbox_message.social_account) or reply.status != InboxReply.Status.SENT:
         return None
     message = reply.inbox_message
     if message.message_type != InboxMessage.MessageType.DM:
@@ -468,11 +463,11 @@ def record_reply(reply, *, source="app_send"):
 @transaction.atomic
 def begin_sync(account, *, started_at=None):
     """Only supported instrumented Meta providers get a per-stream attempt."""
-    if not enabled() or account.platform not in _META_PLATFORMS:
+    if not capture_allowed(account):
         return None
     expected_platform = account.platform
     account = lock_dm_account(account.pk, account.workspace_id)
-    if account is None or account.platform != expected_platform:
+    if account is None or account.platform != expected_platform or not capture_allowed(account):
         return None
     started_at = started_at or timezone.now()
     for stream in ("dm", "comment"):
@@ -487,11 +482,11 @@ def begin_sync(account, *, started_at=None):
 @transaction.atomic
 def finish_sync(account, *, started_at, stream_results=None, imported=False, error_code=""):
     """Never infer successful DM fetching from a mixed legacy poll result."""
-    if not enabled() or started_at is None:
+    if not capture_allowed(account) or started_at is None:
         return
     expected_platform = account.platform
     account = lock_dm_account(account.pk, account.workspace_id)
-    if account is None or account.platform != expected_platform:
+    if account is None or account.platform != expected_platform or not capture_allowed(account):
         return
     for state in ConversationSyncState.objects.filter(**_scope(account), last_attempt_at=started_at):
         result = _dict(_dict(stream_results).get(state.stream))

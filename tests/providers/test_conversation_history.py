@@ -1,5 +1,6 @@
 """Opt-in native outbound history and independent Meta inbox stream results."""
 
+import json
 from unittest.mock import Mock
 
 import pytest
@@ -12,6 +13,29 @@ from providers.meta_inbox_content import BASIC_MESSAGE_FIELDS, CONTENT_MESSAGE_F
 PROVIDERS = [FacebookProvider, InstagramLoginProvider]
 OWNER = "owner-id"
 PEER = "peer-id"
+WORKSPACE_ID = "10000000-0000-4000-8000-000000000001"
+ACCOUNT_ID = "20000000-0000-4000-8000-000000000001"
+OTHER_ACCOUNT_ID = "20000000-0000-4000-8000-000000000002"
+
+
+@pytest.fixture(autouse=True)
+def _default_conversation_settings(settings):
+    settings.INBOX_CONVERSATION_V2_ENABLED = False
+    settings.INBOX_CONVERSATION_V2_CAPTURE_ACCOUNTS = "[]"
+    settings.INBOX_CONVERSATION_V2_READ_ACCOUNTS = "[]"
+
+
+def _scope(provider_type, account_id=ACCOUNT_ID):
+    return {
+        "workspace_id": WORKSPACE_ID,
+        "social_account_id": account_id,
+        "platform": "facebook" if provider_type is FacebookProvider else "instagram_login",
+    }
+
+
+def _enroll(settings, provider_type, account_id=ACCOUNT_ID):
+    settings.INBOX_CONVERSATION_V2_ENABLED = True
+    settings.INBOX_CONVERSATION_V2_CAPTURE_ACCOUNTS = json.dumps([_scope(provider_type, account_id)])
 
 
 def _message(message_id="native-outbound", sender_id=OWNER, **fields):
@@ -24,8 +48,10 @@ def _message(message_id="native-outbound", sender_id=OWNER, **fields):
     }
 
 
-def _provider(provider_type, messages, *, participants=None, credentials=None):
-    provider = provider_type(credentials if credentials is not None else {"page_id": OWNER, "ig_user_id": OWNER})
+def _provider(provider_type, messages, *, participants=None, credentials=None, account_id=ACCOUNT_ID):
+    creds = dict(credentials if credentials is not None else {"page_id": OWNER, "ig_user_id": OWNER})
+    creds["conversation_v2_scope"] = _scope(provider_type, account_id)
+    provider = provider_type(creds)
     conversation = {"id": "provider-conversation-id", "messages": {"data": messages}}
     if participants is not None:
         conversation["participants"] = participants
@@ -39,8 +65,8 @@ def _provider(provider_type, messages, *, participants=None, credentials=None):
 
 
 @pytest.mark.parametrize("provider_type", PROVIDERS)
-def test_disabled_preserves_legacy_skip_and_request_fields(settings, provider_type):
-    settings.INBOX_CONVERSATION_V2_ENABLED = False
+def test_unenrolled_preserves_legacy_skip_and_request_fields(settings, provider_type):
+    settings.INBOX_CONVERSATION_V2_ENABLED = True
     provider = _provider(
         provider_type,
         [_message("inbound", PEER, to={"data": [{"id": OWNER}]}), _message()],
@@ -65,7 +91,7 @@ def test_disabled_preserves_legacy_skip_and_request_fields(settings, provider_ty
 
 @pytest.mark.parametrize("provider_type", PROVIDERS)
 def test_enabled_keeps_native_outbound_and_exact_pair_identity(settings, provider_type):
-    settings.INBOX_CONVERSATION_V2_ENABLED = True
+    _enroll(settings, provider_type)
     provider = _provider(
         provider_type,
         [_message("inbound", PEER), _message()],
@@ -94,8 +120,183 @@ def test_enabled_keeps_native_outbound_and_exact_pair_identity(settings, provide
 
 
 @pytest.mark.parametrize("provider_type", PROVIDERS)
+def test_only_exact_account_is_enriched_when_same_provider_has_two_accounts(settings, provider_type):
+    _enroll(settings, provider_type)
+    results = {}
+    for account_id in (ACCOUNT_ID, OTHER_ACCOUNT_ID):
+        provider = _provider(
+            provider_type,
+            [_message("inbound", PEER), _message()],
+            participants={"data": [{"id": OWNER}, {"id": PEER}]},
+            account_id=account_id,
+        )
+        results[account_id] = provider._fetch_direct_messages("synthetic")
+        fields = provider._request.call_args.kwargs["params"]["fields"]
+        assert (",to" in fields) is (account_id == ACCOUNT_ID)
+        if provider_type is FacebookProvider:
+            expected_params = {"fields": "id,participants"} if account_id == ACCOUNT_ID else {}
+            assert provider._request.call_args_list[0].kwargs["params"] == expected_params
+
+    assert [message.platform_message_id for message in results[ACCOUNT_ID]] == ["inbound", "native-outbound"]
+    assert results[ACCOUNT_ID][1].extra["direction"] == "outbound"
+    assert [message.platform_message_id for message in results[OTHER_ACCOUNT_ID]] == ["inbound"]
+    assert results[OTHER_ACCOUNT_ID][0].extra == {
+        "conversation_id": "provider-conversation-id",
+        "sender_id": PEER,
+        "inbox_attachments": [],
+    }
+
+
+@pytest.mark.parametrize("provider_type", PROVIDERS)
+@pytest.mark.parametrize("binding_error", ["missing", "wrong_platform", "wrong_workspace"])
+def test_enrollment_requires_exact_scope_bound_to_provider(settings, provider_type, binding_error):
+    _enroll(settings, provider_type)
+    provider = _provider(provider_type, [_message("inbound", PEER), _message()])
+    if binding_error == "missing":
+        provider.credentials.pop("conversation_v2_scope")
+    elif binding_error == "wrong_platform":
+        # Even a valid enrollment for the other platform cannot authorize this provider.
+        wrong_provider = InstagramLoginProvider if provider_type is FacebookProvider else FacebookProvider
+        provider.credentials["conversation_v2_scope"] = _scope(wrong_provider)
+        _enroll(settings, wrong_provider)
+    else:
+        provider.credentials["conversation_v2_scope"]["workspace_id"] = "10000000-0000-4000-8000-000000000002"
+
+    messages = provider._fetch_direct_messages("synthetic")
+
+    assert [message.platform_message_id for message in messages] == ["inbound"]
+    assert ",to" not in provider._request.call_args.kwargs["params"]["fields"]
+    assert "message_recipient_id" not in messages[0].extra
+    if provider_type is FacebookProvider:
+        assert provider._request.call_args_list[0].kwargs["params"] == {}
+
+
+@pytest.mark.parametrize("provider_type", PROVIDERS)
+def test_global_kill_switch_disables_enrolled_account(settings, provider_type):
+    _enroll(settings, provider_type)
+    settings.INBOX_CONVERSATION_V2_ENABLED = False
+    provider = _provider(provider_type, [_message("inbound", PEER), _message()])
+
+    messages = provider._fetch_direct_messages("synthetic")
+
+    assert [message.platform_message_id for message in messages] == ["inbound"]
+    assert ",to" not in provider._request.call_args.kwargs["params"]["fields"]
+
+
+@pytest.mark.parametrize("provider_type", PROVIDERS)
+def test_existing_provider_rechecks_enrollment_on_next_poll(settings, provider_type):
+    _enroll(settings, provider_type)
+    provider = _provider(provider_type, [_message("inbound", PEER), _message()])
+    responses = (
+        list(provider._request.side_effect) if provider_type is FacebookProvider else [provider._request.return_value]
+    )
+    provider._request = Mock(side_effect=responses * 2)
+    assert len(provider._fetch_direct_messages("synthetic")) == 2
+
+    settings.INBOX_CONVERSATION_V2_CAPTURE_ACCOUNTS = "[]"
+    messages = provider._fetch_direct_messages("synthetic")
+
+    assert [message.platform_message_id for message in messages] == ["inbound"]
+    assert ",to" not in provider._request.call_args.kwargs["params"]["fields"]
+
+
+@pytest.mark.parametrize("provider_type", PROVIDERS)
+def test_revocation_while_fetching_messages_drops_outbound_and_identity(settings, provider_type):
+    _enroll(settings, provider_type)
+    provider = _provider(
+        provider_type,
+        [_message("inbound", PEER, to={"data": [{"id": OWNER}]}), _message()],
+        participants={"data": [{"id": OWNER}, {"id": PEER}]},
+    )
+    responses = (
+        list(provider._request.side_effect) if provider_type is FacebookProvider else [provider._request.return_value]
+    )
+
+    def fetch(*args, **kwargs):
+        response = responses.pop(0)
+        if not responses:
+            settings.INBOX_CONVERSATION_V2_CAPTURE_ACCOUNTS = "[]"
+        return response
+
+    provider._request = Mock(side_effect=fetch)
+    messages = provider._fetch_direct_messages("synthetic")
+
+    assert [message.platform_message_id for message in messages] == ["inbound"]
+    assert messages[0].extra == {
+        "conversation_id": "provider-conversation-id",
+        "sender_id": PEER,
+        "inbox_attachments": [],
+    }
+
+
+def test_facebook_revocation_between_conversations_also_discards_earlier_enrichment(settings):
+    _enroll(settings, FacebookProvider)
+    provider = _provider(FacebookProvider, [])
+    conversations = [
+        {"id": name, "participants": {"data": [{"id": OWNER}, {"id": PEER}]}} for name in ("first", "second", "third")
+    ]
+
+    def fetch(method, url, **kwargs):
+        if url.endswith("/conversations"):
+            return Mock(json=lambda: {"data": conversations})
+        conversation_id = url.split("/")[-2]
+        if conversation_id == "second":
+            settings.INBOX_CONVERSATION_V2_CAPTURE_ACCOUNTS = "[]"
+        return Mock(
+            json=lambda: {
+                "data": [_message(f"{conversation_id}-inbound", PEER), _message(f"{conversation_id}-outbound")]
+            }
+        )
+
+    provider._request = Mock(side_effect=fetch)
+    messages = provider._fetch_direct_messages("synthetic")
+
+    assert [message.platform_message_id for message in messages] == [
+        "first-inbound",
+        "second-inbound",
+        "third-inbound",
+    ]
+    assert all(set(message.extra) == {"conversation_id", "sender_id", "inbox_attachments"} for message in messages)
+    assert ",to" in provider._request.call_args_list[1].kwargs["params"]["fields"]
+    assert provider._request.call_args.kwargs["params"]["fields"] == CONTENT_MESSAGE_FIELDS
+
+
+@pytest.mark.parametrize("provider_type", PROVIDERS)
+def test_attachment_fallback_rechecks_revoked_enrollment(settings, provider_type):
+    _enroll(settings, provider_type)
+    provider = _provider(provider_type, [_message("inbound", PEER), _message()])
+    responses = (
+        list(provider._request.side_effect) if provider_type is FacebookProvider else [provider._request.return_value]
+    )
+    failed = False
+
+    def fetch(*args, **kwargs):
+        nonlocal failed
+        if "attachments" in kwargs["params"].get("fields", "") and not failed:
+            failed = True
+            settings.INBOX_CONVERSATION_V2_CAPTURE_ACCOUNTS = "[]"
+            raise APIError(
+                "unsupported attachment field",
+                raw_response={"error": {"code": 100, "message": "Tried accessing nonexisting field (attachments)"}},
+            )
+        return responses.pop(0)
+
+    provider._request = Mock(side_effect=fetch)
+    messages = provider._fetch_direct_messages("synthetic")
+
+    assert failed
+    assert [message.platform_message_id for message in messages] == ["inbound"]
+    expected_fields = (
+        BASIC_MESSAGE_FIELDS
+        if provider_type is FacebookProvider
+        else f"id,participants,messages{{{BASIC_MESSAGE_FIELDS}}}"
+    )
+    assert provider._request.call_args.kwargs["params"]["fields"] == expected_fields
+
+
+@pytest.mark.parametrize("provider_type", PROVIDERS)
 def test_message_to_single_recipient_is_sufficient_evidence(settings, provider_type):
-    settings.INBOX_CONVERSATION_V2_ENABLED = True
+    _enroll(settings, provider_type)
     provider = _provider(provider_type, [_message(to={"data": [{"id": PEER, "name": "Not retained"}]})])
 
     extra = provider._fetch_direct_messages("synthetic")[0].extra
@@ -127,7 +328,7 @@ def test_message_to_single_recipient_is_sufficient_evidence(settings, provider_t
     ],
 )
 def test_unknown_ambiguous_and_group_recipient_is_never_guessed(settings, provider_type, participants, to):
-    settings.INBOX_CONVERSATION_V2_ENABLED = True
+    _enroll(settings, provider_type)
     fields = {"to": to} if to is not None else {}
     provider = _provider(provider_type, [_message(**fields)], participants=participants)
 
@@ -144,7 +345,7 @@ def test_unknown_ambiguous_and_group_recipient_is_never_guessed(settings, provid
 
 @pytest.mark.parametrize("provider_type", PROVIDERS)
 def test_unknown_own_id_never_marks_outbound(settings, provider_type):
-    settings.INBOX_CONVERSATION_V2_ENABLED = True
+    _enroll(settings, provider_type)
     provider = _provider(provider_type, [_message()], credentials={})
 
     messages = provider._fetch_direct_messages("synthetic")
@@ -156,7 +357,7 @@ def test_unknown_own_id_never_marks_outbound(settings, provider_type):
 
 @pytest.mark.parametrize("provider_type", PROVIDERS)
 def test_unsupported_attachment_fallback_preserves_requested_identity_fields(settings, provider_type):
-    settings.INBOX_CONVERSATION_V2_ENABLED = True
+    _enroll(settings, provider_type)
     provider = _provider(provider_type, [_message(to={"data": [{"id": PEER}]})])
     request = provider._request
     error = APIError(

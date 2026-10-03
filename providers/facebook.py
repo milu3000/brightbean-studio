@@ -886,10 +886,9 @@ class FacebookProvider(SocialProvider):
         return messages
 
     def _fetch_direct_messages(self, access_token: str, since: datetime | None = None) -> list[InboxMessage]:
-        from django.conf import settings
+        from apps.inbox.conversation_policy import provider_capture_allowed
 
-        conversation_v2 = getattr(settings, "INBOX_CONVERSATION_V2_ENABLED", False)
-        identity_fields = ",to" if conversation_v2 else ""
+        conversation_v2 = provider_capture_allowed(self.credentials, platform="facebook")
         page_id = self.credentials.get("page_id", "me")
         params: dict = {}
         if conversation_v2:
@@ -905,17 +904,32 @@ class FacebookProvider(SocialProvider):
         )
         conversations = resp.json().get("data", [])
 
-        messages: list[InboxMessage] = []
+        def request_messages(*args, **kwargs):
+            # A field-compatibility retry must also honor enrollment revocation.
+            if not provider_capture_allowed(self.credentials, platform="facebook"):
+                kwargs["params"] = {**kwargs["params"], "fields": kwargs["params"]["fields"].replace(",to", "")}
+            return self._request(*args, **kwargs)
+
+        conversation_messages = []
         for convo in conversations:
             convo_id = convo["id"]
+            identity_fields = ",to" if provider_capture_allowed(self.credentials, platform="facebook") else ""
             msg_resp = request_with_content_fields(
-                self._request,
+                request_messages,
                 f"{BASE_URL}/{convo_id}/messages",
                 access_token=access_token,
                 params={"fields": CONTENT_MESSAGE_FIELDS + identity_fields},
                 basic_fields=BASIC_MESSAGE_FIELDS + identity_fields,
             )
-            for msg in msg_resp.json().get("data", []):
+            conversation_messages.append((convo, msg_resp.json().get("data", [])))
+
+        # Project only after all responses arrive: revocation during a later
+        # conversation fetch also excludes earlier outbound/identity data.
+        conversation_v2 = provider_capture_allowed(self.credentials, platform="facebook")
+        messages: list[InboxMessage] = []
+        for convo, polled_messages in conversation_messages:
+            convo_id = convo["id"]
+            for msg in polled_messages:
                 sender = msg.get("from", {})
                 sender_id = str(sender.get("id", ""))
                 # A conversation contains both sides. Without this the Page's

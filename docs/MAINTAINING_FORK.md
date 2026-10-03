@@ -82,6 +82,10 @@ or silently changes the legacy per-message event/send contracts.
 Both flags default off. Deploy additive migrations first and verify both web and
 worker. Activate history only after readback and separate provider acceptance;
 keep coordination shadow/local-only until its documented gates are satisfied.
+Capture and read enrollments default empty and pin workspace, account and
+platform. Never enable global capture to obtain an unapproved test sample, and
+do not treat V2-off as a pause of existing received-event responders. Follow the
+[scoped acceptance sequence](CONVERSATION_V2_SCOPED_ROLLOUT.md).
 Never treat a stored debounce deadline as an automatic reply or use an unknown
 outcome to justify a retry. See [phase 1](CONVERSATION_V2_PHASE1.md) and
 [phase 2](CONVERSATION_V2_PHASE2.md) for exact limitations.

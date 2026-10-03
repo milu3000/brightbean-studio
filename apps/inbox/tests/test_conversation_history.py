@@ -25,8 +25,9 @@ pytestmark = [pytest.mark.django_db, pytest.mark.usefixtures("v2")]
 
 
 @pytest.fixture
-def v2(settings):
+def v2(settings, inbox_account, enroll_conversation_accounts):
     settings.INBOX_CONVERSATION_V2_ENABLED = True
+    enroll_conversation_accounts(inbox_account)
 
 
 def _ingest(account, source, *, mid="native-1", outbound=True, recipient="customer-1", conversation="", deleted=False):
@@ -158,13 +159,16 @@ def test_incoming_dual_write_enriches_exact_identity_without_duplicate_work(inbo
 
 
 @pytest.mark.parametrize("foreign_workspace", [False, True])
-def test_same_provider_id_never_merges_or_hides_another_accounts_inbound(inbox_account, foreign_workspace):
+def test_same_provider_id_never_merges_or_hides_another_accounts_inbound(
+    inbox_account, foreign_workspace, enroll_conversation_accounts
+):
     workspace = inbox_account.workspace
     if foreign_workspace:
         workspace = Workspace.objects.create(name="Other workspace", organization=workspace.organization)
     other = SocialAccount.objects.create(
         workspace=workspace, platform="facebook", account_platform_id="other", account_name="Other"
     )
+    enroll_conversation_accounts(other)
     _ingest(other, "poll", conversation="same-thread")
     _ingest(inbox_account, "poll", outbound=False, conversation="same-thread")
     assert ConversationMessage.objects.count() == 2
@@ -418,6 +422,7 @@ def test_backfill_preview_apply_and_rerun_are_local_and_preserve_archive(inbox_a
             call_command(
                 "backfill_conversation_history",
                 workspace=str(inbox_account.workspace_id),
+                account=str(inbox_account.pk),
                 apply=True,
                 batch_size=1,
                 stdout=output,
@@ -667,10 +672,11 @@ def test_stale_platform_cannot_begin_sync_in_new_namespace(inbox_account):
     assert not ConversationSyncState.objects.exists()
 
 
-def test_stale_platform_cannot_finish_same_timestamp_sync_in_new_namespace(inbox_account):
+def test_stale_platform_cannot_finish_same_timestamp_sync_in_new_namespace(inbox_account, enroll_conversation_accounts):
     started = begin_sync(inbox_account)
     SocialAccount.objects.filter(pk=inbox_account.pk).update(platform="instagram_login")
     fresh = SocialAccount.objects.get(pk=inbox_account.pk)
+    enroll_conversation_accounts(fresh)
     assert begin_sync(fresh, started_at=started) == started
     finish_sync(inbox_account, started_at=started, imported=True, stream_results={"dm": {"status": "success"}})
     assert ConversationSyncState.objects.count() == 4

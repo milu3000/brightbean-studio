@@ -5,6 +5,7 @@ from datetime import timedelta
 from django.core.management.base import BaseCommand
 from django.utils import timezone
 
+from apps.inbox.conversation_policy import provider_options
 from apps.inbox.tasks import InboxSyncEngine, _related_post_key, resolve_related_posts
 from apps.social_accounts.models import SocialAccount
 from providers import get_provider
@@ -55,7 +56,9 @@ class Command(BaseCommand):
 
         for account in accounts:
             try:
-                provider = get_provider(account.platform, _resolve_publish_credentials(account))
+                provider = get_provider(
+                    account.platform, {**_resolve_publish_credentials(account), **provider_options(account)}
+                )
                 # Explicit history seeding is the one caller that must not
                 # stop early: the routine poll's cutoff and its 5-page cap exist
                 # to protect a daily budget across hundreds of automatic polls,
@@ -80,6 +83,7 @@ class Command(BaseCommand):
                             account,
                             msg,
                             notify=False,
+                            source="legacy_backfill",
                             related_post_id=related_posts.get(_related_post_key(msg.extra)),
                         )
                         count += 1

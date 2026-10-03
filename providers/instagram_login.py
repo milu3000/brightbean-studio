@@ -596,22 +596,31 @@ class InstagramLoginProvider(SocialProvider):
         )
 
     def _fetch_direct_messages(self, access_token: str, since: datetime | None = None) -> list[InboxMessage]:
-        from django.conf import settings
+        from apps.inbox.conversation_policy import provider_capture_allowed
 
-        conversation_v2 = getattr(settings, "INBOX_CONVERSATION_V2_ENABLED", False)
+        conversation_v2 = provider_capture_allowed(self.credentials, platform="instagram_login")
         identity_fields = ",to" if conversation_v2 else ""
         params: dict = {"fields": f"id,participants,messages{{{CONTENT_MESSAGE_FIELDS}{identity_fields}}}"}
         if since:
             params["since"] = int(since.timestamp())
 
+        def request_messages(*args, **kwargs):
+            # A field-compatibility retry must also honor enrollment revocation.
+            if not provider_capture_allowed(self.credentials, platform="instagram_login"):
+                kwargs["params"] = {**kwargs["params"], "fields": kwargs["params"]["fields"].replace(",to", "")}
+            return self._request(*args, **kwargs)
+
         resp = request_with_content_fields(
-            self._request,
+            request_messages,
             f"{API_BASE}/me/conversations",
             access_token=access_token,
             params=params,
             basic_fields=f"id,participants,messages{{{BASIC_MESSAGE_FIELDS}{identity_fields}}}",
         )
         conversations = resp.json().get("data", [])
+        # Do not retain outbound history or identity enrichment if enrollment
+        # was revoked while the request was in flight.
+        conversation_v2 = provider_capture_allowed(self.credentials, platform="instagram_login")
 
         own_id = str(self.credentials.get("ig_user_id", ""))
 

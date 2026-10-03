@@ -1,6 +1,7 @@
 """Anonymous local coordination tests, not proof of PostgreSQL or live sends."""
 
 from concurrent.futures import ThreadPoolExecutor
+from copy import deepcopy
 from dataclasses import replace
 from datetime import timedelta
 from threading import Barrier
@@ -29,8 +30,11 @@ from apps.inbox.reply_coordination import (
     check_before_send,
     claim_reply,
     enabled,
+    invalidate_conversations,
     mark_outcome_unknown,
+    observe_message,
     prepare_reply,
+    quarantine_transferred_uncertainty,
     set_owner_paused,
 )
 from apps.mcp.models import EventOutbox
@@ -41,9 +45,10 @@ pytestmark = pytest.mark.django_db
 
 
 @pytest.fixture(autouse=True)
-def flags(settings):
+def flags(settings, inbox_account, enroll_conversation_accounts):
     settings.INBOX_CONVERSATION_V2_ENABLED = True
     settings.INBOX_REPLY_COORDINATION_ENABLED = True
+    enroll_conversation_accounts(inbox_account)
 
 
 @pytest.fixture
@@ -150,6 +155,137 @@ def test_default_off_and_phase1_dependency(settings, inbox_account, actor, v2, c
             body="Draft",
             idempotency_key="key",
         )
+
+
+def test_capture_enrollment_allows_local_coordination_without_read_enrollment(settings, inbox_account, actor):
+    settings.INBOX_CONVERSATION_V2_READ_ACCOUNTS = []
+    row = observe(inbox_account)
+    operation = claim(actor, prepare(actor, row))
+    assert check(actor, operation)["local_state_valid"] is True
+    assert check(actor, operation)["send_allowed"] is False
+
+
+@pytest.mark.parametrize("entrance", ["prepare", "claim", "check", "pause", "resume", "unknown"])
+@pytest.mark.parametrize("exclusion", ["removed", "other_account", "workspace", "platform"])
+def test_local_entrances_deny_excluded_enrollment_and_preserve_holds(
+    settings, inbox_account, actor, entrance, exclusion
+):
+    row = observe(inbox_account)
+    operation = claim(actor, prepare(actor, row))
+    unknown(actor, operation)
+    state = ConversationWorkState.objects.get()
+    state.identity_quarantined = True
+    state.history_gap = True
+    state.owner_paused = True
+    state.pause_reason = "identity_uncertain"
+    state.save()
+    before_state = list(ConversationWorkState.objects.values())
+    before_operations = list(SendOperation.objects.values())
+    entries = deepcopy(settings.INBOX_CONVERSATION_V2_CAPTURE_ACCOUNTS)
+    if exclusion == "removed":
+        entries = []
+    elif exclusion == "other_account":
+        entries[0]["social_account_id"] = str(inbox_account.workspace_id)
+    elif exclusion == "workspace":
+        entries[0]["workspace_id"] = str(inbox_account.pk)
+    else:
+        entries[0]["platform"] = "instagram_login"
+    settings.INBOX_CONVERSATION_V2_CAPTURE_ACCOUNTS = entries
+    with pytest.raises(ReplyCoordinationError, match="not_found_or_denied"):
+        if entrance == "prepare":
+            prepare(actor, row)
+        elif entrance == "claim":
+            claim(actor, operation)
+        elif entrance == "check":
+            check(actor, operation)
+        elif entrance in {"pause", "resume"}:
+            pause(actor, row, paused=entrance == "pause")
+        else:
+            unknown(actor, operation)
+    assert list(ConversationWorkState.objects.values()) == before_state
+    assert list(SendOperation.objects.values()) == before_operations
+
+
+@pytest.mark.parametrize("entrance", ["observe", "invalidate", "quarantine"])
+@pytest.mark.parametrize("exclusion", ["removed", "other_account", "workspace", "platform", "capture_disabled"])
+def test_internal_hooks_refresh_capture_enrollment_and_preserve_holds(
+    settings, inbox_account, actor, entrance, exclusion
+):
+    row = observe(inbox_account)
+    operation = claim(actor, prepare(actor, row))
+    unknown(actor, operation)
+    source = InboxConversation.objects.get(pk=row.conversation_id)
+    destination = InboxConversation.objects.create(
+        workspace=inbox_account.workspace,
+        social_account=inbox_account,
+        platform=inbox_account.platform,
+        platform_conversation_id="quarantine-destination",
+        peer_id="peer-2",
+        identity_kind="platform",
+    )
+    state = ConversationWorkState.objects.get(conversation=source)
+    state.identity_quarantined = True
+    state.history_gap = True
+    state.owner_paused = True
+    state.pause_reason = "identity_uncertain"
+    state.save()
+    before_state = list(ConversationWorkState.objects.values())
+    before_operations = list(SendOperation.objects.values())
+    if exclusion == "removed":
+        settings.INBOX_CONVERSATION_V2_CAPTURE_ACCOUNTS = []
+    elif exclusion == "other_account":
+        entries = deepcopy(settings.INBOX_CONVERSATION_V2_CAPTURE_ACCOUNTS)
+        entries[0]["social_account_id"] = str(inbox_account.workspace_id)
+        settings.INBOX_CONVERSATION_V2_CAPTURE_ACCOUNTS = entries
+    elif exclusion == "workspace":
+        moved = Workspace.objects.create(name="Moved", organization=inbox_account.workspace.organization)
+        SocialAccount.objects.filter(pk=inbox_account.pk).update(workspace=moved)
+    elif exclusion == "platform":
+        SocialAccount.objects.filter(pk=inbox_account.pk).update(platform="instagram_login")
+    else:
+        settings.INBOX_CONVERSATION_V2_ENABLED = False
+    if entrance == "observe":
+        assert observe_message(row.pk, source="webhook", is_new=True, changed=True) is None
+    elif entrance == "invalidate":
+        assert invalidate_conversations(inbox_account, [source.pk]) is None
+    else:
+        assert quarantine_transferred_uncertainty(inbox_account, [source.pk], destination.pk) is None
+    assert list(ConversationWorkState.objects.values()) == before_state
+    assert list(SendOperation.objects.values()) == before_operations
+
+
+@pytest.mark.parametrize("entrance", ["observe", "invalidate", "quarantine"])
+def test_internal_hooks_check_enrollment_after_account_lock(settings, inbox_account, actor, entrance):
+    row = observe(inbox_account)
+    operation = claim(actor, prepare(actor, row))
+    unknown(actor, operation)
+    destination = InboxConversation.objects.create(
+        workspace=inbox_account.workspace,
+        social_account=inbox_account,
+        platform=inbox_account.platform,
+        platform_conversation_id="lock-refresh-destination",
+        peer_id="peer-2",
+        identity_kind="platform",
+    )
+    before_state = list(ConversationWorkState.objects.values())
+    before_operations = list(SendOperation.objects.values())
+    from apps.inbox.locking import lock_dm_account
+
+    def remove_enrollment_at_lock(account_id, workspace_id):
+        current = lock_dm_account(account_id, workspace_id)
+        settings.INBOX_CONVERSATION_V2_CAPTURE_ACCOUNTS = []
+        return current
+
+    with patch("apps.inbox.reply_coordination.lock_dm_account", side_effect=remove_enrollment_at_lock) as locked:
+        if entrance == "observe":
+            observe_message(row.pk, source="webhook", is_new=True, changed=True)
+        elif entrance == "invalidate":
+            invalidate_conversations(inbox_account, [row.conversation_id])
+        else:
+            quarantine_transferred_uncertainty(inbox_account, [row.conversation_id], destination.pk)
+    locked.assert_called_once_with(inbox_account.pk, inbox_account.workspace_id)
+    assert list(ConversationWorkState.objects.values()) == before_state
+    assert list(SendOperation.objects.values()) == before_operations
 
 
 @pytest.mark.parametrize("share_first", [False, True])
@@ -398,13 +534,14 @@ def test_scopes_are_rechecked_before_claim(inbox_account, actor, change):
     assert operation.status == "prepared"
 
 
-def test_no_cross_account_peer_or_thread_merge(inbox_account, actor):
+def test_no_cross_account_peer_or_thread_merge(inbox_account, actor, enroll_conversation_accounts):
     other = SocialAccount.objects.create(
         workspace=inbox_account.workspace,
         platform=inbox_account.platform,
         account_platform_id="other-account",
         account_name="Other synthetic account",
     )
+    enroll_conversation_accounts(other)
     row = observe(inbox_account)
     other_row = observe(other)
     other_peer = observe(inbox_account, mid="other-peer-message", peer="peer-2")
