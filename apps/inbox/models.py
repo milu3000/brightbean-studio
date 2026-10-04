@@ -148,6 +148,7 @@ class InboxReply(models.Model):
         DRAFT = "draft", "Draft"
         SENT = "sent", "Sent"
         FAILED = "failed", "Failed"
+        UNKNOWN = "unknown", "Outcome unknown"
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     inbox_message = models.ForeignKey(
@@ -182,6 +183,52 @@ class InboxReply(models.Model):
 
     def __str__(self):
         return f"{self.get_status_display()} reply by {self.author} ({self.created_at:%Y-%m-%d %H:%M})"
+
+
+class DMSendControl(models.Model):
+    """Explicit enrollment pins an identity; flags cannot remove this hold."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    social_account = models.OneToOneField(
+        "social_accounts.SocialAccount", on_delete=models.PROTECT, related_name="dm_send_control"
+    )
+    workspace = models.ForeignKey("workspaces.Workspace", on_delete=models.PROTECT)
+    platform = models.CharField(max_length=30)
+    account_platform_id = models.CharField(max_length=255)
+    paused = models.BooleanField(default=True)
+    epoch = models.PositiveBigIntegerField(default=1)
+    resume_cutoff = models.DateTimeField(null=True, blank=True)
+    coverage_from = models.DateTimeField()
+    coverage_version = models.CharField(max_length=40)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "inbox_dm_send_control"
+
+
+class DMSendAttempt(models.Model):
+    class Outcome(models.TextChoices):
+        UNKNOWN = "unknown", "Possibly in flight / outcome unknown"
+        SENT = "sent", "Provider accepted"
+        NOT_SENT = "not_sent", "Known not sent"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    control = models.ForeignKey(DMSendControl, on_delete=models.PROTECT, related_name="attempts")
+    reply = models.ForeignKey(InboxReply, on_delete=models.PROTECT, related_name="dm_send_attempts")
+    epoch = models.PositiveBigIntegerField()
+    fingerprint = models.CharField(max_length=64)
+    outcome = models.CharField(max_length=10, choices=Outcome.choices, default=Outcome.UNKNOWN)
+    reason_code = models.CharField(max_length=40, default="attempt_committed")
+    created_at = models.DateTimeField(auto_now_add=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        db_table = "inbox_dm_send_attempt"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["control"], condition=models.Q(outcome="unknown"), name="inbox_dm_one_unresolved"
+            ),
+        ]
 
 
 class InternalNote(models.Model):

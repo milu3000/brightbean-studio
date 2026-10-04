@@ -5,9 +5,9 @@ import logging
 from django.contrib.auth.decorators import login_required
 from django.core.exceptions import PermissionDenied
 from django.db.models import Q
-from django.http import HttpResponse
+from django.http import HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
-from django.views.decorators.http import require_POST
+from django.views.decorators.http import require_GET, require_POST
 
 from apps.members.decorators import require_permission
 from apps.members.models import WorkspaceMembership
@@ -17,6 +17,7 @@ from apps.social_accounts.models import SocialAccount
 from apps.workspaces.models import Workspace
 
 from . import services as inbox_services
+from .dm_send_gate import DMSendGateError, dm_send_status, session_send_authorization
 from .forms import (
     AssignForm,
     BulkActionForm,
@@ -238,7 +239,9 @@ def send_reply(request, workspace_id, message_id):
     # A reply is only recorded if the platform accepted it. Recording it
     # regardless would show the team a sent reply the customer never got.
     try:
-        reply = inbox_services.send_reply(message=message, body=body, author=request.user)
+        reply = inbox_services.send_reply(
+            message=message, body=body, author=request.user, authorization=session_send_authorization(request.user)
+        )
     except Exception as exc:
         logger.exception("Failed to send reply for message %s (%s)", message.id, account.platform)
         response = render(
@@ -247,6 +250,7 @@ def send_reply(request, workspace_id, message_id):
             {
                 "platform_label": account.get_platform_display(),
                 "reason": inbox_services.reply_failure_reason(exc),
+                "gate_held": isinstance(exc, DMSendGateError),
             },
         )
         # htmx does not swap on a 4xx/5xx, so the failure is reported as a
@@ -293,8 +297,14 @@ def send_reply_draft(request, workspace_id, reply_id):
     message = reply.inbox_message
 
     failed = False
+    gate_reason = ""
     try:
-        inbox_services.send_reply_now(reply, actor=request.user)
+        inbox_services.send_reply_now(reply, actor=request.user, authorization=session_send_authorization(request.user))
+    except DMSendGateError as exc:
+        # Render committed unknown/hold state immediately. HTMX does not swap
+        # a 409, which would leave stale Retry/Discard controls on the screen.
+        failed = True
+        gate_reason = str(exc)
     except inbox_services.ReplyStateError as exc:
         return HttpResponse(str(exc), status=409)
     except Exception:
@@ -304,7 +314,9 @@ def send_reply_draft(request, workspace_id, reply_id):
         failed = True
 
     message.refresh_from_db()
-    panel = render(request, "inbox/partials/_message_panel.html", _detail_context(workspace, message))
+    context = _detail_context(workspace, message)
+    context["dm_gate_reason"] = gate_reason
+    panel = render(request, "inbox/partials/_message_panel.html", context)
     if failed:
         panel["HX-Reply-Failed"] = "1"
     return panel
@@ -580,3 +592,17 @@ def sla_config(request, workspace_id):
 
     context = {"workspace": workspace, "form": form, "config": config}
     return render(request, "inbox/sla_config.html", context)
+
+
+@login_required
+@require_permission("use_inbox")
+@require_GET
+def dm_send_gate_status(request, workspace_id, account_id):
+    """Existing session authorization, facts only; no control mutation."""
+    workspace = _get_workspace(request, workspace_id)
+    account = get_object_or_404(SocialAccount, pk=account_id, workspace=workspace)
+    try:
+        state = dm_send_status(account)
+    except DMSendGateError as exc:
+        return JsonResponse({"detail": str(exc)}, status=409)
+    return JsonResponse(state)

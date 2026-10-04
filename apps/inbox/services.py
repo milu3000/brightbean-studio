@@ -74,6 +74,11 @@ def reply_failure_reason(exc: Exception) -> str:
     """
     from providers.exceptions import OAuthError, RateLimitError, TokenExpiredError
 
+    from .dm_send_gate import DMSendGateError
+
+    if isinstance(exc, DMSendGateError):
+        return str(exc)
+
     if isinstance(exc, RateLimitError):
         return "the account has hit its rate limit. Wait a few minutes and try again."
     if isinstance(exc, TokenExpiredError | OAuthError):
@@ -164,6 +169,8 @@ def _lock_reply(reply: InboxReply) -> None:
 def update_reply_draft(reply: InboxReply, *, body: str) -> InboxReply:
     """Edit a draft (or failed) reply's body."""
     _lock_reply(reply)
+    if reply.dm_send_attempts.exists():
+        raise ReplyStateError("Replies with durable DM attempts cannot be edited.")
     if reply.status not in _SENDABLE_STATUSES:
         raise ReplyStateError(f"A {reply.get_status_display().lower()} reply cannot be edited.")
     body = (body or "").strip()
@@ -178,12 +185,25 @@ def update_reply_draft(reply: InboxReply, *, body: str) -> InboxReply:
 def discard_reply_draft(reply: InboxReply) -> None:
     """Delete a draft (or failed) reply. Sent replies are permanent."""
     _lock_reply(reply)
+    if reply.dm_send_attempts.exists():
+        raise ReplyStateError("Replies with durable DM attempts cannot be discarded.")
     if reply.status not in _SENDABLE_STATUSES:
         raise ReplyStateError(f"A {reply.get_status_display().lower()} reply cannot be discarded.")
     reply.delete()
 
 
-def send_reply_now(reply: InboxReply, *, actor=None, automated: bool = False) -> InboxReply:
+def send_reply_now(reply: InboxReply, *, actor=None, automated: bool = False, authorization=None) -> InboxReply:
+    """Common UI/REST/MCP boundary; persisted DM enrollment cannot be toggled off."""
+    from .dm_send_gate import EnrolledDMSendError, capture_send_snapshot, send_enrolled_dm
+
+    snapshot = capture_send_snapshot(reply)
+    try:
+        return _send_legacy_reply(reply, actor=actor, automated=automated, snapshot=snapshot)
+    except EnrolledDMSendError:
+        return send_enrolled_dm(reply, actor=actor, automated=automated, authorization=authorization, snapshot=snapshot)
+
+
+def _send_legacy_reply(reply: InboxReply, *, actor=None, automated: bool = False, snapshot=None) -> InboxReply:
     """Deliver an existing draft/failed reply to the platform.
 
     On a platform refusal the row is kept and moved to ``failed`` with a
@@ -205,15 +225,37 @@ def send_reply_now(reply: InboxReply, *, actor=None, automated: bool = False) ->
             .first()
         )
         locked_account = None
+        if snapshot is not None and identity and identity["inbox_message__message_type"] != InboxMessage.MessageType.DM:
+            from .dm_send_gate import DMSendGateError, DMSendUnknownError
+
+            if reply.dm_send_attempts.filter(outcome="unknown").exists():
+                raise DMSendUnknownError()
+            raise DMSendGateError("target_changed", "The originally selected DM target changed; reload before sending.")
         if identity and identity["inbox_message__message_type"] == InboxMessage.MessageType.DM:
             locked_account = lock_dm_account(
                 identity["inbox_message__social_account_id"], identity["inbox_message__workspace_id"]
             )
             if locked_account is None:
                 raise ReplyStateError("The message account changed. Reload before sending.")
+            from .dm_send_gate import DMSendControl, EnrolledDMSendError, check_snapshot_identity
+
+            check_snapshot_identity(snapshot, locked_account)
+
+            # Decide under the same account lock used for enrollment/pause.
+            # Match account PK first, then the gate validates its pinned scope.
+            if DMSendControl.objects.filter(social_account_id=locked_account.pk).exists():
+                raise EnrolledDMSendError()
         # Keep the lock through delivery and persistence. Every competing send,
         # edit or discard must check the latest state after acquiring this lock.
         _lock_reply(reply)
+        if reply.dm_send_attempts.exists():
+            from .dm_send_gate import DMSendGateError, DMSendUnknownError
+
+            if reply.dm_send_attempts.filter(outcome="unknown").exists():
+                raise DMSendUnknownError()
+            raise DMSendGateError(
+                "legacy_attempt", "This reply has a durable DM attempt; legacy dispatch is unavailable."
+            )
         if reply.status not in _SENDABLE_STATUSES:
             raise ReplyStateError(f"A {reply.get_status_display().lower()} reply cannot be sent again.")
 
@@ -290,7 +332,7 @@ def send_reply_now(reply: InboxReply, *, actor=None, automated: bool = False) ->
     return reply
 
 
-def send_reply(*, message: InboxMessage, body: str, author=None) -> InboxReply:
+def send_reply(*, message: InboxMessage, body: str, author=None, authorization=None) -> InboxReply:
     """Create a reply and send it in one step (the classic composer flow).
 
     If the platform refuses it, the ``failed`` row is removed and the
@@ -300,7 +342,7 @@ def send_reply(*, message: InboxMessage, body: str, author=None) -> InboxReply:
     with transaction.atomic():
         reply = create_reply_draft(message=message, body=body, author=author)
     try:
-        return send_reply_now(reply, actor=author)
+        return send_reply_now(reply, actor=author, authorization=authorization)
     except Exception:
-        InboxReply.objects.filter(pk=reply.pk, status=InboxReply.Status.FAILED).delete()
+        InboxReply.objects.filter(pk=reply.pk, status=InboxReply.Status.FAILED, dm_send_attempts__isnull=True).delete()
         raise

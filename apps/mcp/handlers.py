@@ -28,6 +28,7 @@ from apps.api.pagination import decode_offset_cursor, encode_offset_cursor
 from apps.api.schemas import PostResponse
 from apps.composer.models import PlatformPost, Post
 from apps.composer.services import create_post, transition_platform_post
+from apps.inbox.dm_send_gate import key_send_authorization
 from apps.inbox.models import InboxMessage, InboxReply
 from apps.inbox.services import (
     ReplyStateError,
@@ -1561,7 +1562,12 @@ def _send_reply(args: dict, context: dict[str, Any]) -> dict:
             raise JsonRpcError(INVALID_PARAMS, str(exc)) from exc
 
     try:
-        send_reply_now(reply, actor=actor, automated=True)
+        send_reply_now(
+            reply,
+            actor=actor,
+            automated=True,
+            authorization=key_send_authorization(api_key, context.get("request")),
+        )
     except ReplyStateError as exc:
         raise JsonRpcError(INVALID_PARAMS, str(exc)) from exc
     except Exception as exc:  # platform refused it — reply is left in "failed"
@@ -1576,8 +1582,8 @@ register_tool(
         description=(
             "Deliver a reply to an inbox message's platform. Either pass `reply_id` to send an "
             "existing draft, or `message_id` + `body` to create and send in one step. On a "
-            "platform refusal the reply is kept in `failed` state (retry with the same reply_id) "
-            "and an error is returned. Automated Meta DMs require a known original inbound "
+            "known platform refusal the reply is kept in `failed` state and an error is returned. "
+            "For enrolled DM accounts an unknown outcome holds further sends; do not retry. Automated Meta DMs require a known original inbound "
             "timestamp less than 24 hours old; HUMAN_AGENT is never used. Requires the "
             "reply_from_inbox permission."
         ),

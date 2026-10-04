@@ -1,5 +1,6 @@
 {% load humanize %}
 <div class="flex flex-col h-full">
+    {% if dm_gate_reason %}<p role="alert" class="px-5 py-3 text-sm text-red-700">{{ dm_gate_reason }}</p>{% endif %}
     <!-- Message header -->
     <div class="px-5 py-4 border-b border-stone-100 flex-shrink-0">
         <div class="flex items-start justify-between gap-4">

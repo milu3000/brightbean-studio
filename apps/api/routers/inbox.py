@@ -37,6 +37,7 @@ from apps.api.schemas import (
     InboxReplyResponse,
     UpdateReplyRequest,
 )
+from apps.inbox.dm_send_gate import key_send_authorization
 from apps.inbox.models import InboxMessage, InboxReply
 from apps.inbox.services import (
     ReplyStateError,
@@ -196,7 +197,12 @@ def create_reply(request, message_id: uuid.UUID, payload: CreateReplyRequest):
     try:
         if payload.send:
             try:
-                send_reply_now(reply, actor=request.user if not request.user.is_anonymous else None, automated=True)
+                send_reply_now(
+                    reply,
+                    actor=request.user if not request.user.is_anonymous else None,
+                    automated=True,
+                    authorization=key_send_authorization(request.api_key, request),
+                )
             except ReplyStateError as exc:
                 raise HttpError(409, str(exc)) from exc
             except Exception as exc:  # platform refused it — reply is left in "failed"
@@ -242,7 +248,12 @@ def send_reply(request, reply_id: uuid.UUID):
     _require_perm(request, "reply_from_inbox")
     reply = _get_reply(request, reply_id)
     try:
-        send_reply_now(reply, actor=request.user if not request.user.is_anonymous else None, automated=True)
+        send_reply_now(
+            reply,
+            actor=request.user if not request.user.is_anonymous else None,
+            automated=True,
+            authorization=key_send_authorization(request.api_key, request),
+        )
     except ReplyStateError as exc:
         raise HttpError(409, str(exc)) from exc
     except Exception as exc:

@@ -7,6 +7,7 @@ from . import views
 app_name = "inbox"
 
 urlpatterns = [
+    path("accounts/<uuid:account_id>/dm-send-status/", views.dm_send_gate_status, name="dm_send_status"),
     # Main inbox feed
     path("", views.inbox_feed, name="feed"),
     # Message detail + thread
