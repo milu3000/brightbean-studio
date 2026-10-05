@@ -5,6 +5,7 @@ locks, the durable marker boundary, and entry into the synthetic provider.
 """
 
 from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
 from threading import Barrier, Event, get_ident
 from unittest.mock import patch
 
@@ -173,7 +174,9 @@ def test_pause_acknowledgment_waits_for_provider_transaction_to_commit(owned):
     operation = claim(owned)
     entered, release, waiting_at_lock, acknowledged = Event(), Event(), Event(), Event()
     pause_thread = []
-    original_lock = reply_coordination.lock_dm_account
+    # Tightening a persisted hold deliberately uses dispatch's hold-only path,
+    # not the coordinator's rollout-dependent account lookup.
+    original_lock = dispatch.lock_dm_account
 
     def lock(*args, **kwargs):
         if pause_thread and get_ident() == pause_thread[0]:
@@ -192,7 +195,7 @@ def test_pause_acknowledgment_waits_for_provider_transaction_to_commit(owned):
         return result
 
     with (
-        patch.object(reply_coordination, "lock_dm_account", side_effect=lock),
+        patch.object(dispatch, "lock_dm_account", side_effect=lock),
         patch("apps.inbox.services._dispatch_to_platform", side_effect=provider) as send,
         patch("apps.inbox.conversations.record_reply", return_value=None),
         ThreadPoolExecutor(max_workers=2) as pool,
@@ -232,7 +235,21 @@ def test_new_inbound_waits_for_provider_then_invalidates_next_generation(owned):
 
     def ingest():
         inbound_thread.append(get_ident())
-        row = incoming(owned)
+        # Exercise canonical ingestion at its account-lock boundary. The
+        # convenience incoming() helper first inserts a legacy row; on PG its
+        # account foreign-key check can block before reaching this boundary.
+        row = conversations.upsert_conversation_message(
+            owned.account,
+            platform_message_id="synthetic-concurrent-inbound",
+            sender_id="synthetic-peer",
+            body="Synthetic concurrent question",
+            extra={
+                "message_recipient_id": owned.account.account_platform_id,
+                "participant_ids": [owned.account.account_platform_id, "synthetic-peer"],
+            },
+            occurred_at=owned.clock.now + timedelta(seconds=1),
+            source="webhook",
+        )
         ingested.set()
         return row
 

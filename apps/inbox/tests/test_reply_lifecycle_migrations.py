@@ -65,18 +65,6 @@ def _migrate(target: str) -> None:
     MigrationExecutor(connection).migrate([(APP, target)])
 
 
-@pytest.fixture
-def restore_migrations():
-    """Restore all migration heads, including apps depending on inbox history.
-
-    Rewinding inbox also unapplies dependent MCP outbox tables. Restoring only
-    inbox leaves the rest of the suite with missing tables and invalid cascades.
-    """
-    heads = MigrationExecutor(connection).loader.graph.leaf_nodes()
-    yield
-    MigrationExecutor(connection).migrate(heads)
-
-
 @pytest.mark.django_db(transaction=True)
 def test_migrations_apply_to_a_table_that_already_has_rows(inbox_message, restore_migrations):
     sent_at = timezone.now() - timedelta(hours=1)

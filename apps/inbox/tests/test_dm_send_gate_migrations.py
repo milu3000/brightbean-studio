@@ -7,7 +7,7 @@ from django.db.migrations.executor import MigrationExecutor
 from apps.inbox import dm_send_gate as gate
 from apps.inbox.models import DMSendControl, InboxReply
 
-pytestmark = pytest.mark.django_db(transaction=True)
+pytestmark = [pytest.mark.django_db(transaction=True), pytest.mark.usefixtures("restore_migrations")]
 
 
 def test_existing_sent_draft_failed_records_are_unchanged(inbox_message):

@@ -270,7 +270,7 @@ def test_owned_account_legacy_fallback_blocks_non_direct_other_threads(owned, ki
 
 
 @pytest.mark.django_db(transaction=True)
-def test_existing_rows_migrate_unknown_without_fabricating_evidence(inbox_account):
+def test_existing_rows_migrate_unknown_without_fabricating_evidence(inbox_account, restore_migrations):
     previous = [("inbox", "0008_dmsendattempt_operation_sendoperation_attempt_and_more")]
     executor = MigrationExecutor(connection)
     heads = executor.loader.graph.leaf_nodes()
@@ -362,7 +362,7 @@ def test_malformed_classification_marker_does_not_crash_or_create_direct_proof(r
 
 
 @pytest.mark.django_db(transaction=True)
-def test_classification_reverse_refuses_existing_ownership(owned):
+def test_classification_reverse_refuses_existing_ownership(owned, restore_migrations):
     with pytest.raises(RuntimeError, match="persisted ownership"):
         MigrationExecutor(connection).migrate(
             [("inbox", "0008_dmsendattempt_operation_sendoperation_attempt_and_more")]

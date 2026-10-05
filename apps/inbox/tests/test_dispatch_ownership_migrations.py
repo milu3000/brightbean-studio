@@ -18,17 +18,8 @@ from apps.inbox.models import (
 from apps.inbox.tests.test_dispatch_ownership import clock as clock  # noqa: F401
 from apps.inbox.tests.test_dispatch_ownership import owned as owned  # noqa: F401
 
-pytestmark = pytest.mark.django_db(transaction=True)
+pytestmark = [pytest.mark.django_db(transaction=True), pytest.mark.usefixtures("restore_migrations")]
 PREVIOUS = [("inbox", "0007_dm_send_gate")]
-
-
-@pytest.fixture(autouse=True)
-def restore_current_schema(transactional_db):
-    heads = MigrationExecutor(connection).loader.graph.leaf_nodes()
-    try:
-        yield
-    finally:
-        MigrationExecutor(connection).migrate(heads)
 
 
 def test_forward_migration_preserves_legacy_reply_and_local_operation_states(inbox_message):
