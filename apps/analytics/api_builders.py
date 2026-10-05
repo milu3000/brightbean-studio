@@ -16,10 +16,12 @@ from __future__ import annotations
 
 from apps.api.schemas import (
     AccountAnalyticsResponse,
+    AccountAnalyticsStatusResponse,
     DerivedMetricResponse,
     EngagementCardResponse,
     PlatformPostAnalyticsResponse,
     PostAnalyticsResponse,
+    PostAnalyticsStatusResponse,
     PostMetricTileResponse,
 )
 from apps.composer.models import Post
@@ -35,6 +37,7 @@ from .services import (
     post_detail,
     unavailable_reason,
 )
+from .status import account_analytics_status, post_analytics_status
 
 
 def build_account_analytics(account: SocialAccount, days: int) -> AccountAnalyticsResponse:
@@ -49,12 +52,14 @@ def build_account_analytics(account: SocialAccount, days: int) -> AccountAnalyti
     existing service layer.
     """
     reason = unavailable_reason(account.platform)
+    analytics_status = AccountAnalyticsStatusResponse(**account_analytics_status(account))
     if reason is not None:
         return AccountAnalyticsResponse(
             account_id=account.id,
             platform=account.platform,
             account_name=account.account_name,
             connection_status=account.connection_status,
+            analytics_status=analytics_status,
             days=days,
             analytics_available=False,
             unavailable_reason=reason,
@@ -102,6 +107,7 @@ def build_account_analytics(account: SocialAccount, days: int) -> AccountAnalyti
         platform=account.platform,
         account_name=account.account_name,
         connection_status=account.connection_status,
+        analytics_status=analytics_status,
         days=days,
         analytics_available=True,
         unavailable_reason=None,
@@ -139,6 +145,7 @@ def build_post_analytics(post: Post) -> PostAnalyticsResponse:
 
 def _build_platform_post_analytics(platform_post, enabled_platforms: list[str]) -> PlatformPostAnalyticsResponse:
     account = platform_post.social_account
+    analytics_status = PostAnalyticsStatusResponse(**post_analytics_status(platform_post))
     reason = unavailable_reason(account.platform, enabled_platforms)
 
     # Short-circuit unavailable-platform and draft/scheduled cases BEFORE
@@ -150,6 +157,8 @@ def _build_platform_post_analytics(platform_post, enabled_platforms: list[str]) 
             social_account_id=account.id,
             platform=account.platform,
             status=platform_post.status,
+            analytics_status=analytics_status,
+            account_status=AccountAnalyticsStatusResponse(**account_analytics_status(account)),
             published_at=platform_post.published_at,
             analytics_available=False,
             unavailable_reason=reason,
@@ -163,6 +172,8 @@ def _build_platform_post_analytics(platform_post, enabled_platforms: list[str]) 
             social_account_id=account.id,
             platform=account.platform,
             status=platform_post.status,
+            analytics_status=analytics_status,
+            account_status=AccountAnalyticsStatusResponse(**account_analytics_status(account)),
             published_at=None,
             analytics_available=True,
             unavailable_reason=None,
@@ -193,6 +204,8 @@ def _build_platform_post_analytics(platform_post, enabled_platforms: list[str]) 
         social_account_id=account.id,
         platform=account.platform,
         status=platform_post.status,
+        analytics_status=analytics_status,
+        account_status=AccountAnalyticsStatusResponse(**account_analytics_status(account)),
         published_at=platform_post.published_at,
         analytics_available=True,
         unavailable_reason=None,

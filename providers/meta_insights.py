@@ -3,24 +3,14 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Callable
 from typing import Any
 
+from .analytics_errors import AnalyticsErrorContext, classify_analytics_error
 from .exceptions import APIError
 
 logger = logging.getLogger(__name__)
-
-META_PERMISSION_ERROR_CODES = {10, 190, 200}
-META_PERMISSION_ERROR_MARKERS = (
-    "access token",
-    "authorization",
-    "authorized",
-    "insufficient",
-    "oauth",
-    "permission",
-    "permissions",
-    "scope",
-)
 
 
 def parse_insights_response(data: dict[str, Any]) -> dict[str, Any]:
@@ -44,27 +34,39 @@ def parse_insights_response(data: dict[str, Any]) -> dict[str, Any]:
     return values
 
 
-def is_meta_permission_error(exc: APIError) -> bool:
-    """Return true for Meta auth/scope errors that should trigger reconnect handling."""
-    error = exc.raw_response.get("error") if isinstance(exc.raw_response, dict) else None
-    error = error if isinstance(error, dict) else {}
-    code = error.get("code")
-    message = " ".join(
-        str(value)
-        for value in (
-            error.get("message"),
-            error.get("type"),
-            error.get("error_user_msg"),
-            exc,
-        )
-        if value
-    ).lower()
+def _is_unsupported_metric_error(exc: APIError) -> bool:
+    """Only a code-100 metric validation refusal is safe to skip individually.
 
-    if code in META_PERMISSION_ERROR_CODES:
-        return True
-    if exc.status_code == 403:
-        return True
-    return any(marker in message for marker in META_PERMISSION_ERROR_MARKERS)
+    A missing insights edge is an endpoint failure, not an unsupported metric.
+    Likewise, code 100/33's permission wording says nothing about metrics.
+    """
+    error = exc.raw_response.get("error") if isinstance(exc.raw_response, dict) else None
+    if not isinstance(error, dict) or error.get("code") not in (100, "100"):
+        return False
+    if error.get("error_subcode") in (33, "33"):
+        return False
+    message = error.get("message")
+    if not isinstance(message, str):
+        return False
+    message = message.lower()
+    return bool(
+        "must be a valid insights metric" in message
+        or re.search(r"(?:^|\(#[0-9]+\)\s*)metric must be one of (?:the following|these) values\b", message)
+        or re.search(r"\b(?:metric|metrics)\b[^.!?]{0,160}\b(?:is|are) not supported\b", message)
+    )
+
+
+def is_missing_meta_field(exc: APIError, field: str) -> bool:
+    """Recognize a specific unavailable Graph field, never an absent object."""
+    error = exc.raw_response.get("error") if isinstance(exc.raw_response, dict) else None
+    if not isinstance(error, dict) or error.get("code") not in (100, "100"):
+        return False
+    if error.get("error_subcode") in (33, "33"):
+        return False
+    message = error.get("message")
+    if not isinstance(message, str):
+        return False
+    return bool(re.search(rf"\bnonexisting field\s+\(?{re.escape(field)}\)?(?![a-z0-9_])", message.lower()))
 
 
 def fetch_insights_safe(
@@ -78,7 +80,11 @@ def fetch_insights_safe(
     metric_params: dict[str, dict[str, Any]] | None = None,
     endpoint_type: str = "insights",
 ) -> tuple[dict[str, Any], dict[str, str]]:
-    """Fetch Meta insights one metric at a time so one invalid metric cannot fail all metrics."""
+    """Allow partial supported metrics without hiding object or account errors.
+
+    Failed metrics retain a stable code only. Raw API messages can contain
+    access tokens and must never become snapshot data or log text here.
+    """
     values: dict[str, Any] = {}
     errors: dict[str, str] = {}
     for metric in metrics:
@@ -86,17 +92,23 @@ def fetch_insights_safe(
         try:
             resp = request("GET", endpoint, access_token=access_token, params=params)
         except APIError as exc:
-            if is_meta_permission_error(exc):
+            context: AnalyticsErrorContext = "account" if endpoint_type in {"account", "page"} else "post"
+            classification = classify_analytics_error(exc, platform, context=context)
+            if classification.category != "unknown" or not _is_unsupported_metric_error(exc):
                 raise
-            errors[metric] = str(exc)
+            errors[metric] = "unsupported_metric"
             logger.warning(
-                "Skipping unsupported %s %s metric %s at %s: %s",
+                "Skipping unsupported %s %s metric %s: category=%s evidence=%s",
                 platform,
                 endpoint_type,
                 metric,
-                endpoint,
-                exc,
+                classification.category,
+                classification.safe_evidence,
             )
             continue
         values.update(parse_insights_response(resp.json()))
+    if errors and not values:
+        # Returning an empty mapping here would make providers manufacture
+        # successful zero-valued analytics from a completely failed fetch.
+        raise APIError("No supported analytics metrics returned", platform=platform)
     return values, errors

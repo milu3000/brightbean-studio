@@ -558,6 +558,57 @@ class EngagementCardResponse(Schema):
     )
 
 
+class AccountAnalyticsStatusResponse(Schema):
+    """Evidence-backed analytics authorization, separate from connection status."""
+
+    needs_reconnect: bool = Field(..., description="True only when reliable account authorization evidence exists.")
+    verification_pending: bool = Field(
+        ...,
+        description="A legacy warning exists without verified account authorization evidence. Do not request reconnect.",
+    )
+    category: str = ""
+    checked_at: dt.datetime | None = Field(
+        None,
+        description="Latest relevant authorization failure time. An earlier unresolved account-scope cause may be retained.",
+    )
+    context: str = ""
+    evidence: dict[str, object] = Field(
+        default_factory=dict, description="Allowlisted diagnostic facts; never raw payloads."
+    )
+
+    @field_serializer("checked_at")
+    def _serialize_dt(self, value: dt.datetime | None) -> str | None:
+        return _serialize_utc_z(value)
+
+
+class PostAnalyticsStatusResponse(Schema):
+    """Read-only analytics availability, independent of the original publish status."""
+
+    availability: Literal["unknown", "available", "inaccessible", "archived", "deleted"]
+    label: str
+    source: Literal["", "platform", "user"] = ""
+    checked_at: dt.datetime | None = None
+    error_category: Literal[
+        "",
+        "account_auth",
+        "account_scope",
+        "post_inaccessible",
+        "post_archived",
+        "post_deleted",
+        "transient",
+        "unknown",
+    ] = ""
+    error_evidence: dict[str, object] = Field(
+        default_factory=dict, description="Allowlisted diagnostic facts; never credentials or raw platform payloads."
+    )
+    attempted_at: dt.datetime | None = Field(None, description="Latest analytics fetch attempt, successful or failed.")
+    version: int = Field(..., description="Version of the independently managed analytics status.")
+
+    @field_serializer("checked_at", "attempted_at")
+    def _serialize_dt(self, value: dt.datetime | None) -> str | None:
+        return _serialize_utc_z(value)
+
+
 class AccountAnalyticsResponse(Schema):
     """Channel-level analytics summary over a rolling window of days."""
 
@@ -571,6 +622,7 @@ class AccountAnalyticsResponse(Schema):
             "Disconnected accounts still return historical analytics, but new data may not be flowing."
         ),
     )
+    analytics_status: AccountAnalyticsStatusResponse
     days: int = Field(..., description="Window size (in days) used for derivation. One of 7, 30, or 90.")
     analytics_available: bool = Field(
         ...,
@@ -635,13 +687,18 @@ class PlatformPostAnalyticsResponse(Schema):
     platform_post_id: uuid.UUID
     social_account_id: uuid.UUID
     platform: str
-    status: str
+    status: str = Field(..., description="Original publish status; not changed by analytics availability failures.")
     published_at: dt.datetime | None
+    analytics_status: PostAnalyticsStatusResponse
+    account_status: AccountAnalyticsStatusResponse = Field(
+        ..., description="Account authorization verdict; a failed grant is not a post visibility verdict."
+    )
     analytics_available: bool = Field(
         ...,
         description=(
             "``false`` for platforms without analytics. ``true`` for everything else — including "
-            "drafts and scheduled posts, which simply return empty metric tiles until publish."
+            "drafts and scheduled posts, which simply return empty metric tiles until publish. "
+            "This is platform capability, not fetch success; inspect analytics_status for post availability."
         ),
     )
     unavailable_reason: str | None = None
@@ -651,7 +708,7 @@ class PlatformPostAnalyticsResponse(Schema):
     )
     captured_at: dt.datetime | None = Field(
         None,
-        description="Most recent ``captured_at`` across this platform-post's snapshots.",
+        description="Most recent saved snapshot time. A failed refresh does not make these historical values current.",
     )
     next_sync_eta: dt.datetime | None = Field(
         None,

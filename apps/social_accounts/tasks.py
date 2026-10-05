@@ -37,6 +37,8 @@ def check_social_account_health(account_id: str):
         logger.warning("Health check: account %s not found, skipping", account_id)
         return
 
+    observed_generation = account.analytics_auth_updated_at
+
     # Resolve per-account credentials via the shared resolver: org/.env app creds
     # plus per-account federation metadata (Mastodon instance_url behind an SSRF
     # check, Bluesky pds_url, Instagram ig_user_id). Shared with the publish engine
@@ -64,6 +66,7 @@ def check_social_account_health(account_id: str):
         try:
             new_tokens = provider.refresh_token(account.oauth_refresh_token)
             account.oauth_access_token = new_tokens.access_token
+            account.analytics_auth_updated_at = timezone.now()
             if new_tokens.refresh_token:
                 account.oauth_refresh_token = new_tokens.refresh_token
             if new_tokens.expires_in:
@@ -148,21 +151,29 @@ def check_social_account_health(account_id: str):
             account.last_error = friendly_health_check_error(e)
 
     account.last_health_check_at = timezone.now()
-    account.save(
-        update_fields=[
-            "oauth_access_token",
-            "oauth_refresh_token",
-            "token_expires_at",
-            "follower_count",
-            "avatar_url",
-            "account_name",
-            "account_handle",
-            "connection_status",
-            "last_error",
-            "last_health_check_at",
-            "updated_at",
-        ]
-    )
+    from django.db import transaction
+
+    with transaction.atomic():
+        current = SocialAccount.objects.select_for_update().only("analytics_auth_updated_at").get(pk=account.pk)
+        if current.analytics_auth_updated_at != observed_generation:
+            logger.info("Health check ignored an older token observation for account %s", account.id)
+            return
+        account.save(
+            update_fields=[
+                "oauth_access_token",
+                "analytics_auth_updated_at",
+                "oauth_refresh_token",
+                "token_expires_at",
+                "follower_count",
+                "avatar_url",
+                "account_name",
+                "account_handle",
+                "connection_status",
+                "last_error",
+                "last_health_check_at",
+                "updated_at",
+            ]
+        )
 
     # A fix for a broken subscription is worthless if nothing re-runs it; this
     # is the only thing that does so unattended. Bounded inside

@@ -23,6 +23,7 @@ from apps.workspaces.models import Workspace
 
 from . import services
 from .metrics import PLATFORM_COLOR, PLATFORM_PRIMARY
+from .status import account_analytics_status
 
 logger = logging.getLogger(__name__)
 
@@ -158,6 +159,7 @@ def analytics_account(request: HttpRequest, workspace_id, account_id) -> HttpRes
     # then reconnect), so the template needs the cause, not just the message.
     verdict = account.analytics_verdict
     analytics_unavailable = verdict is not None
+    analytics_status = account_analytics_status(account)
 
     context: dict = {
         "workspace": workspace,
@@ -174,7 +176,9 @@ def analytics_account(request: HttpRequest, workspace_id, account_id) -> HttpRes
         # An unavailable platform gets its own reconnect instructions inside
         # the empty state, so suppressing the scope banner here keeps one set
         # of instructions on screen instead of two competing ones.
-        "analytics_needs_reconnect": account.analytics_needs_reconnect and not analytics_unavailable,
+        "analytics_status": analytics_status,
+        "analytics_needs_reconnect": analytics_status["needs_reconnect"] and not analytics_unavailable,
+        "analytics_verification_pending": analytics_status["verification_pending"] and not analytics_unavailable,
         "analytics_unavailable": analytics_unavailable,
         "analytics_unavailable_notice": verdict.message if verdict else "",
         "analytics_disabled_by_admin": bool(verdict and verdict.cause == services.CAUSE_DISABLED),
@@ -263,5 +267,11 @@ def post_detail(request: HttpRequest, workspace_id, post_id) -> HttpResponse:
         social_account__workspace=workspace,
     )
     context = services.post_detail(post)
-    context.update({"workspace": workspace})
+    membership = getattr(request, "workspace_membership", None)
+    can_confirm_status = bool(
+        membership
+        and membership.workspace_id == workspace.id
+        and membership.effective_permissions.get("create_posts", False)
+    )
+    context.update({"workspace": workspace, "can_confirm_status": can_confirm_status})
     return render(request, "analytics/_post_detail.html", context)

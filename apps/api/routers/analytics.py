@@ -25,14 +25,20 @@ centralised handler in ``apps/api/api.py``.
 from __future__ import annotations
 
 import uuid
+from typing import Literal
 
-from ninja import Query, Router
+from django.shortcuts import get_object_or_404
+from ninja import Query, Router, Schema
+from ninja.errors import HttpError
+from pydantic import StrictBool, StrictInt
 
 from apps.analytics.api_builders import build_account_analytics, build_post_analytics
+from apps.analytics.status import confirm_post_availability
 from apps.api.limits import enforce_http_rate_limits
 from apps.api.middleware import log_audit_entry
 from apps.api.routers.posts import _get_workspace_post, _require_perm, _resolve_account
 from apps.api.schemas import AccountAnalyticsResponse, PostAnalyticsResponse
+from apps.composer.models import PlatformPost
 
 router = Router(tags=["analytics"])
 
@@ -84,3 +90,24 @@ def post_analytics(request, post_id: uuid.UUID):
         status_code=200,
     )
     return build_post_analytics(post)
+
+
+class ConfirmPostAvailabilityRequest(Schema):
+    availability: Literal["archived", "deleted", "unknown"]
+    expected_version: StrictInt
+    confirmed: StrictBool
+
+
+@router.post("/platform-posts/{platform_post_id}/availability", summary="Confirm a local post availability annotation")
+def confirm_platform_post_availability(request, platform_post_id: uuid.UUID, payload: ConfirmPostAvailabilityRequest):
+    enforce_http_rate_limits(request, is_write=True)
+    _require_perm(request, "view_analytics")
+    _require_perm(request, "create_posts")
+    post = get_object_or_404(PlatformPost, pk=platform_post_id, post__workspace=request.api_key.workspace)
+    _resolve_account(request, post.social_account_id)
+    try:
+        result = confirm_post_availability(post, **payload.model_dump())
+    except ValueError as exc:
+        raise HttpError(409, str(exc)) from exc
+    log_audit_entry(request, action="analytics.status.confirm", target_id=post.pk, status_code=200)
+    return result

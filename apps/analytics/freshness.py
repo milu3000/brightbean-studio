@@ -61,6 +61,8 @@ def account_freshness(
         last = AccountInsightsSnapshot.objects.filter(social_account=account).aggregate(latest=Max("captured_at"))[
             "latest"
         ]
+    if account.analytics_needs_reconnect and account.analytics_reconnect_reason in {"account_auth", "account_scope"}:
+        return last, None
     if last is None:
         return None, timezone.now() + _FIRST_POLL_DELAY
     return last, last + _ACCOUNT_SYNC_INTERVAL
@@ -88,7 +90,7 @@ def post_freshness(
     helper will fall back to its own query (``None`` is ambiguous: it
     could mean "no snapshots" OR "caller didn't check").
     """
-    from .tasks import post_sync_interval
+    from .tasks import _analytics_failure_backoff, post_sync_interval
 
     if platform_post.social_account.platform in NO_ANALYTICS_PLATFORMS:
         return None, None
@@ -100,12 +102,17 @@ def post_freshness(
         last = PostInsightsSnapshot.objects.filter(platform_post=platform_post).aggregate(latest=Max("captured_at"))[
             "latest"
         ]
+    if platform_post.analytics_availability in {"archived", "deleted"}:
+        return last, None
     age = timezone.now() - platform_post.published_at
     interval = post_sync_interval(age)
     if interval is None:
         # >90d: syncs have stopped, so there is no meaningful next ETA even
         # if ``last`` exists from earlier in the post's life.
         return last, None
+    if platform_post.analytics_attempted_at is not None:
+        wait = max(interval, _analytics_failure_backoff(platform_post.analytics_failure_count))
+        return last, platform_post.analytics_attempted_at + wait
     # If no rows yet, poll back sooner than the cadence would otherwise
     # suggest — we want the first-sync delay to drive the next ETA.
     if last is None:

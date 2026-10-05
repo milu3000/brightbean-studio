@@ -1614,3 +1614,53 @@ register_tool(
         handler=_send_reply,
     )
 )
+
+
+# Explicit annotations only. The tool never changes the remote platform post.
+def _confirm_post_analytics_status(args: dict, context: dict[str, Any]) -> dict:
+    from apps.analytics.status import confirm_post_availability
+
+    _require_perm(context, "view_analytics")
+    _require_perm(context, "create_posts")
+    api_key = context["api_key"]
+    post_id = _parse_uuid(args.get("platform_post_id"), "platform_post_id")
+    post = PlatformPost.objects.filter(pk=post_id, post__workspace=api_key.workspace).first()
+    if post is None:
+        raise JsonRpcError(INVALID_PARAMS, "Platform post not found")
+    _resolve_allowed_account(api_key, str(post.social_account_id))
+    try:
+        status = confirm_post_availability(
+            post,
+            availability=args.get("availability"),
+            expected_version=args.get("expected_version"),
+            confirmed=args.get("confirmed"),
+        )
+    except ValueError as exc:
+        raise JsonRpcError(INVALID_PARAMS, str(exc)) from exc
+    return _wrap_text(status)
+
+
+register_tool(
+    Tool(
+        name="confirm_post_analytics_status",
+        description=(
+            "Record a user's explicit confirmation that a specific platform post is archived or deleted, "
+            "or remove that confirmation with unknown. This is a local annotation only; it never archives "
+            "or deletes the platform post. Do not infer archive/deletion from missing metrics or permission "
+            "errors. Requires view_analytics and create_posts. Read get_post_analytics for the current "
+            "analytics_status.version and supply it as expected_version; stale updates are rejected."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "platform_post_id": {"type": "string", "format": "uuid"},
+                "availability": {"type": "string", "enum": ["archived", "deleted", "unknown"]},
+                "expected_version": {"type": "integer", "minimum": 0},
+                "confirmed": {"type": "boolean", "const": True},
+            },
+            "required": ["platform_post_id", "availability", "expected_version", "confirmed"],
+            "additionalProperties": False,
+        },
+        handler=_confirm_post_analytics_status,
+    )
+)
