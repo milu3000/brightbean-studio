@@ -723,3 +723,5 @@ INBOX_CONVERSATION_V2_CAPTURE_ACCOUNTS = os.environ.get("INBOX_CONVERSATION_V2_C
 INBOX_CONVERSATION_V2_READ_ACCOUNTS = os.environ.get("INBOX_CONVERSATION_V2_READ_ACCOUNTS", "[]")
 # Local prepare/claim only; requires Conversation V2 and never enables dispatch.
 INBOX_REPLY_COORDINATION_ENABLED = env.bool("INBOX_REPLY_COORDINATION_ENABLED", default=False)
+# Explicit current-actor bridge only; ownership enrollment is separately persisted.
+INBOX_REPLY_DISPATCH_ENABLED = env.bool("INBOX_REPLY_DISPATCH_ENABLED", default=False)

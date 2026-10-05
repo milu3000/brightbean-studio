@@ -215,6 +215,9 @@ class DMSendAttempt(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     control = models.ForeignKey(DMSendControl, on_delete=models.PROTECT, related_name="attempts")
     reply = models.ForeignKey(InboxReply, on_delete=models.PROTECT, related_name="dm_send_attempts")
+    operation = models.OneToOneField(
+        "SendOperation", on_delete=models.PROTECT, null=True, blank=True, related_name="durable_attempt"
+    )
     epoch = models.PositiveBigIntegerField()
     fingerprint = models.CharField(max_length=64)
     outcome = models.CharField(max_length=10, choices=Outcome.choices, default=Outcome.UNKNOWN)
@@ -490,13 +493,37 @@ class ConversationWorkState(models.Model):
         indexes = [models.Index(fields=["owner_paused", "due_at"], name="inbox_work_pause_due")]
 
 
+class DMConversationOwnership(models.Model):
+    """Explicit, durable ownership of one observed DM identity; never a grant."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    control = models.ForeignKey(DMSendControl, on_delete=models.PROTECT, related_name="conversation_owners")
+    conversation = models.OneToOneField(InboxConversation, on_delete=models.PROTECT, related_name="dispatch_ownership")
+    workspace = models.ForeignKey("workspaces.Workspace", on_delete=models.PROTECT)
+    social_account = models.ForeignKey("social_accounts.SocialAccount", on_delete=models.PROTECT)
+    platform = models.CharField(max_length=30)
+    account_platform_id = models.CharField(max_length=255)
+    platform_conversation_id = models.CharField(max_length=255, null=True, blank=True)
+    peer_id = models.CharField(max_length=255)
+    identity_kind = models.CharField(max_length=20)
+    owner_scope = models.CharField(max_length=255)
+    epoch = models.PositiveBigIntegerField(default=1)
+    paused = models.BooleanField(default=True)
+    resume_cutoff = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "inbox_dm_conversation_ownership"
+
+
 class SendOperation(models.Model):
-    """Stable local intent. A claim is a dry-run reservation, never a send."""
+    """Stable intent; a claim alone is never authorization to dispatch."""
 
     class Status(models.TextChoices):
         PREPARED = "prepared", "Prepared locally"
-        CLAIMED = "claimed", "Claimed locally (dry run)"
-        CONFIRMED = "confirmed", "Explicitly reconciled"
+        CLAIMED = "claimed", "Claimed locally"
+        CONFIRMED = "confirmed", "Provider accepted or explicitly reconciled"
         FAILED = "failed", "Explicitly known not sent"
         OUTCOME_UNKNOWN = "outcome_unknown", "Outcome unknown; reconciliation required"
         SUPERSEDED = "superseded", "Superseded before dispatch"
@@ -521,9 +548,20 @@ class SendOperation(models.Model):
     claim_token = models.UUIDField(null=True, blank=True)
     fencing_token = models.PositiveBigIntegerField(default=0)
     lease_expires_at = models.DateTimeField(null=True, blank=True)
-    # Reserved for explicit uncertainty evidence. Nothing in this phase calls a
-    # provider or turns this field into permission to dispatch.
+    # Durable before provider dispatch. Never reclaim or retry by timeout.
     external_attempted_at = models.DateTimeField(null=True, blank=True)
+    ownership = models.ForeignKey(
+        DMConversationOwnership, on_delete=models.PROTECT, null=True, blank=True, related_name="operations"
+    )
+    owner_epoch = models.PositiveBigIntegerField(default=0)
+    reply = models.OneToOneField(
+        InboxReply, on_delete=models.PROTECT, null=True, blank=True, related_name="send_operation"
+    )
+    attempt = models.OneToOneField(
+        DMSendAttempt, on_delete=models.PROTECT, null=True, blank=True, related_name="send_operation"
+    )
+    # Survives removal of the optional ledger target; never inferred from time.
+    target_platform_message_id = models.CharField(max_length=255, blank=True, default="")
     outcome_code = models.CharField(max_length=40, blank=True, default="")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -535,6 +573,11 @@ class SendOperation(models.Model):
         constraints = [
             models.UniqueConstraint(
                 fields=["conversation", "actor_scope", "idempotency_key"], name="inbox_send_idempotency_unique"
+            ),
+            models.UniqueConstraint(
+                fields=["conversation", "target_platform_message_id"],
+                condition=models.Q(status="confirmed") & ~models.Q(target_platform_message_id=""),
+                name="inbox_send_confirmed_target",
             ),
             models.UniqueConstraint(
                 fields=["conversation"],

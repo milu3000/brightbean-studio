@@ -125,6 +125,7 @@ def session_send_authorization(user) -> Authorization:
         ):
             raise DMSendGateError("authorization_revoked", "Current permission to send this DM is unavailable.")
 
+    authorize.actor_scope = f"user:{user_id}"  # type: ignore[attr-defined]
     return authorize
 
 
@@ -163,6 +164,9 @@ def key_send_authorization(api_key, request=None) -> Authorization:
             raise DMSendGateError("authorization_revoked", "Current permission to send this DM is unavailable.")
         session_send_authorization(api_key.issued_by)(account)
 
+    authorize.actor_scope = (  # type: ignore[attr-defined]
+        f"oauth:{actor_id}" if getattr(api_key, "is_oauth", False) else f"key:{api_key.pk}"
+    )
     return authorize
 
 
@@ -271,10 +275,12 @@ def _fingerprint(reply, message):
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
-def _check_send(control, account, reply, message, authorization, automated):
+def _check_send(control, account, reply, message, authorization, automated, dispatch_binding=None):
+    from .reply_dispatch import check_conversation_send
     from .services import validate_automated_reply_window
 
     _check_identity(control, account)
+    check_conversation_send(account, message, reply, dispatch_binding)
     if control.paused:
         raise DMSendGateError("paused", "BrightBean DM sending is paused for this account.")
     if (
@@ -311,7 +317,7 @@ def _lock_target(reply, account):
     return message
 
 
-def _prepare_attempt(reply, authorization, automated, snapshot):
+def _prepare_attempt(reply, authorization, automated, snapshot, dispatch_binding=None):
     _outermost_required()
     with transaction.atomic(durable=True):
         identity = (
@@ -328,10 +334,13 @@ def _prepare_attempt(reply, authorization, automated, snapshot):
         control = DMSendControl.objects.get(social_account=account)
         if control.attempts.filter(outcome=DMSendAttempt.Outcome.UNKNOWN).exists():
             raise DMSendUnknownError()
+        from .reply_dispatch import lock_dispatch_context
+
+        lock_dispatch_context(account, dispatch_binding)
         message = _lock_target(reply, account)
         if reply.status not in {InboxReply.Status.DRAFT, InboxReply.Status.FAILED}:
             raise DMSendGateError("reply_state", "This reply cannot be sent again.")
-        _check_send(control, account, reply, message, authorization, automated)
+        _check_send(control, account, reply, message, authorization, automated, dispatch_binding)
         if _fingerprint(reply, message) != snapshot.fingerprint:
             raise DMSendGateError(
                 "target_changed", "The originally selected DM target or draft changed; reload before sending."
@@ -341,6 +350,9 @@ def _prepare_attempt(reply, authorization, automated, snapshot):
         )
         reply.status, reply.send_error = InboxReply.Status.UNKNOWN, UNKNOWN_MESSAGE
         reply.save(update_fields=["status", "send_error", "updated_at"])
+        from .reply_dispatch import mark_dispatch_attempt
+
+        mark_dispatch_attempt(dispatch_binding, attempt, reply)
     return attempt
 
 
@@ -367,10 +379,19 @@ def _settle_not_sent(reply, attempt, code):
     reply.save(update_fields=["status", "send_error", "updated_at"])
 
 
-def send_enrolled_dm(reply, *, actor, authorization, automated, snapshot):
+class _PreDispatchRefusedError(Exception):
+    """Only our immediately-before-provider callback proves no HTTP was entered."""
+
+    def __init__(self, reason):
+        self.reason = reason
+        super().__init__(str(reason))
+
+
+def send_enrolled_dm(reply, *, actor, authorization, automated, snapshot, dispatch_binding=None):
+    from .reply_dispatch import lock_dispatch_context, settle_dispatch_attempt
     from .services import _apply_post_send_side_effects, _dispatch_to_platform
 
-    attempt = _prepare_attempt(reply, authorization, automated, snapshot)
+    attempt = _prepare_attempt(reply, authorization, automated, snapshot, dispatch_binding)
     failure = None
     try:
         with transaction.atomic(durable=True):
@@ -378,28 +399,51 @@ def send_enrolled_dm(reply, *, actor, authorization, automated, snapshot):
             if account is None:
                 raise DMSendGateError("identity_changed", "The DM account identity changed.")
             control = DMSendControl.objects.get(pk=attempt.control_id)
+            lock_dispatch_context(account, dispatch_binding)
             message = _lock_target(reply, account)
             attempt.refresh_from_db()
             try:
                 if attempt.outcome != DMSendAttempt.Outcome.UNKNOWN or reply.status != InboxReply.Status.UNKNOWN:
                     raise DMSendGateError("attempt_changed", "The durable DM attempt changed; sending is held.")
-                _check_send(control, account, reply, message, authorization, automated)
+                _check_send(control, account, reply, message, authorization, automated, dispatch_binding)
                 if control.epoch != attempt.epoch or _fingerprint(reply, message) != attempt.fingerprint:
                     raise DMSendGateError("stale_attempt", "The DM target, draft or gate changed; sending is held.")
             except (ReplyStateError, ValueError) as exc:
                 # This invocation has not entered dispatch. A new invocation
                 # cannot reach this branch because _prepare_attempt rejects it.
                 _settle_not_sent(reply, attempt, getattr(exc, "code", "preflight_refused"))
+                settle_dispatch_attempt(dispatch_binding, attempt, reply, sent=False)
                 failure = exc
             if failure is None:
                 try:
-                    mid = _dispatch_to_platform(message, reply.body, automated=automated)
+
+                    def before_provider():
+                        try:
+                            _check_send(control, account, reply, message, authorization, automated, dispatch_binding)
+                            if control.epoch != attempt.epoch or _fingerprint(reply, message) != attempt.fingerprint:
+                                raise DMSendGateError("stale_attempt", "The DM attempt changed before dispatch.")
+                        except (ReplyStateError, ValueError) as exc:
+                            raise _PreDispatchRefusedError(exc) from None
+
+                    mid = _dispatch_to_platform(
+                        message, reply.body, automated=automated, before_provider=before_provider
+                    )
                     if not isinstance(mid, str) or not mid.strip() or len(mid) > 255:
                         raise DMSendUnknownError()
                 except Exception as exc:
-                    if _known_refusal(exc, account.platform):
-                        _settle_not_sent(reply, attempt, "provider_refused")
-                        failure = DMSendGateError("provider_refused", reply.send_error)
+                    if isinstance(exc, _PreDispatchRefusedError) or _known_refusal(exc, account.platform):
+                        code = (
+                            getattr(exc.reason, "code", "preflight_refused")
+                            if isinstance(exc, _PreDispatchRefusedError)
+                            else "provider_refused"
+                        )
+                        _settle_not_sent(reply, attempt, code)
+                        settle_dispatch_attempt(dispatch_binding, attempt, reply, sent=False)
+                        failure = (
+                            exc.reason
+                            if isinstance(exc, _PreDispatchRefusedError)
+                            else DMSendGateError(code, reply.send_error)
+                        )
                     else:
                         # No provider response, exception text or secret logs.
                         failure = DMSendUnknownError()
@@ -414,6 +458,7 @@ def send_enrolled_dm(reply, *, actor, authorization, automated, snapshot):
                     attempt.outcome, attempt.reason_code = DMSendAttempt.Outcome.SENT, "provider_accepted"
                     attempt.completed_at = timezone.now()
                     attempt.save(update_fields=["outcome", "reason_code", "completed_at"])
+                    settle_dispatch_attempt(dispatch_binding, attempt, reply, sent=True)
                     from .conversations import record_reply
 
                     try:

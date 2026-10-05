@@ -86,7 +86,7 @@ def reply_failure_reason(exc: Exception) -> str:
     return "the platform rejected it. Try again, or reconnect the account if this keeps happening."
 
 
-def _dispatch_to_platform(message: InboxMessage, body: str, *, automated: bool = False) -> str:
+def _dispatch_to_platform(message: InboxMessage, body: str, *, automated: bool = False, before_provider=None) -> str:
     """Post ``body`` back to the platform and return the platform's reply ID.
 
     Raises if the platform refuses it, so the caller can avoid recording a
@@ -104,6 +104,8 @@ def _dispatch_to_platform(message: InboxMessage, body: str, *, automated: bool =
         extra.setdefault("recipient_id", message.sender_handle)
 
     if message.message_type in _COMMENT_LIKE_TYPES:
+        if before_provider is not None:
+            before_provider()
         result = provider.reply_to_comment(
             access_token=account.oauth_access_token,
             comment_id=message.platform_message_id,
@@ -116,6 +118,8 @@ def _dispatch_to_platform(message: InboxMessage, body: str, *, automated: bool =
             # locks or resolving credentials. Never label automation as a person.
             validate_automated_reply_window(message)
         overdue = not automated and timezone.now() - message.received_at > HUMAN_AGENT_AFTER
+        if before_provider is not None:
+            before_provider()
         result = provider.reply_to_message(
             access_token=account.oauth_access_token,
             message_id=message.platform_message_id,
@@ -169,8 +173,8 @@ def _lock_reply(reply: InboxReply) -> None:
 def update_reply_draft(reply: InboxReply, *, body: str) -> InboxReply:
     """Edit a draft (or failed) reply's body."""
     _lock_reply(reply)
-    if reply.dm_send_attempts.exists():
-        raise ReplyStateError("Replies with durable DM attempts cannot be edited.")
+    if reply.dm_send_attempts.exists() or hasattr(reply, "send_operation"):
+        raise ReplyStateError("Replies with durable DM attempts or V2 operations cannot be edited.")
     if reply.status not in _SENDABLE_STATUSES:
         raise ReplyStateError(f"A {reply.get_status_display().lower()} reply cannot be edited.")
     body = (body or "").strip()
@@ -185,25 +189,38 @@ def update_reply_draft(reply: InboxReply, *, body: str) -> InboxReply:
 def discard_reply_draft(reply: InboxReply) -> None:
     """Delete a draft (or failed) reply. Sent replies are permanent."""
     _lock_reply(reply)
-    if reply.dm_send_attempts.exists():
-        raise ReplyStateError("Replies with durable DM attempts cannot be discarded.")
+    if reply.dm_send_attempts.exists() or hasattr(reply, "send_operation"):
+        raise ReplyStateError("Replies with durable DM attempts or V2 operations cannot be discarded.")
     if reply.status not in _SENDABLE_STATUSES:
         raise ReplyStateError(f"A {reply.get_status_display().lower()} reply cannot be discarded.")
     reply.delete()
 
 
-def send_reply_now(reply: InboxReply, *, actor=None, automated: bool = False, authorization=None) -> InboxReply:
+def send_reply_now(
+    reply: InboxReply, *, actor=None, automated: bool = False, authorization=None, dispatch_binding=None
+) -> InboxReply:
     """Common UI/REST/MCP boundary; persisted DM enrollment cannot be toggled off."""
     from .dm_send_gate import EnrolledDMSendError, capture_send_snapshot, send_enrolled_dm
 
     snapshot = capture_send_snapshot(reply)
     try:
-        return _send_legacy_reply(reply, actor=actor, automated=automated, snapshot=snapshot)
+        return _send_legacy_reply(
+            reply, actor=actor, automated=automated, snapshot=snapshot, dispatch_binding=dispatch_binding
+        )
     except EnrolledDMSendError:
-        return send_enrolled_dm(reply, actor=actor, automated=automated, authorization=authorization, snapshot=snapshot)
+        return send_enrolled_dm(
+            reply,
+            actor=actor,
+            automated=automated,
+            authorization=authorization,
+            snapshot=snapshot,
+            dispatch_binding=dispatch_binding,
+        )
 
 
-def _send_legacy_reply(reply: InboxReply, *, actor=None, automated: bool = False, snapshot=None) -> InboxReply:
+def _send_legacy_reply(
+    reply: InboxReply, *, actor=None, automated: bool = False, snapshot=None, dispatch_binding=None
+) -> InboxReply:
     """Deliver an existing draft/failed reply to the platform.
 
     On a platform refusal the row is kept and moved to ``failed`` with a
@@ -245,9 +262,19 @@ def _send_legacy_reply(reply: InboxReply, *, actor=None, automated: bool = False
             # Match account PK first, then the gate validates its pinned scope.
             if DMSendControl.objects.filter(social_account_id=locked_account.pk).exists():
                 raise EnrolledDMSendError()
+            from .reply_dispatch import check_conversation_send
+
+            # Ownership is durable even when rollout flags are disabled.
+            check_conversation_send(locked_account, reply.inbox_message, reply)
+        if dispatch_binding is not None:
+            raise ReplyStateError("V2 dispatch requires an enrolled DM account gate.")
         # Keep the lock through delivery and persistence. Every competing send,
         # edit or discard must check the latest state after acquiring this lock.
         _lock_reply(reply)
+        from .models import SendOperation
+
+        if SendOperation.objects.filter(reply=reply, ownership__isnull=False).exists():
+            raise ReplyStateError("This reply requires its bound V2 dispatch operation.")
         if reply.dm_send_attempts.exists():
             from .dm_send_gate import DMSendGateError, DMSendUnknownError
 

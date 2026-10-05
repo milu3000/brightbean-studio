@@ -9,7 +9,13 @@ from typing import Any
 from django.utils import timezone
 
 from apps.inbox.conversation_policy import read_allowed, read_available
-from apps.inbox.models import ConversationMessage, ConversationWorkState, InboxConversation, SendOperation
+from apps.inbox.models import (
+    ConversationMessage,
+    ConversationWorkState,
+    DMConversationOwnership,
+    InboxConversation,
+    SendOperation,
+)
 from apps.inbox.reply_coordination import enabled
 from apps.mcp.conversation_tools import _iso, _scope, _sync
 from apps.mcp.handlers import _parse_uuid, _wrap_text
@@ -66,6 +72,33 @@ def _get_reply_coordination(args: dict, context: dict[str, Any]) -> dict:
         ],
     }
     authorized_conversations = InboxConversation.objects.filter(**scoped, pk=conversation.pk).values("pk")
+    owner = DMConversationOwnership.objects.filter(
+        conversation_id__in=authorized_conversations,
+        workspace_id=conversation.workspace_id,
+        social_account_id=conversation.social_account_id,
+    ).first()
+    if owner is not None:
+        from apps.inbox.reply_dispatch import dispatch_enabled
+
+        result["provider_dispatch_enabled"] = dispatch_enabled()
+        result["send_preconditions_enforced"] = True
+        result["dispatch_ownership"] = {
+            "enrolled": True,
+            "epoch": owner.epoch,
+            "paused": owner.paused,
+            "resume_cutoff": _iso(owner.resume_cutoff),
+            "identity_matches": (
+                owner.platform == conversation.platform
+                and owner.account_platform_id == conversation.social_account.account_platform_id
+                and owner.peer_id == conversation.peer_id
+                and owner.platform_conversation_id == conversation.platform_conversation_id
+                and owner.identity_kind == conversation.identity_kind
+            ),
+        }
+        result["limitations"][:2] = [
+            "This conversation has persisted dispatch ownership; legacy sends cannot bypass its bound V2 operation.",
+            "The current-principal dispatch bridge is opt-in. This read does not claim, resume, send or prove readiness.",
+        ]
     state = ConversationWorkState.objects.filter(conversation_id__in=authorized_conversations).first()
     active_ids = list(
         SendOperation.objects.filter(
@@ -147,8 +180,8 @@ register_tool(
         name="get_reply_coordination",
         description=(
             "Read local-only reply coordination for an authorized DM conversation: pause, burst deadline, "
-            "generation and safe operation status. No provider dispatch is implemented. Does not prepare, "
-            "claim, resume or send; existing send tools remain unguarded by this coordinator."
+            "generation and safe operation status, including explicitly enrolled dispatch ownership when present. "
+            "Does not prepare, claim, resume or send. Observed state is not proof of full provider freshness or readiness."
         ),
         input_schema={
             "type": "object",
