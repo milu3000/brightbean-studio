@@ -41,7 +41,7 @@
         <p class="inbox-row-preview text-[12px] text-stone-500 truncate leading-snug">{{ message.content_preview|truncatewords:20 }}</p>
         <div class="flex items-center gap-1.5 mt-1.5">
             <!-- Type badge -->
-            <span class="badge-pill badge-type">{{ message.get_message_type_display }}</span>
+            <span class="badge-pill badge-type">{{ message.type_display|default:message.get_message_type_display }}</span>
             <!-- Status badge -->
             <span class="badge-pill badge-status-{{ message.status }}">{{ message.get_status_display }}</span>
             <!-- Sentiment badge -->

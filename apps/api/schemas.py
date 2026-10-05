@@ -740,6 +740,16 @@ class AttachmentResponse(Schema):
     title: str = ""
     preview_url: str = Field("", description="Safe Meta-hosted image preview URL, if supplied. May expire.")
     availability: Literal["available", "unavailable"] = "unavailable"
+    availability_reason: Literal[
+        "link_provided",
+        "missing_url",
+        "unsafe_url",
+        "preview_only",
+        "unsupported",
+        "removed",
+        "fields_unavailable",
+        "invalid_metadata",
+    ] = "missing_url"
 
 
 class InboxMessageResponse(Schema):
@@ -750,6 +760,9 @@ class InboxMessageResponse(Schema):
     social_account_id: uuid.UUID
     platform: str
     message_type: str
+    conversation_type: Literal["", "unknown", "direct", "group"] = "unknown"
+    classification_reason: str = ""
+    type_display: str = ""
     status: str
     sentiment: str
     sender_name: str
@@ -757,6 +770,9 @@ class InboxMessageResponse(Schema):
     body: str
     content_type: Literal["text", "attachment", "mixed", "unknown"] = "unknown"
     content_preview: str = Field("", description="Message text or a truthful label for non-text content.")
+    content_status: Literal[
+        "removed", "partial", "unsupported", "fields_unavailable", "link_provided", "unavailable", "text", "no_metadata"
+    ] = "no_metadata"
     attachments: list[AttachmentResponse] = Field(default_factory=list)
     related_post_id: uuid.UUID | None = None
     received_at: dt.datetime
@@ -769,6 +785,8 @@ class InboxMessageResponse(Schema):
 
     @classmethod
     def from_message(cls, message, *, include_replies: bool = False) -> InboxMessageResponse:
+        from providers.meta_inbox_content import message_content_status
+
         replies: list[InboxReplyResponse] = []
         if include_replies:
             if "replies" in getattr(message, "_prefetched_objects_cache", {}):
@@ -782,6 +800,9 @@ class InboxMessageResponse(Schema):
             social_account_id=message.social_account_id,
             platform=message.social_account.platform,
             message_type=message.message_type,
+            conversation_type=message.conversation_type,
+            classification_reason=message.classification_reason,
+            type_display=message.type_display,
             status=message.status,
             sentiment=message.sentiment,
             sender_name=message.sender_name,
@@ -789,6 +810,7 @@ class InboxMessageResponse(Schema):
             body=message.body or "",
             content_type=message.content_type,
             content_preview=message.content_preview,
+            content_status=message_content_status(message.extra, message.body or ""),
             attachments=message.attachments,
             related_post_id=message.related_post_id,
             received_at=message.received_at,

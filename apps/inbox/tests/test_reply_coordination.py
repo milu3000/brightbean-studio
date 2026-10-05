@@ -58,7 +58,10 @@ def actor(inbox_account):
 
 def observe(account, *, mid="incoming-1", at=None, source="webhook", outbound=False, peer="peer-1", **kwargs):
     at = at or timezone.now()
-    extra = {"message_recipient_id": peer if outbound else account.account_platform_id}
+    extra = {
+        "message_recipient_id": peer if outbound else account.account_platform_id,
+        "participant_ids": [account.account_platform_id, peer],
+    }
     extra.update(kwargs.pop("extra", {}))
     with patch("django.utils.timezone.now", return_value=at):
         return upsert_conversation_message(
@@ -553,7 +556,7 @@ def test_no_cross_account_peer_or_thread_merge(inbox_account, actor, enroll_conv
         prepare(actor, row, target_message_id=other_peer.pk)
 
 
-@pytest.mark.parametrize("extra", [{"message_recipient_id": ""}, {"participant_ids": ["page-1", "peer-1", "peer-2"]}])
+@pytest.mark.parametrize("extra", [{"participant_ids": None}, {"participant_ids": ["page-1", "peer-1", "peer-2"]}])
 def test_unverified_or_group_identity_creates_no_work(inbox_account, extra):
     observe(inbox_account, extra=extra)
     assert not ConversationWorkState.objects.exists()
@@ -723,7 +726,7 @@ def test_newly_attributed_existing_outbound_pauses_pending_work(inbox_account, a
         outbound=True,
         at=at,
         occurred_at=None,
-        extra={"message_recipient_id": ""},
+        extra={"message_recipient_id": "", "participant_ids": None},
         source=source,
     )
     assert outgoing.conversation_id is None
@@ -790,7 +793,7 @@ def test_reassigned_unknown_target_quarantines_destination_across_resume_and_new
     assert operation.status == "outcome_unknown"
 
 
-def test_identity_quarantine_propagates_through_another_transfer(inbox_account, actor):
+def test_identity_quarantine_cannot_be_laundered_through_another_thread_claim(inbox_account, actor):
     original = observe(inbox_account)
     unknown(actor, claim(actor, prepare(actor, original)))
     moved = observe(
@@ -801,9 +804,9 @@ def test_identity_quarantine_propagates_through_another_transfer(inbox_account, 
         extra={"conversation_id": "thread-2"},
     )
     assert ConversationWorkState.objects.get(conversation_id=moved.conversation_id).identity_quarantined
-    # Transfer another row from the held conversation, with no operation of
-    # its own. A second identity change must not launder the inherited hold.
-    next_row = observe(inbox_account, mid="next-row", peer="peer-2")
+    # Only a native thread ID can place another row in this unknown thread.
+    # A conflicting second native ID must not launder its inherited hold.
+    next_row = observe(inbox_account, mid="next-row", peer="peer-2", extra={"conversation_id": "thread-2"})
     moved_again = observe(
         inbox_account,
         mid=next_row.platform_message_id,
@@ -811,7 +814,8 @@ def test_identity_quarantine_propagates_through_another_transfer(inbox_account, 
         source="poll",
         extra={"conversation_id": "thread-3"},
     )
-    assert moved_again.conversation_id != moved.conversation_id
+    assert moved_again.conversation_id == moved.conversation_id
+    assert moved_again.conversation_type == "unknown"
     assert ConversationWorkState.objects.get(conversation_id=moved_again.conversation_id).identity_quarantined
     with pytest.raises(ReplyCoordinationError, match="identity_reconciliation_required"):
         pause(actor, moved_again, paused=False)

@@ -157,7 +157,7 @@ def test_signed_url_refresh_is_not_replaced_by_original_webhook():
 def test_explicit_deletion_is_not_undone_by_basic_poll():
     deleted = merge_message_extra(webhook(), {"message": {"is_deleted": True}})
     result = normalize_attachments(merge_message_extra(deleted, {"conversation_id": "c"}))
-    assert result == [{"type": "unknown", "url": "", "title": "", "preview_url": "", "availability": "unavailable"}]
+    assert result == []
 
 
 def test_graph_story_link_is_a_share_but_reply_context_is_not_new_attachment():

@@ -62,7 +62,11 @@ def incoming(owner, *, mid=None, peer="synthetic-peer", outbound=False):
             sender_name="Synthetic customer",
             sender_handle=peer,
             body="Synthetic question",
-            extra={"sender_id": peer, "message_recipient_id": owner.account.account_platform_id},
+            extra={
+                "sender_id": peer,
+                "message_recipient_id": owner.account.account_platform_id,
+                "participant_ids": [owner.account.account_platform_id, peer],
+            },
             received_at=owner.clock.now,
         )
     return upsert_conversation_message(
@@ -70,7 +74,10 @@ def incoming(owner, *, mid=None, peer="synthetic-peer", outbound=False):
         platform_message_id=mid,
         sender_id=owner.account.account_platform_id if outbound else peer,
         body="Synthetic native answer" if outbound else "Synthetic question",
-        extra={"message_recipient_id": peer if outbound else owner.account.account_platform_id},
+        extra={
+            "message_recipient_id": peer if outbound else owner.account.account_platform_id,
+            "participant_ids": [owner.account.account_platform_id, peer],
+        },
         occurred_at=owner.clock.now,
         source="webhook",
         legacy_message=legacy,

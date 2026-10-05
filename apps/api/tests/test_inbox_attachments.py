@@ -17,7 +17,7 @@ from apps.workspaces.models import Workspace
 
 
 def _attachment(**overrides):
-    return {
+    data = {
         "type": "share",
         "url": "https://www.instagram.com/p/shared/",
         "title": "Shared post",
@@ -25,6 +25,8 @@ def _attachment(**overrides):
         "availability": "available",
         **overrides,
     }
+    data.setdefault("availability_reason", "link_provided" if data["url"] else "missing_url")
+    return data
 
 
 def _message_stub(**overrides):
@@ -35,6 +37,9 @@ def _message_stub(**overrides):
             "social_account_id": uuid.uuid4(),
             "social_account": SimpleNamespace(platform="instagram"),
             "message_type": "dm",
+            "conversation_type": "unknown",
+            "classification_reason": "participants_missing",
+            "type_display": "Message · type unconfirmed",
             "status": "unread",
             "sentiment": "neutral",
             "sender_name": "Ada",
@@ -67,7 +72,15 @@ def test_schema_exposes_only_typed_attachment_metadata():
 
 def test_schema_new_fields_have_backward_compatible_defaults():
     old_payload = InboxMessageResponse.from_message(_message_stub()).model_dump()
-    for field in ("attachments", "content_type", "content_preview"):
+    for field in (
+        "attachments",
+        "content_type",
+        "content_preview",
+        "content_status",
+        "conversation_type",
+        "classification_reason",
+        "type_display",
+    ):
         old_payload.pop(field)
 
     response = InboxMessageResponse(**old_payload)
@@ -76,6 +89,7 @@ def test_schema_new_fields_have_backward_compatible_defaults():
     assert response.content_type == "unknown"
     assert response.content_preview == ""
     assert AttachmentResponse().availability == "unavailable"
+    assert response.conversation_type == "unknown" and response.content_status == "no_metadata"
 
 
 @pytest.fixture

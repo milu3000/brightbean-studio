@@ -118,7 +118,8 @@ def _verified(conversation):
     # Conservative one-to-one phase: a provider thread alone is not proof of a
     # recipient. Retained conflicting fallback identities require reconciliation.
     return bool(
-        conversation.peer_id
+        conversation.conversation_type == InboxConversation.ConversationType.DIRECT
+        and conversation.peer_id
         and not conversation.peer_ambiguous
         and conversation.identity_kind in InboxConversation.IdentityKind.values
         and not InboxConversation.objects.filter(
@@ -173,8 +174,6 @@ def _invalidate(state, reason):
 @transaction.atomic
 def invalidate_conversations(account, conversation_ids):
     """Internal identity-withdrawal hook; preserve unknown outcomes and pause."""
-    if not enabled():
-        return
     account = _capture_account(account)
     if account is None:
         return

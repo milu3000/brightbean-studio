@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% load humanize %}
+{% load humanize static %}
 
 {% block title %}Inbox - {{ workspace.name }} - Brightbean{% endblock %}
 
@@ -217,6 +217,7 @@
 {% endblock %}
 
 {% block extra_js %}
+<script src="{% static 'js/inbox-media.js' %}" defer></script>
 <script nonce="{{ request.csp_nonce }}">
 function inboxController() {
     return {

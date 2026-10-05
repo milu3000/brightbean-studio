@@ -118,7 +118,8 @@ def test_empty_legacy_message_shows_unknown_content_without_inventing_attachment
     html = _render("_message_panel", _message(attachments=[], content_preview="Non-text message"))
 
     assert "Non-text message" in html
-    assert "No displayable text or attachment data is available for this message" in html
+    assert "No displayable text or attachment metadata was provided for this message" in html
+    assert "its original content has not been verified" in html
     assert "Open attachment" not in html
 
 

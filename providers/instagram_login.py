@@ -28,6 +28,7 @@ from .meta_comments import (
 from .meta_inbox_content import (
     BASIC_MESSAGE_FIELDS,
     CONTENT_MESSAGE_FIELDS,
+    polled_conversation_classification,
     polled_message_extra,
     request_with_content_fields,
 )
@@ -610,12 +611,14 @@ class InstagramLoginProvider(SocialProvider):
                 kwargs["params"] = {**kwargs["params"], "fields": kwargs["params"]["fields"].replace(",to", "")}
             return self._request(*args, **kwargs)
 
+        content_fallback: list[str] = []
         resp = request_with_content_fields(
             request_messages,
             f"{API_BASE}/me/conversations",
             access_token=access_token,
             params=params,
             basic_fields=f"id,participants,messages{{{BASIC_MESSAGE_FIELDS}{identity_fields}}}",
+            on_fallback=content_fallback.append,
         )
         conversations = resp.json().get("data", [])
         # Do not retain outbound history or identity enrichment if enrollment
@@ -650,6 +653,10 @@ class InstagramLoginProvider(SocialProvider):
                             sender_id=sender_id,
                             own_id=str(self.credentials.get("ig_user_id") or "") if conversation_v2 else None,
                             participant_ids=convo.get("participants") if conversation_v2 else None,
+                            content_fetch_status=content_fallback[-1] if content_fallback else "fields_requested",
+                            classification_summary=polled_conversation_classification(
+                                msg, own_id=own_id, sender_id=sender_id, participant_ids=convo.get("participants")
+                            ),
                         ),
                     )
                 )

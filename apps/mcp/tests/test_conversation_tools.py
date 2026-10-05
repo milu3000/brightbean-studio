@@ -42,7 +42,7 @@ from apps.mcp.tools import Tool, all_tools, get_tool
 from apps.social_accounts.models import SocialAccount
 
 pytestmark = pytest.mark.django_db
-TOOLS = {"list_conversations", "get_conversation_messages", "get_reply_context"}
+TOOLS = {"list_conversations", "get_conversation_messages", "get_reply_context", "get_conversation_attachments"}
 V2_TOOLS = TOOLS | {"get_reply_coordination"}
 account = _account
 full_client = _full_client

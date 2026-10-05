@@ -38,6 +38,7 @@ def _ingest(account, source, *, mid="native-1", outbound=True, recipient="custom
         payload = {
             "sender": {"id": sender},
             "recipient": {"id": recipient} if recipient else {},
+            "participant_ids": [sender, recipient] if recipient else None,
             "timestamp": int(now.timestamp() * 1000),
             "message": {"mid": mid, "text": "Native answer" if outbound else "Question", "is_deleted": deleted},
         }
@@ -58,6 +59,7 @@ def _ingest(account, source, *, mid="native-1", outbound=True, recipient="custom
                     "conversation_id": conversation,
                     "sender_id": sender,
                     "message_recipient_id": recipient,
+                    "participant_ids": [sender, recipient] if recipient else None,
                     "is_deleted": deleted,
                 },
             ),
@@ -74,7 +76,7 @@ def _original(account, *, status="archived"):
         sender_handle="not-an-identity-handle",
         body="Question",
         status=status,
-        extra={"sender_id": "customer-1"},
+        extra={"sender_id": "customer-1", "participant_ids": [account.account_platform_id, "customer-1"]},
         received_at=timezone.now() - timedelta(minutes=5),
     )
 

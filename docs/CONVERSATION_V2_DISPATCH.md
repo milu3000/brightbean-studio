@@ -161,7 +161,56 @@ recipient, stale target or authority mismatch.
 This draft's tests, push and CI do not authorize deployment, enrollment, new
 grants, subscriptions, live sends, old-flow removal or broader data collection.
 
-## Candidate verification (2026-10-05 UTC)
+## Group identity and media observation boundary
+
+Conversation and message observations now carry `direct`, `group` or `unknown`
+plus a bounded evidence reason. Existing rows default to unknown; no historical
+direct/group identity is invented. Sender/recipient endpoints prove direction,
+not complete membership. Only a complete valid own-account/peer participant pair
+permits direct classification. Missing, malformed, truncated, tail-page or
+contradictory evidence is held as unknown. Confirmed group evidence is not erased
+by a later text-only poll. Unknown/group observations cannot enter this V2
+dispatcher or the owned-account legacy fallback.
+
+The legacy `message_type=dm` filter remains compatible, while UI/REST/MCP display
+the explicit conversation type. Per-message inbox rows are retained; this does
+not restore the previously cancelled grouped inbox interface. A provider-native
+conversation ID is never synthesized from a screenshot, sender name or timing.
+
+Meta's [Instagram Messaging API](https://www.postman.com/meta/instagram/folder/uxudqu0/send-api)
+does not support group messaging. The native app can show a group and media that
+the connected API does not supply. These changes do not promise a native group
+ID, title, complete member list or missing group photos. Where Instagram already
+returns participant evidence, legacy reads retain only the bounded type/reason
+summary; new full member-history capture is not enabled. No new provider field
+request, OAuth scope, subscription or background media collection is added.
+
+Message-level `content_status` is stored independently from actual attachment
+metadata. Unsupported content, missing optional fields, partial content and
+withdrawal remain visible even when some photos are present. Status-only
+observations do not become fake counted attachments. Six distinct unidentified
+photo metadata entries in one payload remain six; replays do not grow that count.
+Safe payload previews are retained; broken previews show an explicit fallback.
+No media bytes are fetched, downloaded, cached or retained by this change.
+
+V2 history still returns a small attachment preview, with the retained metadata
+count and `get_conversation_attachments` for bounded, read-only continuation.
+Its cursor binds the current principal, exact enrollment, message and content
+version. The retained count is not a claim of complete native media. URLs may
+expire or require login; an available link is not proof that its contents were
+read. Oversized metadata is explicitly marked and entire URLs are withheld,
+never truncated into unsafe or nonfunctional links. Unsafe and credential-bearing
+URLs remain excluded. Withdrawn content does not reappear after a stale poll.
+
+Migration `0009` adds only bounded type/reason/content-status metadata. It does
+not backfill identities or media, and refuses reversal while persisted dispatch
+ownership exists. Production cutover still requires the acceptance gates above.
+
+## Earlier ownership-only candidate verification (2026-10-05 UTC)
+
+The following results describe the ownership-only candidate before the later
+group/media extension. They are retained as provenance, not applied to untested
+changes in that extension. Exact-head CI and the later aggregate supersede them.
 
 The executable candidate was tested from an immutable source snapshot, with
 synthetic identities, an isolated SQLite database, cleared inherited service
@@ -199,3 +248,33 @@ request-driven dispatch possible; it does not install a scheduler, migrate an
 external responder, ship PR #10's UI, or make native sends atomic with local
 state. Do not remove legacy responsibilities merely because the bridge passes
 its narrower tests.
+
+## Integrated group/media candidate verification (2026-10-05 UTC)
+
+The final integrated executable source was frozen and verified against all
+**956 tracked files** before recording these results. Only this result section
+was added afterward.
+
+- Full isolated SQLite aggregate: **3,616 passed, 22 skipped, 5 failed**. The
+  failures are the same five baseline SQLite limitations listed above, each
+  reproduced separately on unchanged PR #11. The skips remain 21 row-lock/
+  PostgreSQL cases plus the existing non-Redis configuration case
+- All newly added committed test modules: **184 passed, 7 PostgreSQL-only
+  skipped**, with no new-test failures. This includes 51 classification cases,
+  independent content-status retention, attachment-page scope/cursor/size tests,
+  and the original ownership/dispatch/migration cases
+- Five dependency-free JavaScript behavior cases passed through the ordinary
+  pytest suite. They verify failed/cached previews, load recovery, unrelated
+  errors and repeated HTMX updates; they are not a real-browser visual pass
+- Whole-project Ruff lint/format (500 Python files), mypy (621 source files),
+  migration drift, Django checks and diff checks passed
+- Group/media independent re-review: **13 offline probes passed** after fixes
+  for incomplete participant tail pages, ownership-safe classification reversal,
+  sticky partial-content evidence and oversized attachment responses. No remaining
+  blocking finding was reported within that review's scope
+
+The exact published head still requires PostgreSQL CI, gitleaks and Docker
+validation. Real browser rendering, provider-visible media availability, native
+group metadata and production takeover have not been verified by these local
+tests. No real account enrollment, flags/grants/subscription changes, media
+download, private payload logging, live DM, merge or deployment was performed.

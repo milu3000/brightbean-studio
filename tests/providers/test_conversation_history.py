@@ -79,7 +79,10 @@ def test_unenrolled_preserves_legacy_skip_and_request_fields(settings, provider_
     assert messages[0].extra == {
         "conversation_id": "provider-conversation-id",
         "sender_id": PEER,
+        "conversation_type": "direct",
+        "classification_reason": "participants_pair",
         "inbox_attachments": [],
+        "content_fetch_status": "fields_requested",
     }
     calls = provider._request.call_args_list
     if provider_type is FacebookProvider:
@@ -109,8 +112,11 @@ def test_enabled_keeps_native_outbound_and_exact_pair_identity(settings, provide
         "sender_id": OWNER,
         "message_recipient_id": PEER,
         "participant_ids": [OWNER, PEER],
+        "conversation_type": "direct",
+        "classification_reason": "participants_pair",
         "direction": "outbound",
         "inbox_attachments": [],
+        "content_fetch_status": "fields_requested",
     }
     assert "recipient_id" not in inbound.extra
     assert "recipient_id" not in outbound.extra
@@ -143,7 +149,10 @@ def test_only_exact_account_is_enriched_when_same_provider_has_two_accounts(sett
     assert results[OTHER_ACCOUNT_ID][0].extra == {
         "conversation_id": "provider-conversation-id",
         "sender_id": PEER,
+        "conversation_type": "direct",
+        "classification_reason": "participants_pair",
         "inbox_attachments": [],
+        "content_fetch_status": "fields_requested",
     }
 
 
@@ -225,7 +234,10 @@ def test_revocation_while_fetching_messages_drops_outbound_and_identity(settings
     assert messages[0].extra == {
         "conversation_id": "provider-conversation-id",
         "sender_id": PEER,
+        "conversation_type": "direct",
+        "classification_reason": "participants_pair",
         "inbox_attachments": [],
+        "content_fetch_status": "fields_requested",
     }
 
 
@@ -256,7 +268,19 @@ def test_facebook_revocation_between_conversations_also_discards_earlier_enrichm
         "second-inbound",
         "third-inbound",
     ]
-    assert all(set(message.extra) == {"conversation_id", "sender_id", "inbox_attachments"} for message in messages)
+    assert all(
+        set(message.extra)
+        == {
+            "conversation_id",
+            "sender_id",
+            "inbox_attachments",
+            "conversation_type",
+            "classification_reason",
+            "content_fetch_status",
+        }
+        for message in messages
+    )
+    assert all(message.extra["conversation_type"] == "direct" for message in messages)
     assert ",to" in provider._request.call_args_list[1].kwargs["params"]["fields"]
     assert provider._request.call_args.kwargs["params"]["fields"] == CONTENT_MESSAGE_FIELDS
 
@@ -295,7 +319,7 @@ def test_attachment_fallback_rechecks_revoked_enrollment(settings, provider_type
 
 
 @pytest.mark.parametrize("provider_type", PROVIDERS)
-def test_message_to_single_recipient_is_sufficient_evidence(settings, provider_type):
+def test_message_to_single_recipient_proves_addressing_only(settings, provider_type):
     _enroll(settings, provider_type)
     provider = _provider(provider_type, [_message(to={"data": [{"id": PEER, "name": "Not retained"}]})])
 
@@ -305,6 +329,8 @@ def test_message_to_single_recipient_is_sufficient_evidence(settings, provider_t
     assert extra["direction"] == "outbound"
     assert "to" not in extra
     assert "participant_ids" not in extra
+    assert extra["conversation_type"] == "unknown"
+    assert extra["classification_reason"] == "participants_missing"
 
 
 @pytest.mark.parametrize("provider_type", PROVIDERS)
@@ -389,6 +415,8 @@ def test_identity_projection_does_not_copy_raw_participants_or_recipient_metadat
         "sender_id",
         "direction",
         "participant_ids",
+        "conversation_type",
+        "classification_reason",
         "message_recipient_id",
         "inbox_attachments",
     }

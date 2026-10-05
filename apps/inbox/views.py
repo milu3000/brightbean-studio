@@ -401,7 +401,7 @@ def assign_message(request, workspace_id, message_id):
         notify(
             user=message.assigned_to,
             event_type=EventType.NEW_INBOX_MESSAGE,
-            title=f"You were assigned a {message.get_message_type_display()}",
+            title=f"You were assigned a {message.type_display}",
             body=f"From {message.sender_name}: {message.body[:100]}",
             data={
                 "message_id": str(message.id),

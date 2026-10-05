@@ -13,6 +13,7 @@ from .meta_comments import parse_graph_time
 from .meta_inbox_content import (
     BASIC_MESSAGE_FIELDS,
     CONTENT_MESSAGE_FIELDS,
+    polled_conversation_classification,
     polled_message_extra,
     request_with_content_fields,
 )
@@ -914,20 +915,22 @@ class FacebookProvider(SocialProvider):
         for convo in conversations:
             convo_id = convo["id"]
             identity_fields = ",to" if provider_capture_allowed(self.credentials, platform="facebook") else ""
+            content_fallback: list[str] = []
             msg_resp = request_with_content_fields(
                 request_messages,
                 f"{BASE_URL}/{convo_id}/messages",
                 access_token=access_token,
                 params={"fields": CONTENT_MESSAGE_FIELDS + identity_fields},
                 basic_fields=BASIC_MESSAGE_FIELDS + identity_fields,
+                on_fallback=content_fallback.append,
             )
-            conversation_messages.append((convo, msg_resp.json().get("data", [])))
+            conversation_messages.append((convo, msg_resp.json().get("data", []), content_fallback))
 
         # Project only after all responses arrive: revocation during a later
         # conversation fetch also excludes earlier outbound/identity data.
         conversation_v2 = provider_capture_allowed(self.credentials, platform="facebook")
         messages: list[InboxMessage] = []
-        for convo, polled_messages in conversation_messages:
+        for convo, polled_messages, content_fallback in conversation_messages:
             convo_id = convo["id"]
             for msg in polled_messages:
                 sender = msg.get("from", {})
@@ -953,6 +956,10 @@ class FacebookProvider(SocialProvider):
                             sender_id=sender_id,
                             own_id=str(self.credentials.get("page_id") or "") if conversation_v2 else None,
                             participant_ids=convo.get("participants") if conversation_v2 else None,
+                            content_fetch_status=content_fallback[-1] if content_fallback else "fields_requested",
+                            classification_summary=polled_conversation_classification(
+                                msg, own_id=str(page_id), sender_id=sender_id, participant_ids=convo.get("participants")
+                            ),
                         ),
                     )
                 )

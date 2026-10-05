@@ -1,5 +1,5 @@
 {% extends "base.html" %}
-{% load humanize %}
+{% load humanize static %}
 
 {% block title %}{{ message.sender_name }} - Inbox - {{ workspace.name }} - Brightbean{% endblock %}
 
@@ -24,6 +24,10 @@
     .sla-warn { color: var(--warning-700); }
     .sla-overdue { color: var(--error-700); }
 </style>
+{% endblock %}
+
+{% block extra_js %}
+<script src="{% static 'js/inbox-media.js' %}" defer></script>
 {% endblock %}
 
 {% block content %}

@@ -116,7 +116,50 @@ class InboxMessage(models.Model):
         ]
 
     def __str__(self):
-        return f"{self.get_message_type_display()} from {self.sender_name}"
+        return f"{self.type_display} from {self.sender_name}"
+
+    def _conversation_classification(self):
+        if self.message_type != self.MessageType.DM:
+            return "", ""
+        row = getattr(self, "conversation_message", None)
+        if row is not None:
+            evidence = row.conversation if row.conversation_id else row
+            return evidence.conversation_type, evidence.classification_reason
+        from providers.meta_inbox_content import classify_conversation_identity
+
+        extra = self.extra if isinstance(self.extra, dict) else {}
+        summary = extra.get("conversation_type"), extra.get("classification_reason")
+        if (
+            not any(key in extra for key in ("participant_ids", "participants"))
+            and all(isinstance(value, str) for value in summary)
+            and summary
+            in {
+                ("direct", "participants_pair"),
+                ("group", "participants_group"),
+            }
+        ):
+            return summary
+        kind, reason, _peer = classify_conversation_identity(
+            self.extra,
+            own_ids=[self.social_account.account_platform_id, self.social_account.webhook_target_id],
+        )
+        return kind, reason
+
+    @property
+    def conversation_type(self):
+        return self._conversation_classification()[0]
+
+    @property
+    def classification_reason(self):
+        return self._conversation_classification()[1]
+
+    @property
+    def type_display(self):
+        if self.message_type != self.MessageType.DM:
+            return self.get_message_type_display()
+        return {"direct": "Direct Message", "group": "Group Message"}.get(
+            self.conversation_type, "Message (type unknown)"
+        )
 
     @property
     def attachments(self):
@@ -129,6 +172,12 @@ class InboxMessage(models.Model):
         if self.attachments:
             return "mixed" if self.body else "attachment"
         return "text" if self.body else "unknown"
+
+    @property
+    def content_status(self):
+        from providers.meta_inbox_content import message_content_status
+
+        return message_content_status(self.extra, self.body or "")
 
     @property
     def content_preview(self):
@@ -319,6 +368,11 @@ class InboxSLAConfig(models.Model):
 class InboxConversation(models.Model):
     """Conversation identity only; never an inbox work item or an SLA state."""
 
+    class ConversationType(models.TextChoices):
+        UNKNOWN = "unknown", "Unknown"
+        DIRECT = "direct", "Direct"
+        GROUP = "group", "Group"
+
     class IdentityKind(models.TextChoices):
         PLATFORM = "platform", "Provider conversation"
         VERIFIED_PEER = "verified_peer", "Verified one-to-one peer"
@@ -332,6 +386,10 @@ class InboxConversation(models.Model):
     platform_conversation_id = models.CharField(max_length=255, null=True, blank=True)
     peer_id = models.CharField(max_length=255, blank=True, default="")
     peer_ambiguous = models.BooleanField(default=False)
+    conversation_type = models.CharField(
+        max_length=10, choices=ConversationType.choices, default=ConversationType.UNKNOWN
+    )
+    classification_reason = models.CharField(max_length=40, default="participants_missing")
     identity_kind = models.CharField(max_length=20, choices=IdentityKind.choices)
     revision = models.PositiveBigIntegerField(default=0)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -388,11 +446,19 @@ class ConversationMessage(models.Model):
     )
     platform_message_id = models.CharField(max_length=255, null=True, blank=True)
     direction = models.CharField(max_length=10, choices=Direction.choices, default=Direction.UNKNOWN)
+    conversation_type = models.CharField(
+        max_length=10,
+        choices=InboxConversation.ConversationType.choices,
+        default=InboxConversation.ConversationType.UNKNOWN,
+    )
+    classification_reason = models.CharField(max_length=40, default="participants_missing")
     sender_id = models.CharField(max_length=255, blank=True, default="")
     recipient_id = models.CharField(max_length=255, blank=True, default="")
     sender_name = models.CharField(max_length=255, blank=True, default="")
     body = models.TextField(blank=True, default="")
     attachments = models.JSONField(default=list, blank=True)
+    # Bounded observation status only; no raw payload or media cache is retained.
+    content_status = models.CharField(max_length=25, default="unknown")
     occurred_at = models.DateTimeField(null=True, blank=True)
     is_deleted = models.BooleanField(default=False)
     sources = models.JSONField(default=list, blank=True)

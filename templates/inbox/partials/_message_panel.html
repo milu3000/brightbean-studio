@@ -63,7 +63,7 @@
         <!-- Original message -->
         <div class="bg-stone-50 rounded-xl p-4 mb-4 border border-stone-100">
             <div class="flex items-center gap-2 mb-2">
-                <span class="badge-pill badge-type">{{ message.get_message_type_display }}</span>
+                <span class="badge-pill badge-type">{{ message.type_display|default:message.get_message_type_display }}</span>
                 {% include "inbox/partials/_sentiment_badge.html" %}
                 {% if sla_config and sla_config.is_active and message.status != 'resolved' and message.status != 'archived' %}
                 {% include "inbox/partials/_sla_badge.html" %}

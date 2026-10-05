@@ -409,6 +409,8 @@ def check_conversation_send(account, message, reply, binding=None):
         if (
             row is None
             or row.conversation_id is None
+            or row.conversation.conversation_type != "direct"
+            or not coordinator._verified(row.conversation)
             or owners.filter(Q(conversation_id=row.conversation_id) | Q(peer_id=_recipient(message))).exists()
         ):
             raise DMSendGateError("conversation_owned", "This DM requires its current owner's V2 dispatch operation.")
