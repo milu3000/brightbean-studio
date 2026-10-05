@@ -516,6 +516,26 @@ class PlatformPost(models.Model):
     # costs one call a week rather than one an hour.
     analytics_failure_count = models.PositiveSmallIntegerField(default=0, db_default=0)
 
+    # Visibility is independent of publishing and metrics. Unknown is not archived.
+    class AnalyticsAvailability(models.TextChoices):
+        UNKNOWN = "unknown", "Not yet verified"
+        AVAILABLE = "available", "Available"
+        INACCESSIBLE = "inaccessible", "Post unavailable"
+        ARCHIVED = "archived", "Archived"
+        DELETED = "deleted", "Deleted"
+
+    analytics_availability = models.CharField(
+        max_length=16,
+        choices=AnalyticsAvailability.choices,
+        default=AnalyticsAvailability.UNKNOWN,
+        db_default=AnalyticsAvailability.UNKNOWN,
+    )
+    analytics_availability_source = models.CharField(max_length=16, blank=True, default="", db_default="")
+    analytics_availability_checked_at = models.DateTimeField(blank=True, null=True)
+    analytics_error_category = models.CharField(max_length=24, blank=True, default="", db_default="")
+    analytics_error_evidence = models.JSONField(default=dict, db_default={}, blank=True)
+    analytics_status_version = models.PositiveIntegerField(default=0, db_default=0)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

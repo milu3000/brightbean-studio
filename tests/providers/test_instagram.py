@@ -391,28 +391,160 @@ def test_instagram_login_account_metrics_use_current_insights_metrics():
     )
 
 
-def test_account_metrics_followers_none_when_profile_fetch_fails():
-    """A transient profile-fetch failure must yield followers=None (not 0) so the
-    analytics layer can skip it instead of writing a poisoning 0 snapshot for a
-    real account."""
-    provider = InstagramProvider({"client_id": "id", "client_secret": "secret", "ig_user_id": "ig-1"})
-    provider._request = MagicMock(
+@pytest.fixture(params=[InstagramProvider, InstagramLoginProvider], ids=["facebook-login", "instagram-login"])
+def analytics_provider(request):
+    return request.param({"client_id": "id", "client_secret": "secret", "ig_user_id": "ig-1"})
+
+
+def _account_insight_responses():
+    return [
+        _resp({"data": [{"name": "reach", "values": [{"value": 12}]}]}),
+        _resp({"data": [{"name": "views", "period": "day", "total_value": {"value": 67}}]}),
+        _resp({"data": [{"name": "accounts_engaged", "values": [{"value": 8}]}]}),
+        _resp({"data": [{"name": "total_interactions", "values": [{"value": 9}]}]}),
+    ]
+
+
+def test_account_metrics_followers_none_when_profile_fetch_fails(analytics_provider):
+    """An unclassified optional-field failure leaves followers unset, not 0.
+
+    Auth-looking text without structured evidence must not elevate this unknown
+    failure into an account-wide reconnect warning.
+    """
+    analytics_provider._request = MagicMock(
         side_effect=[
-            _resp({"data": [{"name": "reach", "values": [{"value": 12}]}]}),
-            _resp({"data": [{"name": "views", "period": "day", "total_value": {"value": 67}}]}),
-            _resp({"data": [{"name": "accounts_engaged", "values": [{"value": 8}]}]}),
-            _resp({"data": [{"name": "total_interactions", "values": [{"value": 9}]}]}),
-            APIError("(#190) Error validating access token", platform="Instagram"),
+            *_account_insight_responses(),
+            APIError("(#190) Error validating access token", platform=analytics_provider.platform_name),
         ]
     )
 
-    metrics = provider.get_account_metrics(
+    metrics = analytics_provider.get_account_metrics(
         "page-token",
         (datetime(2026, 6, 18, tzinfo=UTC), datetime(2026, 6, 19, tzinfo=UTC)),
     )
 
     assert metrics.followers is None
     assert metrics.reach == 12
+
+
+@pytest.fixture(
+    params=["expired_token", "invalid_session", "unauthorized", "missing_scope", "rate_limit", "server_error"]
+)
+def analytics_field_failure(request, analytics_provider):
+    scope = (
+        "instagram_business_manage_insights"
+        if isinstance(analytics_provider, InstagramLoginProvider)
+        else "instagram_manage_insights"
+    )
+    status_code, error = {
+        "expired_token": (400, {"code": 190, "error_subcode": 463}),
+        "invalid_session": (400, {"code": 102}),
+        "unauthorized": (401, {}),
+        "missing_scope": (403, {"code": 10, "missing_scopes": [scope]}),
+        "rate_limit": (429, {"code": 4}),
+        "server_error": (503, {}),
+    }[request.param]
+    return APIError(
+        "Provider request failed",
+        platform=analytics_provider.platform_name,
+        status_code=status_code,
+        raw_response={"error": error},
+    )
+
+
+def test_profile_failure_propagates_after_successful_account_insights(analytics_provider, analytics_field_failure):
+    analytics_provider._request = MagicMock(side_effect=[*_account_insight_responses(), analytics_field_failure])
+
+    with pytest.raises(APIError) as raised:
+        analytics_provider.get_account_metrics(
+            "page-token",
+            (datetime(2026, 6, 18, tzinfo=UTC), datetime(2026, 6, 19, tzinfo=UTC)),
+        )
+
+    assert raised.value is analytics_field_failure
+    assert analytics_provider._request.call_count == 5
+    assert all(request.args[1].endswith("/insights") for request in analytics_provider._request.call_args_list[:4])
+    assert "fields" in analytics_provider._request.call_args.kwargs["params"]
+
+
+def test_media_field_failure_stops_before_successful_post_insights(analytics_provider, analytics_field_failure):
+    analytics_provider._request = MagicMock(
+        side_effect=[analytics_field_failure, _resp({"data": [{"name": "reach", "values": [{"value": 12}]}]})]
+    )
+
+    with pytest.raises(APIError) as raised:
+        analytics_provider.get_post_metrics("page-token", "ig-media-1")
+
+    assert raised.value is analytics_field_failure
+    analytics_provider._request.assert_called_once()
+    assert analytics_provider._request.call_args.args[1].endswith("/ig-media-1")
+
+
+@pytest.mark.parametrize("failure", ["unsupported_object", "forbidden_object", "not_found", "archived", "deleted"])
+def test_unavailable_media_does_not_manufacture_successful_analytics(analytics_provider, failure):
+    error = APIError(
+        "Object unavailable",
+        platform=analytics_provider.platform_name,
+        status_code=404 if failure == "not_found" else 400,
+        raw_response={
+            "error": {
+                "unsupported_object": {"code": 100, "error_subcode": 33},
+                "forbidden_object": {"code": 200},
+            }.get(failure, {})
+        },
+    )
+    if failure in {"archived", "deleted"}:
+        error.analytics_post_state = failure
+    analytics_provider._request = MagicMock(side_effect=[error, _resp({"data": []})])
+
+    with pytest.raises(APIError) as raised:
+        analytics_provider.get_post_metrics("page-token", "ig-media-1")
+
+    assert raised.value is error
+    analytics_provider._request.assert_called_once()
+
+
+@pytest.mark.parametrize("field_type", ["profile", "media"])
+def test_optional_field_fallback_logs_only_safe_error_evidence(analytics_provider, field_type, caplog):
+    secret = "never-log-this-access-token"
+    error = APIError(
+        f"GET https://graph.example/object?access_token={secret} failed",
+        status_code=400,
+        raw_response={
+            "error": {
+                "code": 100,
+                "message": f"Tried accessing an unknown field; access_token={secret}",
+                "fbtrace_id": secret,
+            }
+        },
+    )
+    caplog.set_level("DEBUG", logger=type(analytics_provider).__module__)
+    if field_type == "profile":
+        analytics_provider._request = MagicMock(side_effect=[*_account_insight_responses(), error])
+        metrics = analytics_provider.get_account_metrics(
+            "page-token",
+            (datetime(2026, 6, 18, tzinfo=UTC), datetime(2026, 6, 19, tzinfo=UTC)),
+        )
+        assert metrics.followers is None
+        assert metrics.reach == 12
+    else:
+        analytics_provider._request = MagicMock(
+            side_effect=[
+                error,
+                _resp({"data": [{"name": "reach", "values": [{"value": 12}]}]}),
+                *[_resp({"data": []}) for _ in range(6)],
+            ]
+        )
+        metrics = analytics_provider.get_post_metrics("page-token", "ig-media-1")
+        assert metrics.extra["raw_fields"] == {}
+        assert metrics.reach == 12
+
+    assert "category=unknown" in caplog.text
+    assert "'code': 100" in caplog.text
+    assert "'http_status': 400" in caplog.text
+    assert secret not in caplog.text
+    assert "graph.example" not in caplog.text
+    assert secret not in repr(metrics)
 
 
 # ----------------------------------------------------------------------

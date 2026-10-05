@@ -1008,6 +1008,11 @@ def _create_or_update_account(
             "last_error": "",
             # Fresh OAuth grant invalidates any prior analytics-scope failure.
             "analytics_needs_reconnect": False,
+            "analytics_reconnect_reason": "",
+            "analytics_reconnect_context": "",
+            "analytics_reconnect_checked_at": None,
+            "analytics_reconnect_evidence": {},
+            "analytics_auth_updated_at": timezone.now(),
             # Likewise the webhook verdict: the subscription is about to be
             # retried below, and subscribe_account_webhooks returns early
             # without recording when the provider has no webhooks at all — so

@@ -29,7 +29,10 @@ from django.db import transaction
 from django.db.models import F, Q
 from django.utils import timezone
 
+from providers.analytics_errors import classify_analytics_error
 from providers.exceptions import APIError, QuotaExceededError, TokenExpiredError
+
+from .status import record_account_failure, record_account_success, record_post_observation
 
 logger = logging.getLogger(__name__)
 
@@ -353,30 +356,20 @@ def _analytics_provider_and_token(account) -> tuple:
     try:
         access_token = account.refresh_oauth_token(provider, enqueue_backfill=False)
     except Exception as exc:
-        if _is_dead_grant(exc):
-            logger.warning("analytics: OAuth grant for %s is gone (%s); flagging for reconnect", account, exc)
-            _mark_needs_reconnect(account)
+        if _is_dead_grant(exc, account.platform):
+            logger.warning("analytics: OAuth grant for account %s is gone; flagging for reconnect", account.id)
+            _mark_needs_reconnect(account, exc, context="account")
             _enqueue_health_check(account)
         else:
-            logger.warning("analytics: token refresh failed for %s: %s", account, exc)
+            logger.warning("analytics: token refresh failed for account %s: %s", account.id, type(exc).__name__)
     return provider, access_token
 
 
-def _is_dead_grant(exc: Exception) -> bool:
-    """Whether a refresh failure means the user's grant is gone for good.
-
-    Classified with the same machinery the health check and the connection UI
-    use, rather than by sniffing the message, so the three surfaces cannot drift
-    on what counts as "reconnect required". A network blip or a 5xx on the token
-    endpoint classifies as something else and is left alone — retrying is the
-    right move there.
-    """
-    from apps.social_accounts.error_messages import _RECONNECT, _classify
-
-    try:
-        return _classify(exc) == _RECONNECT
-    except Exception:  # pragma: no cover - classification must never break the sync
-        return False
+def _is_dead_grant(exc: Exception, platform: str = "") -> bool:
+    return (
+        classify_analytics_error(exc, platform or getattr(exc, "platform", ""), context="account").category
+        == "account_auth"
+    )
 
 
 def _enqueue_health_check(account) -> None:
@@ -394,58 +387,16 @@ def _enqueue_health_check(account) -> None:
 
 
 def _record_post_sync_success(post_ids: list, now=None) -> None:
-    """Stamp the attempt and clear the failure streak for posts we just fetched.
-
-    Uses ``update()`` rather than ``instance.save()`` so it can never write back
-    a stale copy of a row the publish engine is touching concurrently.
-    """
-    if not post_ids:
-        return
-    from apps.composer.models import PlatformPost
-
-    PlatformPost.objects.filter(pk__in=post_ids).update(
-        analytics_attempted_at=now or timezone.now(),
-        analytics_failure_count=0,
-    )
+    record_post_observation(post_ids, checked_at=now)
 
 
-def _record_post_sync_failure(post_ids: list, now=None) -> None:
-    """Stamp the attempt and extend the failure streak for posts that came back empty.
+def _record_post_sync_failure(post_ids: list, now=None, *, classification=None) -> None:
+    if classification is None:
+        # A missing batch item proves only that this object was not returned.
+        from providers.analytics_errors import AnalyticsErrorClassification
 
-    Only for a call that actually reached the platform and returned no data for
-    *that id*. A quota block, an expired token, or any other account-wide
-    refusal must NOT come through here: those posts were never really attempted,
-    and counting them would exile perfectly good posts for a week because of a
-    problem that had nothing to do with them.
-    """
-    if not post_ids:
-        return
-    from apps.composer.models import PlatformPost
-
-    PlatformPost.objects.filter(pk__in=post_ids).update(
-        analytics_attempted_at=now or timezone.now(),
-        analytics_failure_count=F("analytics_failure_count") + 1,
-    )
-
-
-def _is_insufficient_scope(exc: Exception) -> bool:
-    """Best-effort recognition of "you don't have the right scope" errors.
-
-    Each provider raises slightly different exceptions; rather than wire
-    them all up here, sniff the message for the common signals.
-    """
-    msg = str(exc).lower()
-    return any(
-        marker in msg
-        for marker in (
-            "scope",
-            "permission",
-            "insufficient",
-            "forbidden",
-            "(#10)",  # Meta's permission-error subcode
-            "(#200)",  # Meta's permission-denied subcode
-        )
-    )
+        classification = AnalyticsErrorClassification(category="post_inaccessible")
+    record_post_observation(post_ids, checked_at=now, classification=classification)
 
 
 def _write_account_snapshot(
@@ -601,6 +552,7 @@ def _sync_account_metrics(
             continue
         start = datetime.combine(target, time.min, tzinfo=tz)
         end = datetime.combine(target, time.max, tzinfo=tz)
+        attempted_at = timezone.now()
         try:
             metrics = provider.get_account_metrics(access_token, (start, end))
         except NotImplementedError:
@@ -611,10 +563,17 @@ def _sync_account_metrics(
             # per-day warning that the hourly cron quietly forgets.
             raise
         except Exception as exc:
-            if _is_insufficient_scope(exc):
-                _mark_needs_reconnect(account)
-            logger.warning("get_account_metrics failed for %s on %s: %s", account, target, exc)
+            classification = classify_analytics_error(exc, account.platform, context="account")
+            _mark_needs_reconnect(account, exc, context="account", checked_at=attempted_at)
+            logger.warning(
+                "get_account_metrics failed for %s on %s: category=%s evidence=%s",
+                account.id,
+                target,
+                classification.category,
+                classification.safe_evidence,
+            )
             return
+        record_account_success(account, context="account")
         _refresh_follower_count(account, metrics)
         fetched_followers = getattr(metrics, "followers", None)
         if fetched_followers is not None:
@@ -676,6 +635,7 @@ def _sync_youtube_post_analytics(
             published_at__date__lte=on_date,
         )
         .exclude(platform_post_id="")
+        .exclude(analytics_availability__in=["archived", "deleted"])
         .values_list("platform_post_id", flat=True)
     )
     if not post_ids:
@@ -702,8 +662,7 @@ def _sync_youtube_post_analytics(
         # The caller owns breaker/reconnect handling and must see it.
         raise
     except Exception as exc:
-        if _is_insufficient_scope(exc):
-            _mark_needs_reconnect(account)
+        _mark_needs_reconnect(account, exc, context="account")
         retryable = isinstance(exc, APIError) and exc.status_code is not None and exc.status_code >= 500
         if retryable and retry_attempt < len(_YOUTUBE_POST_ANALYTICS_RETRY_DELAYS):
             delay = _YOUTUBE_POST_ANALYTICS_RETRY_DELAYS[retry_attempt]
@@ -732,7 +691,9 @@ def _sync_youtube_post_analytics(
 
     posts_by_pid = {
         p.platform_post_id: p
-        for p in PlatformPost.objects.filter(social_account=account, platform_post_id__in=list(per_video.keys()))
+        for p in PlatformPost.objects.filter(
+            social_account=account, platform_post_id__in=list(per_video.keys())
+        ).exclude(analytics_availability__in=["archived", "deleted"])
     }
     for pid, metrics in per_video.items():
         post = posts_by_pid.get(pid)
@@ -814,9 +775,9 @@ def retry_youtube_post_analytics(account_id: str, on_date_iso: str, attempt: int
         )
     except QuotaExceededError as exc:
         _handle_quota_exhaustion(account, exc, key=key, scope="analytics", cache={})
-    except TokenExpiredError:
+    except TokenExpiredError as exc:
         logger.warning("YouTube optional Analytics retry token rejected for account %s", account.id)
-        _mark_needs_reconnect(account)
+        _mark_needs_reconnect(account, exc)
         _enqueue_health_check(account)
 
 
@@ -849,6 +810,9 @@ def _sync_post_metrics(post, on_date: dt_date, *, provider=None, access_token: s
         return
     if provider is None or access_token is None:
         provider, access_token = _analytics_provider_and_token(account)
+    if post.analytics_availability in {"archived", "deleted"}:
+        return
+    attempted_at = timezone.now()
     try:
         metrics = provider.get_post_metrics(access_token, post.platform_post_id)
     except NotImplementedError:
@@ -856,13 +820,21 @@ def _sync_post_metrics(post, on_date: dt_date, *, provider=None, access_token: s
     except (QuotaExceededError, TokenExpiredError):
         raise
     except Exception as exc:
-        if _is_insufficient_scope(exc):
-            _mark_needs_reconnect(account)
-        logger.warning("get_post_metrics failed for post %s (%s): %s", post.id, account.platform, exc)
-        _record_post_sync_failure([post.pk])
+        classification = classify_analytics_error(exc, account.platform)
+        if _mark_needs_reconnect(account, exc, checked_at=attempted_at):
+            return
+        logger.warning(
+            "get_post_metrics failed for post %s (%s): category=%s evidence=%s",
+            post.id,
+            account.platform,
+            classification.category,
+            classification.safe_evidence,
+        )
+        _record_post_sync_failure([post.pk], attempted_at, classification=classification)
         return
     _write_post_metrics_snapshot(post, metrics, account.platform, on_date)
-    _record_post_sync_success([post.pk])
+    _record_post_sync_success([post.pk], attempted_at)
+    record_account_success(account, context="post")
 
 
 def _write_post_metrics_snapshot(post, metrics, platform: str, on_date: dt_date) -> None:
@@ -905,7 +877,12 @@ def _sync_account_posts(
     the caller needs them to trip the breaker. Crucially, they leave every post's
     sync state untouched — see :func:`_record_post_sync_failure`.
     """
-    posts = [p for p in posts if not _has_unusable_platform_post_id(p, account.platform)]
+    posts = [
+        p
+        for p in posts
+        if p.analytics_availability not in {"archived", "deleted"}
+        and not _has_unusable_platform_post_id(p, account.platform)
+    ]
     if not posts:
         return 0, 0, 0
 
@@ -933,6 +910,7 @@ def _sync_account_posts(
         chunk = posts[offset : offset + batch_size]
         by_platform_id = {p.platform_post_id: p for p in chunk}
         api_calls += 1
+        attempted_at = timezone.now()
         try:
             metrics_by_id = provider.get_post_metrics_batch(access_token, list(by_platform_id))
         except NotImplementedError:
@@ -945,18 +923,20 @@ def _sync_account_posts(
             # A regular API/transport failure belongs to this chunk only. Stamp
             # those posts so a bad response cannot make the whole account due
             # again on the next tick, then continue with later chunks.
-            first_error = first_error or exc
-            if _is_insufficient_scope(exc):
-                _mark_needs_reconnect(account)
-            attempted_at = timezone.now()
-            _record_post_sync_failure([p.pk for p in by_platform_id.values()], attempted_at)
+            classification = classify_analytics_error(exc, account.platform)
+            if _mark_needs_reconnect(account, exc, checked_at=attempted_at):
+                return synced, failed, api_calls
+            first_error = first_error or classification.category
+            _record_post_sync_failure(
+                [p.pk for p in by_platform_id.values()], attempted_at, classification=classification
+            )
             failed += len(by_platform_id)
             logger.debug(
                 "get_post_metrics_batch failed for %s (%s), %s posts: %s",
                 account,
                 account.platform,
                 len(by_platform_id),
-                exc,
+                classification.safe_evidence,
             )
             continue
 
@@ -964,7 +944,6 @@ def _sync_account_posts(
         # HTTP call has returned, so a slow platform never holds a database
         # connection open across the network — and one chunk's rows still land
         # together or not at all.
-        attempted_at = timezone.now()
         hit_ids, miss_ids = [], []
         with transaction.atomic():
             for platform_post_id, post in by_platform_id.items():
@@ -979,6 +958,8 @@ def _sync_account_posts(
 
             _record_post_sync_success(hit_ids, attempted_at)
             _record_post_sync_failure(miss_ids, attempted_at)
+        if hit_ids:
+            record_account_success(account, context="post")
         synced += len(hit_ids)
         failed += len(miss_ids)
 
@@ -1019,6 +1000,7 @@ def _sync_account_posts_individually(
                 _RUN_BUDGET,
             )
             break
+        attempted_at = timezone.now()
         try:
             metrics = provider.get_post_metrics(access_token, post.platform_post_id)
         except NotImplementedError:
@@ -1027,18 +1009,25 @@ def _sync_account_posts_individually(
             raise
         except Exception as exc:
             api_calls += 1
+            classification = classify_analytics_error(exc, account.platform)
+            if _mark_needs_reconnect(account, exc, checked_at=attempted_at):
+                return synced, failed, api_calls
             failed += 1
-            first_error = first_error or exc
-            if _is_insufficient_scope(exc):
-                _mark_needs_reconnect(account)
-            logger.debug("get_post_metrics failed for post %s (%s): %s", post.id, account.platform, exc)
-            _record_post_sync_failure([post.pk], timezone.now())
+            first_error = first_error or classification.category
+            logger.debug(
+                "get_post_metrics failed for post %s (%s): category=%s evidence=%s",
+                post.id,
+                account.platform,
+                classification.category,
+                classification.safe_evidence,
+            )
+            _record_post_sync_failure([post.pk], attempted_at, classification=classification)
             continue
         api_calls += 1
-        attempted_at = timezone.now()
         with transaction.atomic():
             _write_post_metrics_snapshot(post, metrics, account.platform, on_date)
             _record_post_sync_success([post.pk], attempted_at)
+        record_account_success(account, context="post")
         synced += 1
 
     if first_error is not None:
@@ -1073,11 +1062,12 @@ def _refresh_follower_count(account, metrics) -> None:
     account.save(update_fields=["follower_count", "updated_at"])
 
 
-def _mark_needs_reconnect(account):
-    if account.analytics_needs_reconnect:
-        return
-    account.analytics_needs_reconnect = True
-    account.save(update_fields=["analytics_needs_reconnect", "updated_at"])
+def _mark_needs_reconnect(account, exc, *, context="post", checked_at=None):
+    classification = classify_analytics_error(exc, account.platform, context=context)
+    record_account_failure(account, classification, context=context, checked_at=checked_at)
+    if classification.category == "account_auth":
+        account._analytics_auth_failed = True
+    return classification.is_account_error
 
 
 def _post_cadence_due(post, now=None, *, platform: str | None = None) -> bool:
@@ -1107,6 +1097,8 @@ def _post_cadence_due(post, now=None, *, platform: str | None = None) -> bool:
     ``platform`` may be supplied by callers iterating posts of a known
     account to avoid the implicit ``post.social_account.platform`` lookup.
     """
+    if post.analytics_availability in {"archived", "deleted"}:
+        return False
     now = now or timezone.now()
     if not post.published_at:
         return False
@@ -1173,6 +1165,7 @@ def _due_posts_for(account, now):
             published_at__gte=now - timedelta(days=cap_days),
         )
         .exclude(platform_post_id="")
+        .exclude(analytics_availability__in=["archived", "deleted"])
         .filter(
             Q(analytics_attempted_at__isnull=True) | Q(analytics_attempted_at__lte=now - _SYNC_FAILURE_BACKOFF_BASE)
         )
@@ -1231,7 +1224,7 @@ def _sync_one_account(account, on_date, now, *, cache, force_today=False, deadli
     try:
         if not blocked(account_scope):
             has_today_rows = AccountInsightsSnapshot.objects.filter(social_account=account, date=on_date).exists()
-            if not account.analytics_needs_reconnect and (
+            if (not account.analytics_needs_reconnect or not account.analytics_reconnect_reason) and (
                 force_today or not has_today_rows or _needs_empty_follower_count_refresh(account)
             ):
                 try:
@@ -1248,6 +1241,8 @@ def _sync_one_account(account, on_date, now, *, cache, force_today=False, deadli
                     if account_scope == post_scope:
                         return 0, 0, 0
 
+        if getattr(account, "_analytics_auth_failed", False):
+            return 0, 0, 0
         if blocked(post_scope):
             return 0, 0, 0
         due = [p for p in _due_posts_for(account, now) if _post_cadence_due(p, now, platform=account.platform)]
@@ -1260,9 +1255,13 @@ def _sync_one_account(account, on_date, now, *, cache, force_today=False, deadli
         # suspect. Hand it to the task that owns connection_status, and do not
         # count it against any post — none of them were really attempted.
         logger.warning("analytics: %s rejected our token for %s; flagging for reconnect", account.platform, account)
-        _mark_needs_reconnect(account)
+        _mark_needs_reconnect(account, exc)
         _enqueue_health_check(account)
-        logger.debug("token rejection detail for %s: %s", account, exc)
+        logger.debug(
+            "token rejection evidence for %s: %s",
+            account.id,
+            classify_analytics_error(exc, account.platform).safe_evidence,
+        )
         return 0, 0, 0
 
 
@@ -1329,6 +1328,8 @@ def backfill_account_analytics(account_id: str, days: int | None = None) -> None
                 if account_scope == post_scope:
                     return
 
+        if getattr(account, "_analytics_auth_failed", False):
+            return
         if quota.quota_blocked_until(account.platform, key, post_scope, cache=cache):
             logger.info("analytics: skipping %s backfill — %s quota is spent", account, account.platform)
             return
@@ -1344,9 +1345,9 @@ def backfill_account_analytics(account_id: str, days: int | None = None) -> None
     except QuotaExceededError as exc:
         _handle_quota_exhaustion(account, exc, key=key, scope=post_scope, cache=cache)
         return
-    except TokenExpiredError:
+    except TokenExpiredError as exc:
         logger.warning("analytics: %s rejected our token during backfill of %s", account.platform, account)
-        _mark_needs_reconnect(account)
+        _mark_needs_reconnect(account, exc)
         _enqueue_health_check(account)
         return
 

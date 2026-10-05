@@ -32,6 +32,7 @@ from .metrics import (
     post_metrics_for,
 )
 from .models import AccountInsightsSnapshot, PostInsightsSnapshot
+from .status import account_analytics_status, post_analytics_status
 
 # Metrics whose per-post values are unique-user-per-post counts; summing them
 # across an account's posts double-counts users who saw multiple posts, so the
@@ -606,7 +607,7 @@ def all_posts_for(
             status=PlatformPost.Status.PUBLISHED,
             published_at__isnull=False,
         )
-        .select_related("post")
+        .select_related("post", "social_account")
         .prefetch_related("post__media_attachments__media_asset")
         .order_by("-published_at")
     )
@@ -616,7 +617,7 @@ def all_posts_for(
 
     posts: list[PlatformPost] = list(qs)
     metrics = post_metrics_for(account.platform)
-    stats_by_post = _latest_post_stats([p.id for p in posts], metrics)
+    stats_by_post, captured_by_post = _latest_post_stats_with_freshness([p.id for p in posts], metrics)
 
     rows: list[dict[str, Any]] = []
     for p in posts:
@@ -630,6 +631,8 @@ def all_posts_for(
                 "media_kind": media_kind,
                 "media_preview": _first_media_preview(p),
                 "stats": stats_by_post.get(p.id, {}),
+                "captured_at": captured_by_post.get(p.id),
+                "analytics_status": post_analytics_status(p),
             }
         )
     if type_filter != "all":
@@ -694,6 +697,8 @@ def post_detail(post: PlatformPost) -> dict[str, Any]:
         "media_kind": _media_kind(post),
         "media_preview": _first_media_preview(post),
         "captured_at": max_captured,
+        "analytics_status": post_analytics_status(post),
+        "account_status": account_analytics_status(account),
         "metric_tiles": [
             {
                 "key": m,
@@ -704,6 +709,7 @@ def post_detail(post: PlatformPost) -> dict[str, Any]:
                 "is_primary": m == PLATFORM_PRIMARY.get(account.platform),
             }
             for m in metrics
+            if m in stats
         ],
     }
 
@@ -718,54 +724,43 @@ def _label(metric_key: str) -> str:
 
 
 def _latest_post_stats(post_ids: Iterable[Any], metrics: list[str]) -> dict[Any, dict[str, float]]:
-    """For each post id, return ``{metric_key: latest value}``.
+    """For each post id, return ``{metric_key: latest value}``."""
+    stats, _ = _latest_post_stats_with_freshness(post_ids, metrics)
+    return stats
 
-    Three columns, never model instances. ``PostInsightsSnapshot`` is one row
-    per (post, metric, day) and carries two JSONFields — ``raw`` is the entire
-    provider response — and Django decodes both eagerly while hydrating a row.
-    Pulling these as models therefore ran a ``json.loads`` over every payload
-    in the table for the account, twice per row, to read three numbers none of
-    which are in the JSON. On an account with 300 posts and 90 days of history
-    that is 216k instances and 432k needless decodes, in a web process with
-    ~60 MB of headroom.
 
-    Where the backend supports it, ``DISTINCT ON`` also does the dedup in
-    Postgres rather than in Python, so the query returns one row per
-    (post, metric) instead of one per day. The ``order_by`` prefix it requires
-    is the ordering this needs anyway.
+def _latest_post_stats_with_freshness(
+    post_ids: Iterable[Any], metrics: list[str]
+) -> tuple[dict[Any, dict[str, float]], dict[Any, Any]]:
+    """Latest metric values and their saved timestamps, in one lightweight scan.
 
-    That is an optimization, not a requirement: README documents SQLite for
-    local development and small deployments, and SQLite inherits Django's base
-    ``distinct_sql``, which raises ``NotSupportedError`` the moment any field is
-    passed. So the clause is applied only when the backend advertises it, and
-    everything else dedups the same rows in Python. The ``values_list`` above
-    is where nearly all of the saving comes from and it works everywhere.
+    Select scalar columns only: snapshot JSON payloads are large and are not
+    needed for rendering. DISTINCT ON reduces the result in PostgreSQL; the
+    streaming fallback preserves support for SQLite and other backends.
     """
     post_ids = list(post_ids)
     if not post_ids:
-        return {}
+        return {}, {}
     rows = (
         PostInsightsSnapshot.objects.filter(platform_post_id__in=post_ids, metric_key__in=metrics)
         .order_by("platform_post_id", "metric_key", "-date")
-        .values_list("platform_post_id", "metric_key", "value")
+        .values_list("platform_post_id", "metric_key", "value", "captured_at")
     )
+    if connections[rows.db].features.can_distinct_on_fields:
+        rows = rows.distinct("platform_post_id", "metric_key")
 
     out: dict[Any, dict[str, float]] = defaultdict(dict)
-    if connections[rows.db].features.can_distinct_on_fields:
-        for post_id, metric_key, value in rows.distinct("platform_post_id", "metric_key"):
-            out[post_id][metric_key] = value
-        return out
-
-    # Same ordering, so the first row for each (post, metric) is still the
-    # newest; ``iterator`` keeps the untrimmed result set from being cached.
+    captured: dict[Any, Any] = {}
     seen: set[tuple[Any, str]] = set()
-    for post_id, metric_key, value in rows.iterator(chunk_size=2000):
+    for post_id, metric_key, value, captured_at in rows.iterator(chunk_size=2000):
         key = (post_id, metric_key)
         if key in seen:
             continue
         seen.add(key)
         out[post_id][metric_key] = value
-    return out
+        if captured_at and (post_id not in captured or captured_at > captured[post_id]):
+            captured[post_id] = captured_at
+    return out, captured
 
 
 def _post_sparklines_with_freshness(post: PlatformPost, metrics: list[str]) -> tuple[dict[str, list[float]], Any]:

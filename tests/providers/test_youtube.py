@@ -388,8 +388,8 @@ class TestErrorClassification:
         assert isinstance(exc, TokenExpiredError)
 
     def test_permission_403_still_raises_plain_api_error(self):
-        """A scope refusal must keep reaching ``_is_insufficient_scope``."""
-        from apps.analytics.tasks import _is_insufficient_scope
+        """A generic forbidden object is not evidence of a missing account scope."""
+        from providers.analytics_errors import classify_analytics_error
 
         body = {"error": {"code": 403, "message": "Forbidden", "errors": [{"reason": "forbidden"}]}}
 
@@ -398,7 +398,7 @@ class TestErrorClassification:
         assert isinstance(exc, APIError)
         assert not isinstance(exc, QuotaExceededError)
         assert exc.status_code == 403
-        assert _is_insufficient_scope(exc)
+        assert classify_analytics_error(exc, "youtube").category == "post_inaccessible"
 
     def test_429_still_raises_plain_rate_limit_error(self):
         """The base contract an override must preserve."""

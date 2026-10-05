@@ -21,6 +21,15 @@ def _resp(data):
     return MagicMock(json=MagicMock(return_value=data))
 
 
+def _missing_field(field):
+    return APIError(
+        "Graph field unavailable",
+        platform="Facebook",
+        status_code=400,
+        raw_response={"error": {"code": 100, "message": f"Tried accessing nonexisting field ({field})"}},
+    )
+
+
 def test_publish_multi_photo_post_stages_photos_then_publishes_feed_post():
     provider = FacebookProvider({"client_id": "id", "client_secret": "secret"})
     provider._request = MagicMock(
@@ -465,7 +474,7 @@ def test_get_post_metrics_keeps_object_counts_when_insights_edge_is_missing():
                     "reactions": {"summary": {"total_count": 4}},
                 }
             ),
-            APIError("nonexisting field insights", platform="Facebook"),
+            _missing_field("insights"),
         ]
     )
 
@@ -597,7 +606,7 @@ def test_get_post_metrics_tries_next_candidate_when_feed_id_has_no_insights_edge
         side_effect=[
             _resp({"id": "1668168861075953"}),
             _resp({"id": "page-1_1668168861075953", "comments": {"summary": {"total_count": 2}}}),
-            APIError("nonexisting field insights", platform="Facebook"),
+            _missing_field("insights"),
             _resp(
                 {
                     "data": [
@@ -635,7 +644,7 @@ def test_get_post_metrics_reports_batched_insights_failure_for_each_metric():
     provider._request = MagicMock(
         side_effect=[
             _resp({"id": "page-1_post-1", "comments": {"summary": {"total_count": 1}}}),
-            APIError("nonexisting field insights", platform="Facebook", raw_response={"error": {"code": 100}}),
+            _missing_field("insights"),
         ]
     )
 
@@ -763,7 +772,7 @@ def test_get_post_fields_retries_without_post_id_when_field_rejected():
     provider = FacebookProvider({"client_id": "id", "client_secret": "secret"})
     provider._request = MagicMock(
         side_effect=[
-            APIError("(#100) nonexisting field (post_id) on node type (Page)", platform="Facebook"),
+            _missing_field("post_id"),
             _resp(
                 {
                     "id": "page-1_post-1",
@@ -1086,10 +1095,144 @@ def test_get_post_fields_does_not_retry_on_non_field_error():
     provider = FacebookProvider({"client_id": "id", "client_secret": "secret"})
     provider._request = MagicMock(side_effect=APIError("(#190) Error validating access token", platform="Facebook"))
 
-    fields = provider._get_post_fields("page-token", "page-1_post-1")
+    with pytest.raises(APIError):
+        provider._get_post_fields("page-token", "page-1_post-1")
 
-    assert fields == {}
     assert provider._request.call_count == 1
+
+
+@pytest.mark.parametrize("stage", ["fields", "insights"])
+@pytest.mark.parametrize("error", [{"code": 190}, {"code": 10}, {"code": 200}, {"code": 100, "error_subcode": 33}])
+def test_analytics_propagates_account_and_object_errors(stage, error):
+    provider = FacebookProvider({"client_id": "id", "client_secret": "secret"})
+    exc = APIError("Do not turn this into successful zeros", status_code=400, raw_response={"error": error})
+    responses = [exc] if stage == "fields" else [_resp({"id": "page-1_post-1"}), exc]
+    provider._request = MagicMock(side_effect=responses)
+    with pytest.raises(APIError) as raised:
+        provider.get_post_metrics("page-token", "page-1_post-1")
+    assert raised.value is exc
+    assert provider._request.call_count == len(responses)
+
+
+@pytest.mark.parametrize("status", [401, 403, 500, 503])
+def test_post_insights_does_not_silently_return_zeros_for_unknown_or_transient_error(status):
+    provider = FacebookProvider({"client_id": "id", "client_secret": "secret"})
+    exc = APIError("failure", status_code=status)
+    provider._request = MagicMock(side_effect=[_resp({"id": "page-1_post-1"}), exc])
+    with pytest.raises(APIError) as raised:
+        provider.get_post_metrics("page-token", "page-1_post-1")
+    assert raised.value is exc
+
+
+def test_unsupported_insights_preserves_real_object_counts_without_raw_diagnostics(caplog):
+    provider = FacebookProvider({"client_id": "id", "client_secret": "secret"})
+    exc = _missing_field("insights")
+    secret = "private-token-should-not-leak"
+    exc.args = (secret,)
+    exc.raw_response["error"]["access_token"] = secret
+    provider._request = MagicMock(
+        side_effect=[_resp({"id": "page-1_post-1", "comments": {"summary": {"total_count": 3}}}), exc]
+    )
+    metrics = provider.get_post_metrics("page-token", "page-1_post-1")
+    assert metrics.comments == 3
+    assert set(metrics.extra["insight_errors"].values()) == {"unsupported_insights"}
+    assert secret not in repr(metrics.extra)
+    assert secret not in caplog.text
+
+
+def test_missing_insights_edge_without_any_object_metrics_is_not_zero_success():
+    provider = FacebookProvider({"client_id": "id", "client_secret": "secret"})
+    provider._request = MagicMock(side_effect=[_resp({"id": "page-1_post-1"}), _missing_field("insights")])
+    with pytest.raises(APIError, match="No supported Facebook post metrics returned"):
+        provider.get_post_metrics("page-token", "page-1_post-1")
+
+
+def test_batch_metric_rejection_falls_back_to_supported_individual_metrics():
+    provider = FacebookProvider({"client_id": "id", "client_secret": "secret"})
+    exc = APIError(
+        "invalid metric", raw_response={"error": {"code": 100, "message": "The value must be a valid insights metric"}}
+    )
+    provider._request = MagicMock(
+        side_effect=[
+            _resp({"id": "page-1_post-1"}),
+            exc,
+            _resp({"data": [{"name": "post_media_view", "values": [{"value": 12}]}]}),
+            exc,
+            _resp({"data": [{"name": "post_clicks", "values": [{"value": 2}]}]}),
+            _resp({"data": []}),
+        ]
+    )
+    metrics = provider.get_post_metrics("page-token", "page-1_post-1")
+    assert metrics.video_views == 12
+    assert metrics.clicks == 2
+    assert metrics.extra["insight_errors"] == {"post_total_media_view_unique": "unsupported_metric"}
+
+
+def test_all_individual_metrics_rejected_raise_unknown_instead_of_zero_success():
+    provider = FacebookProvider({"client_id": "id", "client_secret": "secret"})
+    exc = APIError(
+        "invalid metric", raw_response={"error": {"code": 100, "message": "The value must be a valid insights metric"}}
+    )
+    provider._request = MagicMock(side_effect=[_resp({"id": "page-1_post-1"}), *([exc] * 5)])
+    with pytest.raises(APIError, match="No supported analytics metrics returned"):
+        provider.get_post_metrics("page-token", "page-1_post-1")
+
+
+@pytest.mark.parametrize("error", [{"code": 190}, {"code": 200}, {"code": 2}])
+def test_account_follower_failure_does_not_hide_auth_after_successful_insights(error):
+    provider = FacebookProvider({"client_id": "id", "client_secret": "secret", "page_id": "page-1"})
+    exc = APIError("account refused", status_code=400, raw_response={"error": error})
+    provider._request = MagicMock(side_effect=[*([_resp({"data": []})] * 5), exc])
+    with pytest.raises(APIError) as raised:
+        provider.get_account_metrics("page-token", (MagicMock(timestamp=lambda: 10), MagicMock(timestamp=lambda: 20)))
+    assert raised.value is exc
+
+
+def test_inaccessible_alternative_post_id_keeps_original_fields():
+    provider = FacebookProvider({"client_id": "id", "client_secret": "secret", "page_id": "page-1"})
+    exc = APIError("alias unavailable", status_code=400, raw_response={"error": {"code": 100, "error_subcode": 33}})
+    provider._request = MagicMock(
+        side_effect=[_resp({"id": "video-1", "comments": {"summary": {"total_count": 8}}}), exc]
+    )
+    fields, candidates = provider._resolve_post_fields("page-token", "video-1")
+    assert fields["comments"]["summary"]["total_count"] == 8
+    assert candidates == ["video-1"]
+
+
+def test_inaccessible_generated_alias_does_not_block_original_video_insights():
+    provider = FacebookProvider({"client_id": "id", "client_secret": "secret", "page_id": "page-1"})
+    unavailable_alias = APIError(
+        "alias unavailable", status_code=400, raw_response={"error": {"code": 100, "error_subcode": 33}}
+    )
+    provider._request = MagicMock(
+        side_effect=[
+            _resp({"id": "12345", "comments": {"summary": {"total_count": 8}}}),
+            unavailable_alias,
+            _resp({"data": [{"name": "post_media_view", "values": [{"value": 12}]}]}),
+        ]
+    )
+
+    metrics = provider.get_post_metrics("page-token", "12345")
+
+    assert metrics.video_views == 12
+    assert metrics.comments == 8
+    assert metrics.extra["insight_post_id"] == "12345"
+    assert metrics.extra["attempted_insight_post_ids"] == ["12345"]
+    assert provider._request.call_args_list[-1].args[1] == "https://graph.facebook.com/v25.0/12345/insights"
+    assert provider._request.call_count == 3
+
+
+@pytest.mark.parametrize("error", [{"code": 190}, {"code": 200, "missing_scopes": ["read_insights"]}, {"code": 2}])
+def test_generated_alias_auth_scope_and_transient_failures_are_not_discarded(error):
+    provider = FacebookProvider({"client_id": "id", "client_secret": "secret", "page_id": "page-1"})
+    exc = APIError("alias refusal", status_code=400, raw_response={"error": error})
+    provider._request = MagicMock(side_effect=[_resp({"id": "12345"}), exc])
+
+    with pytest.raises(APIError) as raised:
+        provider.get_post_metrics("page-token", "12345")
+
+    assert raised.value is exc
+    assert provider._request.call_count == 2
 
 
 # ---------------------------------------------------------------------------
