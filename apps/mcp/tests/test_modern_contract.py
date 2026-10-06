@@ -278,6 +278,7 @@ def test_tools_list_cannot_silently_ignore_cursor(context, cursor):
     assert response.json()["error"]["code"] == -32602
 
 
+@pytest.mark.django_db(transaction=True)
 def test_mocked_inbound_delivery_fetch_reply_and_echo_lifecycle(context, params, verify):
     """Exercise the complete server chain, not a claim of live ChatGPT waking."""
     from types import SimpleNamespace
@@ -303,8 +304,28 @@ def test_mocked_inbound_delivery_fetch_reply_and_echo_lifecycle(context, params,
     # precision, without relying on sleeps or rewriting the stored timestamp.
     now = timezone.now()
     with patch("apps.inbox.tasks.InboxSyncEngine._notify_new_message"):
-        _handle_facebook_messaging(account, _messaging(mid="customer-new", timestamp=now.timestamp() * 1000))
+        inbound = _messaging(mid="customer-new", timestamp=now.timestamp() * 1000)
+        inbound["recipient"] = {"id": account.account_platform_id}
+        _handle_facebook_messaging(account, inbound)
     message = InboxMessage.objects.get()
+    assert message.conversation_type == "unknown"
+    # Endpoints alone do not establish one-to-one membership. The ordinary
+    # provider poll supplies its verified bounded summary before we may reply.
+    InboxSyncEngine()._upsert_message(
+        account,
+        _polled(
+            mid="customer-new",
+            timestamp=now,
+            extra={
+                "conversation_id": "synthetic-native-thread",
+                "sender_id": "customer-1",
+                "conversation_type": "direct",
+                "classification_reason": "participants_pair",
+            },
+        ),
+    )
+    message.refresh_from_db()
+    assert message.conversation_type == "direct"
     outbox = EventOutbox.objects.get()
     payload = json.loads(outbox.payload)
     assert payload["data"]["message_id"] == str(message.pk)

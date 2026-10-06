@@ -69,7 +69,10 @@ def test_forward_migration_preserves_legacy_reply_and_local_operation_states(inb
             )
         before_operations = list(operation_model.objects.order_by("pk").values())
         MigrationExecutor(connection).migrate(heads)
-        assert list(InboxReply.objects.order_by("pk").values()) == before_replies
+        assert list(InboxReply.objects.order_by("pk").values(*before_replies[0])) == before_replies
+        assert not InboxReply.objects.exclude(
+            follow_up_of=None, is_follow_up=False, not_sent_verified=False, send_generation=0
+        ).exists()
         old_fields = list(before_operations[0])
         assert list(SendOperation.objects.order_by("pk").values(*old_fields)) == before_operations
         assert not DMConversationOwnership.objects.exists()
@@ -136,4 +139,4 @@ def test_reverse_refuses_dispatch_links_even_if_no_ownership_row_survives(inbox_
         MigrationExecutor(connection).migrate(PREVIOUS)
     operation.refresh_from_db()
     assert operation.status == "outcome_unknown"
-    assert InboxReply.objects.get(pk=reply.pk).status == "unknown"
+    assert InboxReply.objects.values_list("status", flat=True).get(pk=reply.pk) == "unknown"

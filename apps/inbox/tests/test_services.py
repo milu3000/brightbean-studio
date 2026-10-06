@@ -130,13 +130,19 @@ def test_failed_reply_can_be_retried(message):
     assert reply.platform_reply_id == "ok-1"
 
 
-def test_provider_without_reply_api_records_locally(message):
+def test_provider_without_reply_api_retains_failed_reply(message):
     reply = services.create_reply_draft(message=message, body="answer")
-    with patch("apps.inbox.services._dispatch_to_platform", side_effect=NotImplementedError):
+    with (
+        patch("apps.inbox.services._dispatch_to_platform", side_effect=NotImplementedError),
+        pytest.raises(NotImplementedError),
+    ):
         services.send_reply_now(reply)
     reply.refresh_from_db()
-    assert reply.status == InboxReply.Status.SENT
+    assert reply.status == InboxReply.Status.FAILED
     assert reply.platform_reply_id == ""
+    assert reply.sent_at is None
+    assert reply.body == "answer"
+    assert "does not support" in reply.send_error
 
 
 def test_send_applies_sla_auto_resolve(message):

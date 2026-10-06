@@ -505,6 +505,10 @@ def prepare_reply(
         .exists()
     ):
         raise ReplyCoordinationError("target_already_answered")
+    if target.legacy_message_id:
+        from .reply_safety import check_dm_receipts
+
+        check_dm_receipts(target.legacy_message, include_drafts=True)
     operation = SendOperation.objects.create(
         ownership=owner,
         owner_epoch=owner.epoch if owner else 0,

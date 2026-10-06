@@ -35,6 +35,7 @@ from apps.api.schemas import (
     InboxMessageResponse,
     InboxMessagesListResponse,
     InboxReplyResponse,
+    InboxThreadResponse,
     UpdateReplyRequest,
 )
 from apps.inbox.dm_send_gate import key_send_authorization
@@ -72,6 +73,7 @@ def _visible_messages_qs(request: HttpRequest) -> QuerySet[InboxMessage]:
     """Messages in the key's workspace whose account is in the allowlist."""
     return InboxMessage.objects.filter(
         workspace_id=request.api_key.workspace_id,  # type: ignore[attr-defined]
+        social_account__workspace_id=request.api_key.workspace_id,  # type: ignore[attr-defined]
         social_account_id__in=_allowlisted_account_ids(request),
     ).select_related("social_account")
 
@@ -85,6 +87,7 @@ def _get_reply(request: HttpRequest, reply_id: uuid.UUID) -> InboxReply:
         InboxReply.objects.select_related("inbox_message", "inbox_message__social_account", "author"),
         id=reply_id,
         inbox_message__workspace_id=request.api_key.workspace_id,  # type: ignore[attr-defined]
+        inbox_message__social_account__workspace_id=request.api_key.workspace_id,  # type: ignore[attr-defined]
     )
     if reply.inbox_message.social_account_id not in _allowlisted_account_ids(request):
         raise Http404()
@@ -134,7 +137,7 @@ def list_messages(
     rows = rows[:limit]
     log_audit_entry(request, action="inbox.list", target_id=None, status_code=200)
     return InboxMessagesListResponse(
-        messages=[InboxMessageResponse.from_message(m, include_replies=True) for m in rows],
+        messages=[InboxMessageResponse.from_message(m, include_replies=True, include_eligibility=True) for m in rows],
         limit=limit,
         next_cursor=encode_offset_cursor(offset + limit) if has_more else None,
     )
@@ -146,7 +149,27 @@ def retrieve_message(request, message_id: uuid.UUID):
     _require_perm(request, "use_inbox")
     message = _get_message(request, message_id)
     log_audit_entry(request, action="inbox.read", target_id=message.id, status_code=200)
-    return InboxMessageResponse.from_message(message, include_replies=True)
+    return InboxMessageResponse.from_message(message, include_replies=True, include_eligibility=True)
+
+
+@router.get("/{message_id}/thread", response=InboxThreadResponse, summary="Read the stored inbox conversation")
+def retrieve_thread(
+    request,
+    message_id: uuid.UUID,
+    limit: int = Query(20, ge=1, le=50),
+    cursor: str | None = Query(None),
+):
+    from apps.inbox.thread_reads import read_stored_thread
+
+    enforce_http_rate_limits(request, is_write=False)
+    _require_perm(request, "use_inbox")
+    message = _get_message(request, message_id)
+    try:
+        result = read_stored_thread(message, actor_id=request.api_key.id, cursor=cursor, limit=limit)
+    except ValueError as exc:
+        raise HttpError(422, str(exc)) from exc
+    log_audit_entry(request, action="inbox.thread.read", target_id=message.id, status_code=200)
+    return result
 
 
 @router.post(
@@ -161,6 +184,7 @@ def create_reply(request, message_id: uuid.UUID, payload: CreateReplyRequest):
         _require_perm(request, "reply_from_inbox")
 
     message = _get_message(request, message_id)
+    follow_up_of = _get_reply(request, payload.follow_up_reply_id) if payload.follow_up_reply_id else None
     idempotency_key = payload.idempotency_key or request.headers.get("Idempotency-Key") or None
     fingerprint = fingerprint_request(request.method or "POST", request.path, payload.model_dump(mode="json"))
     try:
@@ -184,6 +208,7 @@ def create_reply(request, message_id: uuid.UUID, payload: CreateReplyRequest):
             message=message,
             body=payload.body,
             author=request.user if not request.user.is_anonymous else None,
+            follow_up_of=follow_up_of,
         )
     except ValueError as exc:
         release_idempotent_claim(api_key=request.api_key, idempotency_key=idempotency_key)

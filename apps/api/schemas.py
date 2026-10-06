@@ -757,6 +757,9 @@ class InboxReplyResponse(Schema):
     status: str
     body: str
     author_email: str = ""
+    follow_up_reply_id: uuid.UUID | None = None
+    is_follow_up: bool = False
+    not_sent_verified: bool = False
     platform_reply_id: str = ""
     send_error: str = ""
     created_at: dt.datetime
@@ -775,6 +778,9 @@ class InboxReplyResponse(Schema):
             inbox_message_id=reply.inbox_message_id,
             status=reply.status,
             body=reply.body,
+            follow_up_reply_id=getattr(reply, "follow_up_of_id", None),
+            is_follow_up=getattr(reply, "is_follow_up", False),
+            not_sent_verified=getattr(reply, "not_sent_verified", False),
             author_email=(getattr(author, "email", "") or ""),
             platform_reply_id=reply.platform_reply_id or "",
             send_error=reply.send_error or "",
@@ -806,7 +812,16 @@ class AttachmentResponse(Schema):
         "removed",
         "fields_unavailable",
         "invalid_metadata",
+        "size_limited",
     ] = "missing_url"
+
+
+class InboxReplyEligibilityResponse(Schema):
+    allowed: bool
+    code: str
+    reason: str
+    existing_reply_id: uuid.UUID | None = None
+    requires_current_authorization: bool = True
 
 
 class InboxMessageResponse(Schema):
@@ -835,13 +850,19 @@ class InboxMessageResponse(Schema):
     received_at: dt.datetime
     created_at: dt.datetime
     replies: list[InboxReplyResponse] = Field(default_factory=list)
+    reply_eligibility: InboxReplyEligibilityResponse | None = Field(
+        None, description="Read-only message eligibility; sending always rechecks current permission and state."
+    )
 
     @field_serializer("received_at", "created_at")
     def _serialize_dt(self, value: dt.datetime | None) -> str | None:
         return _serialize_utc_z(value)
 
     @classmethod
-    def from_message(cls, message, *, include_replies: bool = False) -> InboxMessageResponse:
+    def from_message(
+        cls, message, *, include_replies: bool = False, include_eligibility: bool = False
+    ) -> InboxMessageResponse:
+        from apps.inbox.services import reply_send_availability
         from providers.meta_inbox_content import message_content_status
 
         replies: list[InboxReplyResponse] = []
@@ -873,7 +894,29 @@ class InboxMessageResponse(Schema):
             received_at=message.received_at,
             created_at=message.created_at,
             replies=replies,
+            reply_eligibility=reply_send_availability(message) if include_eligibility else None,
         )
+
+
+class StoredThreadMessageResponse(InboxMessageResponse):
+    body_truncated: bool = False
+    attachment_metadata_count: int = 0
+    attachments_truncated: bool = False
+    reply_count: int = 0
+    replies_truncated: bool = False
+    detail_tool: str = "get_inbox_message"
+
+
+class InboxThreadResponse(Schema):
+    anchor_message_id: uuid.UUID
+    latest_message_id: uuid.UUID | None
+    grouping: Literal["native_conversation", "single_message"]
+    messages: list[StoredThreadMessageResponse]
+    limit: int
+    next_cursor: str | None = None
+    history_complete: bool = False
+    outbound_coverage: str = "brightbean_replies_only"
+    response_truncated: bool = False
 
 
 class InboxMessagesListResponse(Schema):
@@ -883,6 +926,10 @@ class InboxMessagesListResponse(Schema):
 
 
 class CreateReplyRequest(Schema):
+    follow_up_reply_id: uuid.UUID | None = Field(
+        None,
+        description="Explicit sent receipt to follow with another reply to the same incoming message. Never use for a retry.",
+    )
     body: str = Field(..., min_length=1, max_length=10_000, description="The reply text.")
     idempotency_key: str | None = Field(
         None,

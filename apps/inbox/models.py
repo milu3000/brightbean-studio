@@ -205,6 +205,16 @@ class InboxReply(models.Model):
         on_delete=models.CASCADE,
         related_name="replies",
     )
+    follow_up_of = models.OneToOneField(
+        "self",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="follow_up_reply",
+    )
+    is_follow_up = models.BooleanField(default=False, db_default=False)
+    not_sent_verified = models.BooleanField(default=False, db_default=False)
+    send_generation = models.PositiveBigIntegerField(default=0, db_default=0)
     author = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,

@@ -231,8 +231,27 @@ def dm_send_status(account) -> dict:
         .filter(social_account_id=account.pk)
         .first()
     )
+    from .reply_safety import is_unresolved_reply
+
+    receipts = list(
+        InboxReply.objects.select_related("inbox_message")
+        .prefetch_related("dm_send_attempts")
+        .filter(
+            inbox_message__social_account_id=account.pk,
+            status__in=[InboxReply.Status.UNKNOWN, InboxReply.Status.FAILED],
+        )
+    )
+    shared_counts = {
+        "shared_unknown_reply_count": sum(reply.status == InboxReply.Status.UNKNOWN for reply in receipts),
+        "shared_unresolved_reply_count": sum(is_unresolved_reply(reply) for reply in receipts),
+    }
     if control is None:
-        return {"enrolled": False, "enforcement_scope": "BrightBean DM", "legacy_coverage_incomplete": True}
+        return {
+            "enrolled": False,
+            "enforcement_scope": "BrightBean DM",
+            "legacy_coverage_incomplete": True,
+            **shared_counts,
+        }
     if control.social_account.workspace_id != account.workspace_id:
         raise DMSendGateError("identity_changed", "The DM account identity changed; reload its state.")
     _check_identity(control, control.social_account)
@@ -242,6 +261,7 @@ def dm_send_status(account) -> dict:
         "pause_committed": control.paused,
         "epoch": control.epoch,
         "tracked_unresolved": control.tracked_unresolved,
+        **shared_counts,
         "observed_at": timezone.now(),
         "coverage_from": control.coverage_from,
         "coverage_version": control.coverage_version,
@@ -259,6 +279,10 @@ def _valid_time(value, cutoff, now):
 
 def _fingerprint(reply, message):
     # No message text, recipients, platform payloads or secrets in this table.
+    try:
+        parent = reply.follow_up_of
+    except InboxReply.DoesNotExist:
+        parent = None
     payload = [
         str(message.pk),
         str(message.workspace_id),
@@ -271,12 +295,17 @@ def _fingerprint(reply, message):
         message.created_at.isoformat(),
         reply.body,
         reply.created_at.isoformat(),
+        reply.is_follow_up,
+        str(reply.follow_up_of_id) if reply.follow_up_of_id else None,
+        parent.platform_reply_id if parent else None,
+        parent.sent_at.isoformat() if parent and parent.sent_at else None,
     ]
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
 
 def _check_send(control, account, reply, message, authorization, automated, dispatch_binding=None):
     from .reply_dispatch import check_conversation_send
+    from .reply_safety import check_dm_receipts, validate_dm_target
     from .services import validate_automated_reply_window
 
     _check_identity(control, account)
@@ -301,6 +330,8 @@ def _check_send(control, account, reply, message, authorization, automated, disp
         raise DMSendGateError("empty_body", "The DM reply body is empty.")
     if account.connection_status != "connected":
         raise DMSendGateError("disconnected", "The DM account is not connected.")
+    validate_dm_target(message)
+    check_dm_receipts(message, reply, include_drafts=True)
     _authorize(authorization, account)
     if automated:
         validate_automated_reply_window(message)
@@ -348,8 +379,9 @@ def _prepare_attempt(reply, authorization, automated, snapshot, dispatch_binding
         attempt = DMSendAttempt.objects.create(
             control=control, reply=reply, epoch=control.epoch, fingerprint=_fingerprint(reply, message)
         )
-        reply.status, reply.send_error = InboxReply.Status.UNKNOWN, UNKNOWN_MESSAGE
-        reply.save(update_fields=["status", "send_error", "updated_at"])
+        reply.send_generation += 1
+        reply.status, reply.send_error, reply.not_sent_verified = InboxReply.Status.UNKNOWN, UNKNOWN_MESSAGE, False
+        reply.save(update_fields=["status", "send_error", "not_sent_verified", "send_generation", "updated_at"])
         from .reply_dispatch import mark_dispatch_attempt
 
         mark_dispatch_attempt(dispatch_binding, attempt, reply)
@@ -375,8 +407,9 @@ def _settle_not_sent(reply, attempt, code):
     attempt.completed_at = timezone.now()
     attempt.save(update_fields=["outcome", "reason_code", "completed_at"])
     reply.status = InboxReply.Status.FAILED
+    reply.not_sent_verified = True
     reply.send_error = f"DM send stopped ({code}); no provider acceptance was recorded for this attempt."
-    reply.save(update_fields=["status", "send_error", "updated_at"])
+    reply.save(update_fields=["status", "send_error", "not_sent_verified", "updated_at"])
 
 
 class _PreDispatchRefusedError(Exception):
@@ -449,11 +482,20 @@ def send_enrolled_dm(reply, *, actor, authorization, automated, snapshot, dispat
                         failure = DMSendUnknownError()
                 else:
                     reply.status, reply.platform_reply_id, reply.send_error = InboxReply.Status.SENT, mid, ""
+                    reply.not_sent_verified = False
                     reply.sent_at = timezone.now()
                     if actor is not None and reply.author_id is None:
                         reply.author = actor
                     reply.save(
-                        update_fields=["status", "platform_reply_id", "send_error", "sent_at", "author", "updated_at"]
+                        update_fields=[
+                            "status",
+                            "platform_reply_id",
+                            "send_error",
+                            "sent_at",
+                            "author",
+                            "not_sent_verified",
+                            "updated_at",
+                        ]
                     )
                     attempt.outcome, attempt.reason_code = DMSendAttempt.Outcome.SENT, "provider_accepted"
                     attempt.completed_at = timezone.now()

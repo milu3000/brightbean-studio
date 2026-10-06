@@ -181,14 +181,16 @@ def test_backfill_arriving_late_spares_rows_written_since_0002(inbox_message, re
     """Staging's path: it applied the backfill inside 0002 and has been taking
     traffic since, so the split backfill lands on a table holding real drafts."""
     _migrate(SCHEMA)
+    schema_apps = MigrationExecutor(connection).loader.project_state([(APP, SCHEMA)]).apps
+    schema_reply = schema_apps.get_model(APP, "InboxReply")
 
     sent_at = timezone.now() - timedelta(hours=1)
     drafted_at = timezone.now() - timedelta(hours=3)
-    draft = InboxReply.objects.create(inbox_message=inbox_message, body="still a draft")
-    failed = InboxReply.objects.create(inbox_message=inbox_message, body="bounced")
-    InboxReply.objects.filter(pk=failed.pk).update(status=InboxReply.Status.FAILED, send_error="rate limited")
-    delivered = InboxReply.objects.create(inbox_message=inbox_message, body="drafted, then sent")
-    InboxReply.objects.filter(pk=delivered.pk).update(
+    draft = schema_reply.objects.create(inbox_message_id=inbox_message.pk, body="still a draft")
+    failed = schema_reply.objects.create(inbox_message_id=inbox_message.pk, body="bounced")
+    schema_reply.objects.filter(pk=failed.pk).update(status=InboxReply.Status.FAILED, send_error="rate limited")
+    delivered = schema_reply.objects.create(inbox_message_id=inbox_message.pk, body="drafted, then sent")
+    schema_reply.objects.filter(pk=delivered.pk).update(
         status=InboxReply.Status.SENT, created_at=drafted_at, sent_at=sent_at
     )
 
@@ -201,3 +203,8 @@ def test_backfill_arriving_late_spares_rows_written_since_0002(inbox_message, re
     assert failed.status == InboxReply.Status.FAILED
     assert delivered.status == InboxReply.Status.SENT
     assert delivered.created_at == drafted_at
+
+    # New safety metadata must not alter the historical draft/failure evidence.
+    assert not InboxReply.objects.exclude(
+        follow_up_of=None, is_follow_up=False, not_sent_verified=False, send_generation=0
+    ).exists()

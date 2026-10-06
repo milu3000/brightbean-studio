@@ -12,7 +12,7 @@ from unittest.mock import patch
 import pytest
 from django.db import close_old_connections, connection
 
-from apps.inbox import conversations, reply_coordination, services
+from apps.inbox import conversations, reply_coordination, reply_safety
 from apps.inbox import dm_send_gate as gate
 from apps.inbox import reply_dispatch as dispatch
 from apps.inbox.models import ConversationWorkState, DMSendAttempt, InboxReply, SendOperation
@@ -280,7 +280,7 @@ def test_owner_enrollment_cannot_be_bypassed_by_legacy_sender_waiting_on_account
     reply = create_reply_draft(message=owned.row.legacy_message, body="Synthetic legacy draft")
     enrollment_locked, release, sender_at_lock = Event(), Event(), Event()
     original_retire = dispatch._retire_work
-    original_lock = services.lock_dm_account
+    original_lock = reply_safety.lock_dm_account
 
     def retire(*args, **kwargs):
         result = original_retire(*args, **kwargs)
@@ -297,7 +297,7 @@ def test_owner_enrollment_cannot_be_bypassed_by_legacy_sender_waiting_on_account
 
     with (
         patch.object(dispatch, "_retire_work", side_effect=retire),
-        patch.object(services, "lock_dm_account", side_effect=lock),
+        patch.object(reply_safety, "lock_dm_account", side_effect=lock),
         patch("apps.inbox.services._dispatch_to_platform") as provider,
         ThreadPoolExecutor(max_workers=2) as pool,
     ):

@@ -946,19 +946,21 @@ class FacebookProvider(SocialProvider):
     def _fetch_direct_messages(self, access_token: str, since: datetime | None = None) -> list[InboxMessage]:
         from apps.inbox.conversation_policy import provider_capture_allowed
 
-        conversation_v2 = provider_capture_allowed(self.credentials, platform="facebook")
         page_id = self.credentials.get("page_id", "me")
-        params: dict = {}
-        if conversation_v2:
-            params["fields"] = "id,participants"
+        # Verify the same conversations already polled without retaining a
+        # participant directory or enabling outbound history. IDs are enough;
+        # requesting names/emails would collect data unnecessary for this check.
+        params: dict = {"fields": "id,participants{id}"}
         if since:
             params["since"] = int(since.timestamp())
 
-        resp = self._request(
-            "GET",
+        resp = request_with_content_fields(
+            self._request,
             f"{BASE_URL}/{page_id}/conversations",
             access_token=access_token,
             params=params,
+            basic_fields="id",
+            optional_fields=("participants",),
         )
         conversations = resp.json().get("data", [])
 

@@ -1250,6 +1250,7 @@ def _visible_inbox_qs(api_key):
         return InboxMessage.objects.none()
     return InboxMessage.objects.filter(
         workspace_id=api_key.workspace_id,
+        social_account__workspace_id=api_key.workspace_id,
         social_account_id__in=allowed,
     ).select_related("social_account")
 
@@ -1267,7 +1268,9 @@ def _get_inbox_reply_for_key(api_key, reply_id_str: str) -> InboxReply:
     allowed = _inbox_allowed_account_ids(api_key)
     try:
         reply = InboxReply.objects.select_related("inbox_message", "inbox_message__social_account", "author").get(
-            id=reply_id, inbox_message__workspace_id=api_key.workspace_id
+            id=reply_id,
+            inbox_message__workspace_id=api_key.workspace_id,
+            inbox_message__social_account__workspace_id=api_key.workspace_id,
         )
     except InboxReply.DoesNotExist as exc:
         raise JsonRpcError(INVALID_PARAMS, "Reply not found") from exc
@@ -1279,7 +1282,9 @@ def _get_inbox_reply_for_key(api_key, reply_id_str: str) -> InboxReply:
 def _serialize_inbox_message(message: InboxMessage) -> dict:
     from apps.api.schemas import InboxMessageResponse
 
-    return InboxMessageResponse.from_message(message, include_replies=True).model_dump(mode="json")
+    return InboxMessageResponse.from_message(message, include_replies=True, include_eligibility=True).model_dump(
+        mode="json"
+    )
 
 
 def _serialize_inbox_reply(reply: InboxReply) -> dict:
@@ -1415,6 +1420,45 @@ register_tool(
 # ---------------------------------------------------------------------------
 
 
+def _get_inbox_thread(args: dict, context: dict[str, Any]) -> dict:
+    from apps.inbox.thread_reads import read_stored_thread
+
+    _require_perm(context, "use_inbox")
+    if "message_id" not in args:
+        raise JsonRpcError(INVALID_PARAMS, "message_id is required")
+    key = context["api_key"]
+    message = _get_inbox_message_for_key(key, args["message_id"])
+    try:
+        result = read_stored_thread(message, actor_id=key.id, cursor=args.get("cursor"), limit=args.get("limit", 20))
+    except ValueError as exc:
+        raise JsonRpcError(INVALID_PARAMS, str(exc)) from exc
+    return _wrap_text(result)
+
+
+register_tool(
+    Tool(
+        name="get_inbox_thread",
+        description=(
+            "Read a bounded conversation from inbox messages and BrightBean replies already stored for this "
+            "authorized account. Groups only an exact native thread ID; missing IDs remain separate. Does not "
+            "fetch native history, mark messages read, change capture, or send. Native outgoing may be absent. "
+            "Follow next_cursor for older messages; use get_inbox_message for truncated item details."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "message_id": {"type": "string", "format": "uuid"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50, "default": 20},
+                "cursor": {"type": "string"},
+            },
+            "required": ["message_id"],
+            "additionalProperties": False,
+        },
+        handler=_get_inbox_thread,
+    )
+)
+
+
 def _create_reply_draft(args: dict, context: dict[str, Any]) -> dict:
     _require_perm(context, "use_inbox")
     api_key = context["api_key"]
@@ -1423,11 +1467,15 @@ def _create_reply_draft(args: dict, context: dict[str, Any]) -> dict:
     if not args.get("body"):
         raise JsonRpcError(INVALID_PARAMS, "body is required")
     message = _get_inbox_message_for_key(api_key, args["message_id"])
+    follow_up_of = (
+        _get_inbox_reply_for_key(api_key, args["follow_up_reply_id"]) if "follow_up_reply_id" in args else None
+    )
     try:
         reply = create_reply_draft(
             message=message,
             body=args["body"],
             author=api_key.issued_by if api_key.issued_by_id else None,
+            follow_up_of=follow_up_of,
         )
     except ValueError as exc:
         raise JsonRpcError(INVALID_PARAMS, str(exc)) from exc
@@ -1440,12 +1488,15 @@ register_tool(
         description=(
             "Draft a reply to an inbox message. The draft is saved but NOT sent to the platform; "
             "a human can review it in the inbox, or call send_reply to deliver it. Requires the "
-            "use_inbox permission (drafting is not sending)."
+            "use_inbox permission (drafting is not sending). For an intentional additional message, "
+            "pass follow_up_reply_id of a confirmed sent receipt on the same incoming message. "
+            "Never use that option to retry uncertain delivery."
         ),
         input_schema={
             "type": "object",
             "properties": {
                 "message_id": {"type": "string", "format": "uuid"},
+                "follow_up_reply_id": {"type": "string", "format": "uuid"},
                 "body": {"type": "string", "minLength": 1, "maxLength": 10000},
             },
             "required": ["message_id", "body"],
@@ -1479,7 +1530,7 @@ register_tool(
     Tool(
         name="update_reply_draft",
         description=(
-            "Replace the body of an existing draft (or failed) reply. Sent replies cannot be "
+            "Replace the body of an existing draft (or a verified not-sent failed reply). Sent or uncertain replies cannot be "
             "edited. Requires the use_inbox permission."
         ),
         input_schema={
@@ -1518,7 +1569,7 @@ register_tool(
     Tool(
         name="discard_reply_draft",
         description=(
-            "Delete a draft (or failed) reply. Sent replies are permanent and cannot be "
+            "Delete a draft (or a verified not-sent failed reply). Sent or uncertain replies cannot be "
             "discarded. Requires the use_inbox permission."
         ),
         input_schema={
@@ -1544,8 +1595,8 @@ def _send_reply(args: dict, context: dict[str, Any]) -> dict:
     api_key = context["api_key"]
     actor = api_key.issued_by if api_key.issued_by_id else None
 
-    if "reply_id" in args and ("message_id" in args or "body" in args):
-        raise JsonRpcError(INVALID_PARAMS, "reply_id cannot be combined with message_id or body")
+    if "reply_id" in args and any(name in args for name in ("message_id", "body", "follow_up_reply_id")):
+        raise JsonRpcError(INVALID_PARAMS, "reply_id cannot be combined with message_id, body or follow_up_reply_id")
     if "reply_id" in args:
         reply = _get_inbox_reply_for_key(api_key, args["reply_id"])
     else:
@@ -1555,9 +1606,12 @@ def _send_reply(args: dict, context: dict[str, Any]) -> dict:
                 "Provide either reply_id (to send an existing draft) or message_id + body",
             )
         message = _get_inbox_message_for_key(api_key, args["message_id"])
+        follow_up_of = (
+            _get_inbox_reply_for_key(api_key, args["follow_up_reply_id"]) if "follow_up_reply_id" in args else None
+        )
         try:
             validate_automated_reply_window(message)
-            reply = create_reply_draft(message=message, body=args["body"], author=actor)
+            reply = create_reply_draft(message=message, body=args["body"], author=actor, follow_up_of=follow_up_of)
         except ValueError as exc:
             raise JsonRpcError(INVALID_PARAMS, str(exc)) from exc
 
@@ -1583,7 +1637,9 @@ register_tool(
             "Deliver a reply to an inbox message's platform. Either pass `reply_id` to send an "
             "existing draft, or `message_id` + `body` to create and send in one step. On a "
             "known platform refusal the reply is kept in `failed` state and an error is returned. "
-            "For enrolled DM accounts an unknown outcome holds further sends; do not retry. Automated Meta DMs require a known original inbound "
+            "For every DM account an unknown outcome holds further sends; do not retry. "
+            "An intentional additional message may name follow_up_reply_id of a confirmed sent receipt "
+            "on the same incoming message; this is never a retry mechanism. Automated Meta DMs require a known original inbound "
             "timestamp less than 24 hours old; HUMAN_AGENT is never used. Requires the "
             "reply_from_inbox permission."
         ),
@@ -1600,12 +1656,19 @@ register_tool(
                     "format": "uuid",
                     "description": "Inbox message to reply to (with `body`) when not using `reply_id`.",
                 },
+                "follow_up_reply_id": {"type": "string", "format": "uuid"},
                 "body": {"type": "string", "minLength": 1, "maxLength": 10000},
             },
             "oneOf": [
                 {
                     "required": ["reply_id"],
-                    "not": {"anyOf": [{"required": ["message_id"]}, {"required": ["body"]}]},
+                    "not": {
+                        "anyOf": [
+                            {"required": ["message_id"]},
+                            {"required": ["body"]},
+                            {"required": ["follow_up_reply_id"]},
+                        ]
+                    },
                 },
                 {"required": ["message_id", "body"], "not": {"required": ["reply_id"]}},
             ],

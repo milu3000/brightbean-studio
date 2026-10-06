@@ -138,11 +138,11 @@ def test_pause_between_marker_and_dispatch_invalidates_original_invocation(enrol
 
 
 def test_initial_enrollment_while_legacy_sender_waits_is_not_bypassed(inbox_account, user):
-    from apps.inbox import services
+    from apps.inbox import reply_safety
 
     reply = create_reply_draft(message=message_for(inbox_account), body="Synthetic answer")
     held, allow_enrollment, at_account_lock = Event(), Event(), Event()
-    original_lock = services.lock_dm_account
+    original_lock = reply_safety.lock_dm_account
 
     def sender_lock(*args):
         # Signal after any incorrect pre-lock enrollment lookup would have
@@ -174,7 +174,7 @@ def test_initial_enrollment_while_legacy_sender_waits_is_not_bypassed(inbox_acco
         return send_reply_now(reply, actor=user, authorization=gate.session_send_authorization(user))
 
     with (
-        patch("apps.inbox.services.lock_dm_account", side_effect=sender_lock),
+        patch("apps.inbox.reply_safety.lock_dm_account", side_effect=sender_lock),
         patch("apps.inbox.services._dispatch_to_platform") as provider,
         ThreadPoolExecutor(max_workers=2) as pool,
     ):

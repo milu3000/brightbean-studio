@@ -600,7 +600,7 @@ CONTENT_MESSAGE_FIELDS = (
 
 
 def request_with_content_fields(
-    request, url: str, *, access_token: str, params: dict, basic_fields: str, on_fallback=None
+    request, url: str, *, access_token: str, params: dict, basic_fields: str, on_fallback=None, optional_fields=None
 ):
     """Retry only a specific unsupported-field rejection, never an auth/quota error."""
     from .exceptions import APIError
@@ -610,21 +610,15 @@ def request_with_content_fields(
     except APIError as exc:
         error = _dict(_dict(exc.raw_response).get("error"))
         message = str(error.get("message") or "").lower()
+        fields = (
+            optional_fields
+            if optional_fields is not None
+            else ("attachments", "shares", "image_data", "video_data", "file_url", "(name)", "(type)", "(url)")
+        )
         unsupported = (
-            error.get("code") == 100
-            and any(
-                field in message
-                for field in (
-                    "attachments",
-                    "shares",
-                    "image_data",
-                    "video_data",
-                    "file_url",
-                    "(name)",
-                    "(type)",
-                    "(url)",
-                )
-            )
+            exc.status_code == 400
+            and error.get("code") == 100
+            and any(field in message for field in fields)
             and any(
                 term in message
                 for term in ("nonexisting", "non-existing", "unknown field", "unsupported", "not supported")

@@ -225,7 +225,13 @@ def test_no_implicit_ownership_or_dispatch_enrollment(inbox_account, settings):
 def test_disabled_dispatch_fails_closed_without_releasing_persisted_owner(owned, settings, setting, value):
     operation = claim(owned)
     setattr(settings, setting, value)
-    old_draft = create_reply_draft(message=owned.row.legacy_message, body="Bypass attempt", author=owned.user)
+    # Simulate a historic duplicate row predating common draft coordination.
+    # New callers cannot create a second intent beside the claimed operation.
+    with pytest.raises(REJECTED):
+        create_reply_draft(message=owned.row.legacy_message, body="Bypass attempt", author=owned.user)
+    old_draft = InboxReply.objects.create(
+        inbox_message=owned.row.legacy_message, body="Bypass attempt", author=owned.user
+    )
     with patch("apps.inbox.services._dispatch_to_platform") as provider:
         with pytest.raises(REJECTED):
             deliver(owned, operation)
@@ -315,7 +321,11 @@ def test_same_idempotency_key_returns_original_terminal_outcome_without_redelive
 
 
 def test_independent_legacy_drafts_for_owned_target_cannot_dispatch(owned):
-    drafts = [create_reply_draft(message=owned.row.legacy_message, body=f"Independent draft {i}") for i in range(2)]
+    first = create_reply_draft(message=owned.row.legacy_message, body="Independent draft 0")
+    with pytest.raises(REJECTED):
+        create_reply_draft(message=owned.row.legacy_message, body="Independent draft 1")
+    # A preexisting second row still cannot bypass ownership or receipts.
+    drafts = [first, InboxReply.objects.create(inbox_message=owned.row.legacy_message, body="Independent draft 1")]
     with patch("apps.inbox.services._dispatch_to_platform") as provider:
         for draft in drafts:
             with pytest.raises(REJECTED):

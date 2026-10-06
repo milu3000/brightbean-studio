@@ -65,6 +65,7 @@ def message_for(account, **kwargs):
         sender_name="Synthetic Customer",
         sender_handle="synthetic-peer",
         body="Synthetic question",
+        extra=kwargs.pop("extra", {"conversation_type": "direct", "classification_reason": "participants_pair"}),
         received_at=kwargs.pop("received_at", timezone.now()),
         **kwargs,
     )
@@ -156,7 +157,10 @@ def test_ambiguous_outcome_holds_account_and_cannot_retry_edit_or_delete(enrolle
             operation()
     pause(enrolled)
     pause(enrolled, False)
-    newer = draft_for(enrolled)
+    with pytest.raises(gate.DMSendGateError, match="unknown"):
+        draft_for(enrolled)
+    # An old independently stored draft still cannot bypass the account hold.
+    newer = InboxReply.objects.create(inbox_message=message_for(enrolled.account), body="Synthetic old draft")
     with pytest.raises(gate.DMSendUnknownError), patch("apps.inbox.services._dispatch_to_platform") as provider:
         send(enrolled, newer)
     provider.assert_not_called()
@@ -514,7 +518,7 @@ def test_unknown_does_not_block_other_account(enrolled):
     )
     reply = create_reply_draft(message=message_for(other), body="Synthetic other")
     with patch("apps.inbox.services._dispatch_to_platform", return_value="other-outbound"):
-        send_reply_now(reply)
+        send_reply_now(reply, actor=enrolled.user, authorization=enrolled.authorize)
     assert reply.status == "sent"
 
 
@@ -647,6 +651,21 @@ def test_future_received_timestamp_is_not_dispatchable(enrolled):
     with (
         pytest.raises(gate.DMSendGateError, match="invalid timestamp"),
         patch("apps.inbox.services._dispatch_to_platform") as provider,
+    ):
+        send(enrolled, reply)
+    provider.assert_not_called()
+
+
+def test_availability_never_advertises_pre_resume_target_as_sendable(enrolled):
+    from apps.inbox.services import reply_send_availability
+
+    reply = draft_for(enrolled)
+    pause(enrolled)
+    pause(enrolled, False)
+    assert reply_send_availability(reply.inbox_message, reply=reply)["code"] == "old_target"
+    with (
+        patch("apps.inbox.services._dispatch_to_platform") as provider,
+        pytest.raises(gate.DMSendGateError, match="predates resume"),
     ):
         send(enrolled, reply)
     provider.assert_not_called()

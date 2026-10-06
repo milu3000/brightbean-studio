@@ -15,7 +15,7 @@ from apps.members.models import OrgMembership, WorkspaceMembership
 from apps.social_accounts.models import SocialAccount
 from apps.workspaces.models import Workspace
 
-pytestmark = pytest.mark.django_db
+pytestmark = pytest.mark.django_db(transaction=True)
 NOW = datetime(2026, 10, 2, 12, tzinfo=UTC)
 
 
@@ -47,6 +47,7 @@ def message(context):
         sender_name="Customer",
         sender_handle="customer-1",
         body="Question",
+        extra={"conversation_type": "direct", "classification_reason": "participants_pair"},
         received_at=NOW - timedelta(hours=1),
     )
 
@@ -57,7 +58,9 @@ def _args(message, mode):
     reply = create_reply_draft(message=message, body="Reply")
     if mode == "failed":
         reply.status = InboxReply.Status.FAILED
-        reply.save(update_fields=["status"])
+        reply.send_error = "Synthetic pre-provider refusal."
+        reply.not_sent_verified = True
+        reply.save(update_fields=["status", "send_error", "not_sent_verified"])
     return {"reply_id": str(reply.pk)}
 
 
@@ -131,7 +134,9 @@ def test_window_rechecked_after_credentials_resolution(context, message):
     assert not InboxReply.objects.filter(status="sent").exists()
 
 
-def test_explicit_human_service_path_keeps_human_agent_behavior(message):
+def test_explicit_human_service_path_keeps_human_agent_behavior(message, context):
+    from apps.inbox.dm_send_gate import session_send_authorization
+
     message.received_at = NOW - timedelta(hours=30)
     message.save(update_fields=["received_at"])
     reply = create_reply_draft(message=message, body="Human reply")
@@ -141,7 +146,11 @@ def test_explicit_human_service_path_keeps_human_agent_behavior(message):
         patch("apps.inbox.services.timezone.now", return_value=NOW),
         patch("apps.inbox.services.get_provider", return_value=provider),
     ):
-        send_reply_now(reply)
+        send_reply_now(
+            reply,
+            actor=context["membership"].user,
+            authorization=session_send_authorization(context["membership"].user),
+        )
     assert provider.reply_to_message.call_args.kwargs["human_agent"] is True
 
 

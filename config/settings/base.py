@@ -725,3 +725,7 @@ INBOX_CONVERSATION_V2_READ_ACCOUNTS = os.environ.get("INBOX_CONVERSATION_V2_READ
 INBOX_REPLY_COORDINATION_ENABLED = env.bool("INBOX_REPLY_COORDINATION_ENABLED", default=False)
 # Explicit current-actor bridge only; ownership enrollment is separately persisted.
 INBOX_REPLY_DISPATCH_ENABLED = env.bool("INBOX_REPLY_DISPATCH_ENABLED", default=False)
+# Presentation-only rollback. This never changes capture, authorization or send safety.
+INBOX_CONVERSATION_PRESENTATION_ENABLED = env.bool("INBOX_CONVERSATION_PRESENTATION_ENABLED", default=True)
+# Emergency hold only; never clears uncertain delivery or enrollment history.
+INBOX_DM_SENDS_ENABLED = env.bool("INBOX_DM_SENDS_ENABLED", default=True)

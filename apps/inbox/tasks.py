@@ -661,12 +661,26 @@ class InboxSyncEngine:
             # Duplicate polls must not rewrite the original inbound timestamp
             # and accidentally reopen the automated-reply window.
             defaults.pop("received_at")
-        obj, created = InboxMessage.objects.update_or_create(
-            social_account=account,
-            platform_message_id=message_id,
-            defaults=defaults,
-            create_defaults=create_defaults,
-        )
+        if msg.message_type == InboxMessage.MessageType.DM:
+            obj, created = InboxMessage.objects.update_or_create(
+                social_account=account,
+                platform_message_id=message_id,
+                defaults=defaults,
+                create_defaults=create_defaults,
+            )
+        else:
+            # A duplicate provider ID cannot downgrade a retained DM to a
+            # public comment edge, overwrite its evidence, or release a receipt
+            # hold. Recheck after the actual row lock, including insert races.
+            obj, created = InboxMessage.objects.select_for_update().get_or_create(
+                social_account=account, platform_message_id=message_id, defaults=create_defaults
+            )
+            if not created:
+                if obj.message_type == InboxMessage.MessageType.DM:
+                    return
+                for field, value in defaults.items():
+                    setattr(obj, field, value)
+                obj.save(update_fields=list(defaults))
         if msg.message_type == InboxMessage.MessageType.DM:
             link_legacy_message(ledger, obj)
         if created:

@@ -95,17 +95,23 @@ def test_naive_provider_timestamp_is_unknown():
 
 @pytest.mark.django_db(transaction=True)
 @pytest.mark.parametrize("source", ["webhook", "poll"])
-def test_echo_before_send_response_waits_for_persisted_outbound_id(inbox_account, source):
+def test_echo_before_send_response_waits_for_persisted_outbound_id(inbox_account, source, user):
     from concurrent.futures import ThreadPoolExecutor
     from threading import Event
 
     from django.db import close_old_connections, connection
 
+    from apps.inbox.dm_send_gate import session_send_authorization
     from apps.inbox.services import send_reply_now
+    from apps.members.models import WorkspaceMembership
 
     if connection.vendor != "postgresql":
         pytest.skip("Requires PostgreSQL row-level locks")
     reply = _sent_reply(inbox_account)
+    WorkspaceMembership.objects.create(user=user, workspace=inbox_account.workspace, workspace_role="owner")
+    message = reply.inbox_message
+    message.extra = {"conversation_type": "direct", "classification_reason": "participants_pair"}
+    message.save(update_fields=["extra"])
     reply.status = InboxReply.Status.DRAFT
     reply.platform_reply_id = ""
     reply.save(update_fields=["status", "platform_reply_id"])
@@ -130,7 +136,9 @@ def test_echo_before_send_response_waits_for_persisted_outbound_id(inbox_account
 
     with patch("apps.inbox.services.get_provider") as provider, ThreadPoolExecutor(max_workers=2) as pool:
         provider.return_value.reply_to_message.side_effect = provider_send
-        sending_job = pool.submit(run, send_reply_now, reply, automated=True)
+        sending_job = pool.submit(
+            run, send_reply_now, reply, actor=user, automated=True, authorization=session_send_authorization(user)
+        )
         try:
             assert sending.wait(10)
             ingestion_job = pool.submit(run, ingest)

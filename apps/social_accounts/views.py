@@ -853,6 +853,11 @@ def disconnect(request, workspace_id, account_id):
             status=409,
         )
 
+    from apps.inbox.receipt_retention import UNRESOLVED_HISTORY, has_unresolved_replies
+
+    if has_unresolved_replies(account.pk):
+        return HttpResponse(UNRESOLVED_HISTORY, status=409)
+
     # Stop the platform pushing us this account's activity before we drop the
     # token that would let us unsubscribe.
     if account.oauth_access_token:
