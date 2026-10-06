@@ -538,6 +538,7 @@ def test_transport_is_one_streamed_get_with_no_redirects_sends_or_body_logs(dm, 
         (200, b'{"id":"first","id":"second"}', "invalid_response"),
         (200, b"x" * (reads.MAX_RESPONSE_BYTES + 1), "response_too_large"),
     ],
+    ids=["rate-limit", "denied", "redirect", "server-error", "invalid-json", "duplicate-json-member", "oversized-body"],
 )
 def test_transport_failures_never_log_body_retry_refresh_or_follow_links(dm, status, body, code, caplog):
     requests = []
