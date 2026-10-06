@@ -31,10 +31,57 @@
     <div style="font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-ghost); margin-bottom: 6px;">Post copy</div>
     <p style="font-size: 0.9375rem; color: var(--text-primary); line-height: 1.65; margin-bottom: 14px; white-space: pre-wrap;">{{ caption|default:"(no caption)" }}</p>
     <div class="a-mono" style="display: flex; align-items: center; gap: 8px; font-size: 0.75rem; color: var(--text-tertiary); padding-bottom: 18px; border-bottom: 1px solid var(--neutral-100);">
-        Published {{ date }}{% if days_ago is not None %} · {{ days_ago }}d ago{% endif %}
+        {% if date %}Published {{ date }}{% if days_ago is not None %} · {{ days_ago }}d ago{% endif %}{% else %}Not published{% endif %}
     </div>
 
-    <div style="font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-ghost); margin: 18px 0 10px;">Performance</div>
+    <div data-analytics-availability="{{ analytics_status.availability }}" data-analytics-error-category="{{ analytics_status.error_category }}" style="margin-top: 18px; padding: 12px 14px; border: 1px solid var(--border); border-radius: var(--radius-lg);">
+        <div style="font-weight: 600; color: var(--text-primary);">Analytics: {{ analytics_status.label }}</div>
+        <div style="font-size: 0.75rem; color: var(--text-secondary); margin-top: 4px;">
+            {% if analytics_status.source == 'user' %}User-confirmed local annotation{% elif analytics_status.source == 'platform' %}Platform observation{% else %}Availability has not been verified{% endif %}
+            {% if analytics_status.checked_at %} · <time datetime="{{ analytics_status.checked_at|date:'c' }}">{{ analytics_status.checked_at|date:'Y-m-d H:i T' }}</time>{% endif %}
+        </div>
+        {% if analytics_status.error_category %}
+        <p style="font-size: 0.8125rem; color: var(--text-secondary); margin-top: 8px;">The latest refresh did not provide current metrics.{% if analytics_status.error_category == 'post_inaccessible' %} This does not confirm that the post was archived or deleted.{% endif %}</p>
+        {% endif %}
+        {% if analytics_status.attempted_at %}<div style="font-size: 0.75rem; color: var(--text-tertiary); margin-top: 4px;">Last fetch attempt <time datetime="{{ analytics_status.attempted_at|date:'c' }}">{{ analytics_status.attempted_at|date:'Y-m-d H:i T' }}</time></div>{% endif %}
+    </div>
+
+    {% if account_status.needs_reconnect %}
+    <p role="status" style="margin-top: 10px; color: var(--warning-700);">The platform rejected this account's analytics authorization. Reconnect the account to resume checks; this does not establish the post's visibility.</p>
+    {% elif account_status.verification_pending %}
+    <p role="status" style="margin-top: 10px; color: var(--text-secondary);">An older account warning is awaiting verification.</p>
+    {% endif %}
+
+    {% if can_confirm_status %}
+    <details style="margin-top: 14px; font-size: 0.8125rem; color: var(--text-secondary);"{% if status_confirmation_error %} open{% endif %}>
+        <summary style="cursor: pointer;">Confirm a local post annotation</summary>
+        <p style="margin: 8px 0;">Use this only after checking the post on the platform. This updates the local analytics annotation; it does not archive or delete the remote post or change its publishing history. Archived and deleted annotations pause metric fetching. Clearing the annotation allows checks to resume.</p>
+        {% if status_confirmation_error %}<p role="alert" style="color: var(--warning-700);">{{ status_confirmation_error }}</p>{% endif %}
+        <form method="post" action="{% url 'analytics:confirm_post_status' workspace_id=workspace.id post_id=post.id %}"
+              hx-post="{% url 'analytics:confirm_post_status' workspace_id=workspace.id post_id=post.id %}"
+              hx-target="#drawer-host" hx-swap="innerHTML" hx-disabled-elt="find button[type='submit']"
+              style="display: flex; flex-direction: column; gap: 10px; margin-top: 10px;">
+            {% csrf_token %}
+            <input type="hidden" name="expected_version" value="{{ analytics_status.version }}">
+            <label for="analytics-annotation-{{ post.id }}">Local annotation</label>
+            <select id="analytics-annotation-{{ post.id }}" name="availability" required style="padding: 8px; border: 1px solid var(--border); border-radius: var(--radius-md);">
+                <option value="" selected disabled>Choose an annotation</option>
+                <option value="archived">I verified this post is archived</option>
+                <option value="deleted">I verified this post is deleted</option>
+                <option value="unknown">Clear the local annotation and verify again</option>
+            </select>
+            <label style="display: flex; align-items: flex-start; gap: 8px;"><input type="checkbox" name="confirmed" value="yes" required> I confirm the selected local annotation</label>
+            <button type="submit" class="btn-outline" style="padding: 9px 16px; width: auto;">Confirm local annotation</button>
+        </form>
+    </details>
+    {% endif %}
+
+    <div style="font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-ghost); margin: 18px 0 10px;">Saved performance</div>
+    {% if captured_at %}
+    <p style="font-size: 0.75rem; color: var(--text-tertiary); margin-bottom: 10px;">Latest saved snapshot <time datetime="{{ captured_at|date:'c' }}">{{ captured_at|date:'Y-m-d H:i T' }}</time>. Metric values may have been captured at different times.</p>
+    {% else %}
+    <p style="font-size: 0.8125rem; color: var(--text-secondary); margin-bottom: 10px;">No saved metrics yet. Missing values are not zero.</p>
+    {% endif %}
     <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px;">
         {% for tile in metric_tiles %}
         <div style="padding: 12px 14px; border-radius: var(--radius-lg); border: 1px solid {% if tile.is_primary %}transparent{% else %}var(--border){% endif %}; background: {% if tile.is_primary %}var(--primary-soft){% else %}#fff{% endif %};">

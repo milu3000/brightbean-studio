@@ -74,6 +74,13 @@ def reply_failure_reason(exc: Exception) -> str:
     """
     from providers.exceptions import OAuthError, RateLimitError, TokenExpiredError
 
+    from .dm_send_gate import DMSendGateError
+
+    if isinstance(exc, DMSendGateError):
+        return str(exc)
+    if isinstance(exc, NotImplementedError):
+        return "this platform does not support sending this reply."
+
     if isinstance(exc, RateLimitError):
         return "the account has hit its rate limit. Wait a few minutes and try again."
     if isinstance(exc, TokenExpiredError | OAuthError):
@@ -81,7 +88,7 @@ def reply_failure_reason(exc: Exception) -> str:
     return "the platform rejected it. Try again, or reconnect the account if this keeps happening."
 
 
-def _dispatch_to_platform(message: InboxMessage, body: str, *, automated: bool = False) -> str:
+def _dispatch_to_platform(message: InboxMessage, body: str, *, automated: bool = False, before_provider=None) -> str:
     """Post ``body`` back to the platform and return the platform's reply ID.
 
     Raises if the platform refuses it, so the caller can avoid recording a
@@ -99,6 +106,8 @@ def _dispatch_to_platform(message: InboxMessage, body: str, *, automated: bool =
         extra.setdefault("recipient_id", message.sender_handle)
 
     if message.message_type in _COMMENT_LIKE_TYPES:
+        if before_provider is not None:
+            before_provider()
         result = provider.reply_to_comment(
             access_token=account.oauth_access_token,
             comment_id=message.platform_message_id,
@@ -111,6 +120,8 @@ def _dispatch_to_platform(message: InboxMessage, body: str, *, automated: bool =
             # locks or resolving credentials. Never label automation as a person.
             validate_automated_reply_window(message)
         overdue = not automated and timezone.now() - message.received_at > HUMAN_AGENT_AFTER
+        if before_provider is not None:
+            before_provider()
         result = provider.reply_to_message(
             access_token=account.oauth_access_token,
             message_id=message.platform_message_id,
@@ -139,11 +150,78 @@ def _apply_post_send_side_effects(message: InboxMessage) -> None:
 # ---------------------------------------------------------------------------
 
 
-def create_reply_draft(*, message: InboxMessage, body: str, author=None) -> InboxReply:
+@transaction.atomic
+def create_reply_draft(
+    *, message: InboxMessage, body: str, author=None, follow_up_of: InboxReply | None = None
+) -> InboxReply:
     """Create a ``draft`` reply against ``message``. Not sent anywhere."""
     body = (body or "").strip()
     if not body:
         raise ValueError("Reply body cannot be empty.")
+    identity = (
+        InboxMessage.objects.filter(pk=message.pk).values("message_type", "social_account_id", "workspace_id").first()
+    )
+    if identity is None:
+        raise ReplyStateError("This incoming message is no longer available.")
+    if identity["message_type"] == InboxMessage.MessageType.DM or follow_up_of is not None:
+        account = lock_dm_account(identity["social_account_id"], identity["workspace_id"])
+        current = InboxMessage.objects.select_for_update().get(pk=message.pk)
+        if account is None or (
+            current.message_type != message.message_type
+            or current.workspace_id != message.workspace_id
+            or current.social_account_id != message.social_account_id
+            or current.social_account_id != account.pk
+            or current.workspace_id != account.workspace_id
+        ):
+            raise ReplyStateError("The selected DM target changed; reload before drafting.")
+        current.social_account = account
+        from .reply_safety import check_dm_receipts, validate_follow_up_parent
+
+        if follow_up_of is not None:
+            existing = (
+                InboxReply.objects.select_for_update()
+                .filter(inbox_message=current, follow_up_of_id=follow_up_of.pk)
+                .first()
+            )
+            if existing is not None and existing.status not in _SENDABLE_STATUSES:
+                raise ReplyStateError("This sent reply already has a follow-up. Open that reply instead.")
+            candidate = existing or InboxReply(inbox_message=current, follow_up_of=follow_up_of, is_follow_up=True)
+            parent = validate_follow_up_parent(current, follow_up_of, reply=candidate)
+            if current.message_type == InboxMessage.MessageType.DM:
+                from .reply_dispatch import check_conversation_send
+
+                check_dm_receipts(current, candidate, include_drafts=True, follow_up_of=parent)
+                check_conversation_send(account, current, candidate)
+            elif current.replies.filter(status=InboxReply.Status.UNKNOWN).exists():
+                raise ReplyStateError(
+                    "Delivery outcome is unknown. Do not create another reply for this incoming message."
+                )
+            if existing is not None:
+                if existing.body == body and existing.author_id == getattr(author, "pk", None):
+                    return existing
+                raise ReplyStateError("This sent reply already has a follow-up draft. Open and edit that draft.")
+            return InboxReply.objects.create(
+                inbox_message=current,
+                author=author,
+                body=body,
+                status=InboxReply.Status.DRAFT,
+                follow_up_of=parent,
+                is_follow_up=True,
+            )
+
+        check_dm_receipts(current)
+        existing = InboxReply.objects.filter(inbox_message=current).order_by("created_at").first()
+        if existing is not None:
+            if (
+                existing.status in _SENDABLE_STATUSES
+                and existing.body == body
+                and existing.author_id == getattr(author, "pk", None)
+            ):
+                return existing
+            raise ReplyStateError("This incoming message already has a reply draft. Open and edit that draft.")
+        message = current
+    elif message.replies.filter(status=InboxReply.Status.UNKNOWN).exists():
+        raise ReplyStateError("Delivery outcome is unknown. Do not create another reply for this incoming message.")
     return InboxReply.objects.create(
         inbox_message=message,
         author=author,
@@ -160,10 +238,34 @@ def _lock_reply(reply: InboxReply) -> None:
         raise ReplyStateError("This reply has been discarded.") from exc
 
 
+def _lock_reply_with_account(reply: InboxReply) -> None:
+    """Edits/deletes share account -> reply ordering with send and retention."""
+    identity = (
+        InboxReply.objects.filter(pk=reply.pk)
+        .values("inbox_message__social_account_id", "inbox_message__workspace_id")
+        .first()
+    )
+    if identity is None:
+        raise ReplyStateError("This reply has been discarded.")
+    account = lock_dm_account(identity["inbox_message__social_account_id"], identity["inbox_message__workspace_id"])
+    _lock_reply(reply)
+    message = reply.inbox_message
+    if account is None or message.social_account_id != account.pk or message.workspace_id != account.workspace_id:
+        raise ReplyStateError("The reply account changed; reload before editing.")
+
+
 @transaction.atomic
 def update_reply_draft(reply: InboxReply, *, body: str) -> InboxReply:
     """Edit a draft (or failed) reply's body."""
-    _lock_reply(reply)
+    _lock_reply_with_account(reply)
+    from .reply_safety import LEGACY_UNVERIFIED_MESSAGE, UNKNOWN_MESSAGE, is_unresolved_reply
+
+    if is_unresolved_reply(reply):
+        raise ReplyStateError(
+            UNKNOWN_MESSAGE if reply.status == InboxReply.Status.UNKNOWN else LEGACY_UNVERIFIED_MESSAGE
+        )
+    if reply.dm_send_attempts.exists() or hasattr(reply, "send_operation"):
+        raise ReplyStateError("Replies with durable DM attempts or V2 operations cannot be edited.")
     if reply.status not in _SENDABLE_STATUSES:
         raise ReplyStateError(f"A {reply.get_status_display().lower()} reply cannot be edited.")
     body = (body or "").strip()
@@ -177,13 +279,63 @@ def update_reply_draft(reply: InboxReply, *, body: str) -> InboxReply:
 @transaction.atomic
 def discard_reply_draft(reply: InboxReply) -> None:
     """Delete a draft (or failed) reply. Sent replies are permanent."""
-    _lock_reply(reply)
+    _lock_reply_with_account(reply)
+    from .reply_safety import LEGACY_UNVERIFIED_MESSAGE, UNKNOWN_MESSAGE, is_unresolved_reply
+
+    if is_unresolved_reply(reply):
+        raise ReplyStateError(
+            UNKNOWN_MESSAGE if reply.status == InboxReply.Status.UNKNOWN else LEGACY_UNVERIFIED_MESSAGE
+        )
+    if reply.dm_send_attempts.exists() or hasattr(reply, "send_operation"):
+        raise ReplyStateError("Replies with durable DM attempts or V2 operations cannot be discarded.")
     if reply.status not in _SENDABLE_STATUSES:
         raise ReplyStateError(f"A {reply.get_status_display().lower()} reply cannot be discarded.")
     reply.delete()
 
 
-def send_reply_now(reply: InboxReply, *, actor=None, automated: bool = False) -> InboxReply:
+def send_reply_now(
+    reply: InboxReply, *, actor=None, automated: bool = False, authorization=None, dispatch_binding=None
+) -> InboxReply:
+    """Common UI/REST/MCP boundary; persisted DM enrollment cannot be toggled off."""
+    from .dm_send_gate import EnrolledDMSendError, capture_send_snapshot, send_enrolled_dm
+
+    snapshot = capture_send_snapshot(reply)
+    try:
+        if snapshot is not None:
+            from .reply_safety import send_unenrolled_dm
+
+            return send_unenrolled_dm(
+                reply,
+                actor=actor,
+                automated=automated,
+                authorization=authorization,
+                snapshot=snapshot,
+                dispatch_binding=dispatch_binding,
+            )
+        return _send_legacy_reply(
+            reply, actor=actor, automated=automated, snapshot=snapshot, dispatch_binding=dispatch_binding
+        )
+    except EnrolledDMSendError:
+        return send_enrolled_dm(
+            reply,
+            actor=actor,
+            automated=automated,
+            authorization=authorization,
+            snapshot=snapshot,
+            dispatch_binding=dispatch_binding,
+        )
+
+
+def reply_send_availability(message, *, reply=None, follow_up_of: InboxReply | None = None):
+    """Read-only common send status; dispatch still verifies current permissions."""
+    from .reply_safety import reply_send_availability as availability
+
+    return availability(message, reply=reply, follow_up_of=follow_up_of)
+
+
+def _send_legacy_reply(
+    reply: InboxReply, *, actor=None, automated: bool = False, snapshot=None, dispatch_binding=None
+) -> InboxReply:
     """Deliver an existing draft/failed reply to the platform.
 
     On a platform refusal the row is kept and moved to ``failed`` with a
@@ -191,48 +343,38 @@ def send_reply_now(reply: InboxReply, *, actor=None, automated: bool = False) ->
     exception is re-raised for the caller to shape into its own error.
     Automated callers must pass ``automated=True`` on every attempt, including
     retries. They cannot use the human-only Meta reply extension, and an
-    unsupported provider is a failure. The explicit human UI keeps its legacy
-    local-record behavior for providers with no reply API.
+    unsupported provider is a failure for both human and automated callers.
     """
     failure: Exception | None = None
     with transaction.atomic():
-        # Always acquire a DM's account before its reply/message row. Ingestion
-        # takes the same account lock before testing known outbound IDs, so even
-        # an unmarked echo arriving during the send waits for our committed ID.
-        identity = (
-            InboxReply.objects.filter(pk=reply.pk)
-            .values("inbox_message__message_type", "inbox_message__social_account_id", "inbox_message__workspace_id")
-            .first()
-        )
-        locked_account = None
-        if identity and identity["inbox_message__message_type"] == InboxMessage.MessageType.DM:
-            locked_account = lock_dm_account(
-                identity["inbox_message__social_account_id"], identity["inbox_message__workspace_id"]
-            )
-            if locked_account is None:
-                raise ReplyStateError("The message account changed. Reload before sending.")
-        # Keep the lock through delivery and persistence. Every competing send,
-        # edit or discard must check the latest state after acquiring this lock.
         _lock_reply(reply)
+        message = InboxMessage.objects.select_for_update().get(pk=reply.inbox_message_id)
+        if message.replies.filter(status=InboxReply.Status.UNKNOWN).exclude(pk=reply.pk).exists():
+            raise ReplyStateError("Delivery outcome is unknown. Do not retry this incoming message.")
+        if reply.dm_send_attempts.filter(outcome="unknown").exists():
+            from .dm_send_gate import DMSendUnknownError
+
+            raise DMSendUnknownError()
+        if message.message_type == InboxMessage.MessageType.DM or snapshot is not None:
+            # Even a direct call to this compatibility path cannot bypass the
+            # committed DM receipt or a persisted account/ownership gate.
+            raise ReplyStateError("DM replies require the shared committed send boundary.")
+        if dispatch_binding is not None or reply.dm_send_attempts.exists():
+            raise ReplyStateError("This reply requires its existing DM send controls.")
+        from .models import SendOperation
+
+        if SendOperation.objects.filter(reply=reply, ownership__isnull=False).exists():
+            raise ReplyStateError("This reply requires its bound dispatch operation.")
         if reply.status not in _SENDABLE_STATUSES:
             raise ReplyStateError(f"A {reply.get_status_display().lower()} reply cannot be sent again.")
+        from .reply_safety import has_follow_up_intent, validate_follow_up_parent
 
-        message = reply.inbox_message
-        if locked_account is not None:
-            message = InboxMessage.objects.select_for_update().get(pk=reply.inbox_message_id)
-            if (
-                message.message_type != InboxMessage.MessageType.DM
-                or message.social_account_id != locked_account.pk
-                or message.workspace_id != locked_account.workspace_id
-            ):
-                raise ReplyStateError("The message account changed. Reload before sending.")
-            message.social_account = locked_account
-        elif message.message_type == InboxMessage.MessageType.DM:
-            raise ReplyStateError("The message changed. Reload before sending.")
-        if automated:
-            if message.social_account.connection_status != "connected":
-                raise ReplyStateError("The social account is not connected. Reconnect it before sending.")
-            validate_automated_reply_window(message)
+        if has_follow_up_intent(reply):
+            if reply.follow_up_of_id is None:
+                raise ReplyStateError("This follow-up's original sent reply is no longer available; sending is held.")
+            validate_follow_up_parent(message, reply.follow_up_of, reply=reply)
+        if automated and message.social_account.connection_status != "connected":
+            raise ReplyStateError("The social account is not connected. Reconnect it before sending.")
         if actor is not None and reply.author_id is None:
             reply.author = actor
 
@@ -243,31 +385,36 @@ def send_reply_now(reply: InboxReply, *, actor=None, automated: bool = False) ->
                 else _dispatch_to_platform(message, reply.body)
             )
         except NotImplementedError as exc:
-            if automated:
-                reply.status = InboxReply.Status.FAILED
-                reply.send_error = "this platform does not support sending this reply."
-                reply.save(update_fields=["status", "send_error", "author", "updated_at"])
-                failure = exc
-            else:
-                logger.info(
-                    "Provider %s cannot send replies; recording reply %s locally.",
-                    message.social_account.platform,
-                    reply.id,
-                )
-                platform_reply_id = ""
+            reply.status = InboxReply.Status.FAILED
+            reply.not_sent_verified = True
+            reply.send_error = reply_failure_reason(exc)
+            reply.save(update_fields=["status", "send_error", "author", "not_sent_verified", "updated_at"])
+            failure = exc
         except Exception as exc:
             logger.exception("Failed to send inbox reply %s (%s)", reply.id, message.social_account.platform)
             reply.status = InboxReply.Status.FAILED
+            reply.not_sent_verified = False
             reply.send_error = reply_failure_reason(exc)
-            reply.save(update_fields=["status", "send_error", "author", "updated_at"])
+            reply.save(update_fields=["status", "send_error", "author", "not_sent_verified", "updated_at"])
             failure = exc
 
         if failure is None:
             reply.status = InboxReply.Status.SENT
+            reply.not_sent_verified = False
             reply.platform_reply_id = platform_reply_id
             reply.send_error = ""
             reply.sent_at = timezone.now()
-            reply.save(update_fields=["status", "platform_reply_id", "send_error", "sent_at", "author", "updated_at"])
+            reply.save(
+                update_fields=[
+                    "status",
+                    "platform_reply_id",
+                    "send_error",
+                    "sent_at",
+                    "author",
+                    "not_sent_verified",
+                    "updated_at",
+                ]
+            )
 
             # Keep provider acceptance even if the optional history projection
             # fails; an externally sent message must never become sendable again.
@@ -290,17 +437,21 @@ def send_reply_now(reply: InboxReply, *, actor=None, automated: bool = False) ->
     return reply
 
 
-def send_reply(*, message: InboxMessage, body: str, author=None) -> InboxReply:
+def send_reply(
+    *, message: InboxMessage, body: str, author=None, authorization=None, follow_up_of: InboxReply | None = None
+) -> InboxReply:
     """Create a reply and send it in one step (the classic composer flow).
 
-    If the platform refuses it, the ``failed`` row is removed and the
-    exception propagates — the thread must never show a reply the customer
-    never received. ``NotImplementedError`` keeps the local record.
+    DM receipts retain their actual outcome, including failed/unknown. An
+    unsupported provider also keeps its failed row and never claims delivery.
     """
     with transaction.atomic():
-        reply = create_reply_draft(message=message, body=body, author=author)
+        reply = create_reply_draft(message=message, body=body, author=author, follow_up_of=follow_up_of)
     try:
-        return send_reply_now(reply, actor=author)
-    except Exception:
-        InboxReply.objects.filter(pk=reply.pk, status=InboxReply.Status.FAILED).delete()
+        return send_reply_now(reply, actor=author, authorization=authorization)
+    except Exception as exc:
+        if message.message_type != InboxMessage.MessageType.DM and not isinstance(exc, NotImplementedError):
+            InboxReply.objects.filter(
+                pk=reply.pk, status=InboxReply.Status.FAILED, dm_send_attempts__isnull=True
+            ).delete()
         raise

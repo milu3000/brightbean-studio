@@ -1,33 +1,66 @@
 {% load humanize %}
 {# One pending reply: a draft awaiting review, or a failed send awaiting retry. #}
-<div class="rounded-lg border px-3 py-2.5 {% if draft.status == 'failed' %}border-red-200 bg-red-50{% else %}border-stone-200 bg-stone-50{% endif %}">
+<div id="draft-{{ draft.id }}" data-draft-target-id="{{ draft.inbox_message_id }}" x-data="{ editing: false }" class="rounded-lg border px-3 py-2.5 {% if draft.status == 'failed' %}border-red-200 bg-red-50{% else %}border-stone-200 bg-stone-50{% endif %}">
     <div class="flex items-center gap-2 mb-1">
-        {% if draft.status == 'failed' %}
+        {% if draft.status == 'unknown' %}
+        <span class="badge-pill">Outcome unknown · sending held</span>
+        {% elif draft.is_unresolved %}
+        <span class="badge-pill">Delivery unverified · sending held</span>
+        {% elif draft.status == 'failed' %}
         <span class="badge-pill" style="background: #fee2e2; color: #b91c1c;">Failed</span>
         {% else %}
         <span class="badge-pill" style="background: var(--surface-2); color: var(--stone-600, #57534e);">Draft</span>
         {% endif %}
-        <span class="text-[11px] text-stone-500">{{ draft.author.get_short_name|default:draft.author.email|default:"—" }}</span>
+        <span class="text-[11px] text-stone-500">{% if draft.author %}{{ draft.author.get_short_name|default:draft.author.email }}{% else %}Your team{% endif %}</span>
         <span class="text-[11px] text-stone-400 ml-auto">{{ draft.created_at|timesince }} ago</span>
     </div>
+    {% if draft.is_follow_up or draft.follow_up_of_id %}<p class="text-[10px] text-stone-500 mb-1">{% if draft.follow_up_of_id %}Additional reply after: {{ draft.follow_up_of.body|truncatewords:16 }}{% else %}Additional reply · original sent reply unavailable{% endif %}</p>{% endif %}
+    {% if conversation_view %}<p class="text-[10px] text-stone-500 mb-1">Reply to {{ draft.inbox_message.sender_name }} · {{ draft.inbox_message.received_at|date:"N j, Y g:i A" }} · {{ draft.inbox_message.content_preview|truncatewords:12 }}</p>{% endif %}
     <p class="text-[13px] text-stone-700 leading-relaxed whitespace-pre-wrap">{{ draft.body }}</p>
-    {% if draft.status == 'failed' and draft.send_error %}
-    <p class="text-[11px] text-red-700 mt-1">Last attempt failed: {{ draft.send_error }}</p>
+    {% if draft.can_edit %}
+    <form x-show="editing" x-cloak hx-post="{% url 'inbox:update_reply_draft' workspace_id=workspace.id reply_id=draft.id %}"
+          hx-target="#inbox-detail-panel" hx-swap="innerHTML" hx-sync="#inbox-detail-panel:drop" class="mt-2">
+        {% csrf_token %}<input type="hidden" name="panel_message_id" value="{{ message.id }}">
+        <label for="draft-body-{{ draft.id }}" class="text-[11px] text-stone-600">Edit this draft</label>
+        <textarea id="draft-body-{{ draft.id }}" name="body" rows="3" required class="w-full border rounded p-2 text-[13px]">{{ draft.body }}</textarea>
+        <button type="submit" class="text-[12px] font-semibold underline">Save changes</button>
+        <button type="button" @click="editing = false; $el.closest('form').reset()" class="text-[12px] ml-3">Cancel</button>
+    </form>
     {% endif %}
+    {% if draft.status == 'failed' and draft.send_error and not draft.is_unresolved %}
+    <p class="text-[11px] text-red-700 mt-1">Last attempt failed: {{ draft.display_error|default:draft.send_error }}</p>
+    {% endif %}
+    {% if draft.status == "unknown" or draft.is_unresolved %}
+    <p class="text-[11px] text-red-700 mt-1">{{ draft.send_availability.reason|default:draft.display_error }}</p>
+    {% if can_review_delivery %}
+    <a href="{% url 'inbox:review_reply_outcome' workspace_id=workspace.id reply_id=draft.id %}"
+       class="inline-flex text-[11px] font-medium underline mt-2">Review delivery outcome</a>
+    {% else %}
+    <p class="text-[11px] text-stone-600 mt-2">Ask a workspace administrator to review this reply's delivery outcome.</p>
+    {% endif %}
+    {% else %}
+    {% if draft.send_availability and not draft.send_availability.allowed %}<p role="status" class="text-[11px] text-amber-800 mt-1">{{ draft.send_availability.reason }}</p>{% endif %}
     <div class="flex items-center gap-2 mt-2">
         <button hx-post="{% url 'inbox:send_reply_draft' workspace_id=workspace.id reply_id=draft.id %}"
+                hx-vals='{"panel_message_id": "{{ message.id }}"}' hx-sync="#inbox-detail-panel:drop"
+                {% if draft.send_availability and not draft.send_availability.allowed %}disabled aria-disabled="true"{% endif %}
                 hx-target="#inbox-detail-panel"
                 hx-swap="innerHTML"
                 class="inline-flex items-center gap-1 px-3 py-1 text-[11px] font-semibold text-white rounded-full transition-all"
                 style="background: var(--primary); box-shadow: var(--shadow-primary);">
             {% if draft.status == 'failed' %}Retry send{% else %}Send{% endif %}
         </button>
+        {% if draft.can_edit %}
+        <button type="button" @click="editing = !editing" class="text-[11px] font-medium underline">Edit</button>
         <button hx-post="{% url 'inbox:discard_reply_draft' workspace_id=workspace.id reply_id=draft.id %}"
+                hx-vals='{"panel_message_id": "{{ message.id }}"}' hx-sync="#inbox-detail-panel:drop"
                 hx-target="#inbox-detail-panel"
                 hx-swap="innerHTML"
                 hx-confirm="Discard this draft reply?"
                 class="inline-flex items-center gap-1 px-3 py-1 text-[11px] font-medium text-stone-500 hover:text-stone-700 rounded-full border border-stone-200 hover:bg-stone-50 transition-all">
             Discard
         </button>
+        {% endif %}
     </div>
+    {% endif %}
 </div>

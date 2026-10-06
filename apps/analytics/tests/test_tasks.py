@@ -30,6 +30,9 @@ def _youtube_account(workspace, *, platform_id, needs_reconnect):
         oauth_refresh_token="refresh",
         connection_status=SocialAccount.ConnectionStatus.CONNECTED,
         analytics_needs_reconnect=needs_reconnect,
+        analytics_reconnect_reason="account_scope" if needs_reconnect else "",
+        analytics_reconnect_context="account" if needs_reconnect else "",
+        analytics_reconnect_checked_at=timezone.now() if needs_reconnect else None,
     )
 
 
@@ -859,7 +862,11 @@ class TestTokenRefresh:
 
         with (
             patch("apps.analytics.tasks._resolve_provider", return_value=provider),
-            patch.object(SocialAccount, "refresh_oauth_token", side_effect=OAuthError("revoked")),
+            patch.object(
+                SocialAccount,
+                "refresh_oauth_token",
+                side_effect=OAuthError("invalid_grant", raw_response={"error": "invalid_grant"}),
+            ),
             patch("apps.analytics.tasks._enqueue_health_check") as health,
         ):
             _analytics_provider_and_token(account)

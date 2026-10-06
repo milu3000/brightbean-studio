@@ -101,6 +101,13 @@ class SocialAccount(models.Model):
     # call as insufficient-scope. Surfaces a "Reconnect for analytics" CTA in
     # place of the metric region. Cleared on successful reconnect.
     analytics_needs_reconnect = models.BooleanField(default=False)
+    # Additive evidence: legacy flags have no reason and remain unverified.
+    analytics_reconnect_reason = models.CharField(max_length=24, blank=True, default="", db_default="")
+    analytics_reconnect_context = models.CharField(max_length=16, blank=True, default="", db_default="")
+    analytics_reconnect_checked_at = models.DateTimeField(blank=True, null=True)
+    analytics_reconnect_evidence = models.JSONField(default=dict, db_default={}, blank=True)
+    # Token generation fence; old in-flight calls cannot undo a reconnect.
+    analytics_auth_updated_at = models.DateTimeField(blank=True, null=True)
 
     # When the inbox last polled this account, and when it last walked the
     # account's full history. Both belong here rather than being derived from
@@ -185,10 +192,13 @@ class SocialAccount(models.Model):
         """
         from datetime import timedelta
 
+        from django.db import transaction
         from django.utils import timezone
 
+        observed_generation = self.analytics_auth_updated_at
         new_tokens = provider.refresh_token(self.oauth_refresh_token)
         self.oauth_access_token = new_tokens.access_token
+        self.analytics_auth_updated_at = timezone.now()
         if new_tokens.refresh_token:
             self.oauth_refresh_token = new_tokens.refresh_token
         if new_tokens.expires_in:
@@ -196,23 +206,31 @@ class SocialAccount(models.Model):
         self.connection_status = self.ConnectionStatus.CONNECTED
         update_fields = [
             "oauth_access_token",
+            "analytics_auth_updated_at",
             "oauth_refresh_token",
             "token_expires_at",
             "connection_status",
             "updated_at",
         ]
-        if enqueue_backfill:
-            self.save(update_fields=update_fields)
-        else:
-            # post_save signals do not receive caller-local keyword arguments.
-            # A short-lived instance flag keeps the token in the normal
-            # update_fields path while telling analytics.signals that this save
-            # is already part of the analytics pass.
-            self._skip_analytics_backfill = True
-            try:
+        with transaction.atomic():
+            current = type(self).objects.select_for_update().only("analytics_auth_updated_at").get(pk=self.pk)
+            if current.analytics_auth_updated_at != observed_generation:
+                # A newer OAuth grant/rotation won while the network call ran.
+                # Use that token; never put the older grant back into storage.
+                self.refresh_from_db()
+                return self.oauth_access_token
+            if enqueue_backfill:
                 self.save(update_fields=update_fields)
-            finally:
-                del self._skip_analytics_backfill
+            else:
+                # post_save signals do not receive caller-local keyword arguments.
+                # A short-lived instance flag keeps the token in the normal
+                # update_fields path while telling analytics.signals that this save
+                # is already part of the analytics pass.
+                self._skip_analytics_backfill = True
+                try:
+                    self.save(update_fields=update_fields)
+                finally:
+                    del self._skip_analytics_backfill
         return new_tokens.access_token
 
     # Platform character limits

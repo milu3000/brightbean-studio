@@ -1,18 +1,23 @@
 {% load humanize %}
 <div id="msg-{{ message.id }}"
-     class="inbox-row {% if message.status == 'unread' %}is-unread{% endif %}"
-     @click="selectMessage('{{ message.id }}', '{% url 'inbox:message_detail' workspace_id=workspace.id message_id=message.id %}')"
-     role="button"
-     tabindex="0">
+     class="inbox-row {% if inbox_row.unread_count or message.status == 'unread' %}is-unread{% endif %}"
+     :class="{ 'is-active': activeMessageId === '{{ message.id }}' }">
 
     <!-- Checkbox -->
     <div class="flex-shrink-0 pt-0.5" @click.stop>
         <input type="checkbox"
+               aria-label="Select this message from {{ message.sender_name }} for bulk actions"
                :checked="isSelected('{{ message.id }}')"
                @change="toggleSelect('{{ message.id }}')"
                class="w-3.5 h-3.5 rounded border-stone-300 text-orange-500 focus:ring-orange-200 cursor-pointer">
     </div>
 
+    <a href="{% url 'inbox:message_detail' workspace_id=workspace.id message_id=message.id %}"
+       hx-get="{% url 'inbox:message_detail' workspace_id=workspace.id message_id=message.id %}"
+       hx-target="#inbox-detail-panel" hx-sync="#inbox-detail-panel:queue last"
+       data-inbox-open-message="{{ message.id }}"
+       class="flex gap-2.5 flex-1 min-w-0 rounded focus:outline-none focus:ring-2 focus:ring-orange-400"
+       aria-label="Open {{ message.type_display|default:message.get_message_type_display }} from {{ message.sender_name }}">
     <!-- Platform icon -->
     <div class="flex-shrink-0 pt-0.5">
         {% include "partials/_platform_icon.html" with platform=message.social_account.platform size="sm" %}
@@ -39,9 +44,13 @@
             <span class="text-[11px] text-stone-400 ml-auto flex-shrink-0" title="{{ message.received_at|date:'N j, Y g:i A' }}">{{ message.received_at|timesince }} ago</span>
         </div>
         <p class="inbox-row-preview text-[12px] text-stone-500 truncate leading-snug">{{ message.content_preview|truncatewords:20 }}</p>
+        <p class="text-[10px] text-stone-400 mt-1 truncate">{{ message.social_account.account_name|default:message.social_account.account_handle }}{% if inbox_row.matched_count > 1 %} · {{ inbox_row.matched_count }} matching messages{% endif %}</p>
+        {% if inbox_row.matched_count > 1 %}
+        <p class="text-[10px] text-stone-500">{{ inbox_row.unread_count }} unread · {{ inbox_row.open_count }} open{% if inbox_row.mixed_assignments %} · Different assignees{% endif %}. Status and selection below apply to this message.</p>
+        {% endif %}
         <div class="flex items-center gap-1.5 mt-1.5">
             <!-- Type badge -->
-            <span class="badge-pill badge-type">{{ message.get_message_type_display }}</span>
+            <span class="badge-pill badge-type">{{ message.type_display|default:message.get_message_type_display }}</span>
             <!-- Status badge -->
             <span class="badge-pill badge-status-{{ message.status }}">{{ message.get_status_display }}</span>
             <!-- Sentiment badge -->
@@ -61,4 +70,5 @@
             {% endif %}
         </div>
     </div>
+    </a>
 </div>

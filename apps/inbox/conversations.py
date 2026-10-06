@@ -12,7 +12,16 @@ from django.db import transaction
 from django.db.models import F, Q
 from django.utils import timezone
 
-from providers.meta_inbox_content import is_deleted_content, merge_message_extra, normalize_attachments
+from providers.meta_inbox_content import (
+    _identity_ids,
+    classify_conversation_identity,
+    is_deleted_content,
+    merge_content_status_evidence,
+    merge_conversation_classification,
+    merge_message_extra,
+    merged_content_status,
+    normalize_attachments,
+)
 
 from .conversation_policy import capture_allowed, enabled  # noqa: F401 (compatibility import)
 from .locking import lock_dm_account
@@ -59,31 +68,56 @@ def _identities(account, sender_id, extra, direction):
     own = {_id(account.account_platform_id), _id(account.webhook_target_id)} - {""}
     sender_id = _id(sender_id) or _id(extra.get("sender_id")) or _id(_dict(extra.get("sender")).get("id"))
     recipient_id = _id(extra.get("message_recipient_id")) or _id(_dict(extra.get("recipient")).get("id"))
-    participants = extra.get("participant_ids")
-    peer = ""
-    if "participant_ids" in extra:
-        # Never drop malformed identities to turn a group into a one-to-one
-        # pair, and never prefer a conflicting participant list over endpoints.
-        participant_ids = {_id(value) for value in participants} if isinstance(participants, list) else set()
-        peers = participant_ids - own
-        if (
-            isinstance(participants, list)
-            and len(participants) == len(participant_ids) == 2
-            and "" not in participant_ids
-            and len(peers) == 1
-            and participant_ids & own
-            and (not sender_id or sender_id in participant_ids)
-            and (not recipient_id or recipient_id in participant_ids)
-            and (not recipient_id or not sender_id or sender_id != recipient_id)
-        ):
-            peer = next(iter(peers))
-    elif direction == "outbound" and sender_id in own and recipient_id and recipient_id not in own:
-        peer = recipient_id
-    elif direction == "inbound" and recipient_id in own and sender_id and sender_id not in own:
-        peer = sender_id
-    if direction == ConversationMessage.Direction.OUTBOUND and not recipient_id and peer:
-        recipient_id = peer
-    return sender_id, recipient_id, peer
+    kind, reason, peer = classify_conversation_identity(extra, own_ids=own, sender_id=sender_id)
+    if kind == "direct" and not recipient_id:
+        participants = _identity_ids(extra.get("participant_ids", extra.get("participants"))) or []
+        recipient_id = peer if sender_id in own else next(iter(own & set(participants)), "")
+    return sender_id, recipient_id, peer, kind, reason
+
+
+def _apply_classification(account, conversation, peer_id, kind, reason):
+    """Late conflicting/group evidence fences work and withdraws pair guesses."""
+    before = (
+        conversation.conversation_type,
+        conversation.classification_reason,
+        conversation.peer_id,
+        conversation.peer_ambiguous,
+    )
+    if kind == "direct" and conversation.peer_id and peer_id != conversation.peer_id:
+        kind, reason = "unknown", "identity_conflict"
+    kind, reason = merge_conversation_classification(
+        conversation.conversation_type, conversation.classification_reason, kind, reason
+    )
+    # Pre-migration ambiguous records cannot be upgraded by a later pair.
+    if conversation.peer_ambiguous and kind != "group":
+        kind, reason = "unknown", "identity_conflict"
+    conversation.conversation_type, conversation.classification_reason = kind, reason
+    if kind == "direct":
+        conversation.peer_id = peer_id or conversation.peer_id
+    else:
+        conversation.peer_id = ""
+        conversation.peer_ambiguous = kind == "group" or reason == "identity_conflict"
+    after = (kind, reason, conversation.peer_id, conversation.peer_ambiguous)
+    if before == after:
+        return
+    conversation.revision += 1
+    conversation.save(
+        update_fields=[
+            "conversation_type",
+            "classification_reason",
+            "peer_id",
+            "peer_ambiguous",
+            "revision",
+            "updated_at",
+        ]
+    )
+    if kind != "direct":
+        ConversationMessage.objects.filter(
+            **_scope(account), conversation=conversation, conversation_attribution="verified_peer"
+        ).update(conversation=None, conversation_attribution="", updated_at=timezone.now())
+        from .reply_coordination import invalidate_conversations
+
+        invalidate_conversations(account, [conversation.pk])
 
 
 def _clear_ambiguous_peer_links(account, peer_id):
@@ -102,7 +136,7 @@ def _clear_ambiguous_peer_links(account, peer_id):
     invalidate_conversations(account, list(conversations.values_list("pk", flat=True)))
 
 
-def _conversation(account, provider_id, peer_id, *, group_evidence=False):
+def _conversation(account, provider_id, peer_id, *, kind="unknown", reason="participants_missing"):
     """Use a real thread first, or an exact, unambiguous one-to-one identity.
 
     A pair-only identity can be promoted once to a provider conversation. If
@@ -113,28 +147,14 @@ def _conversation(account, provider_id, peer_id, *, group_evidence=False):
     if provider_id:
         conversation = scoped.filter(platform_conversation_id=provider_id).first()
         if conversation:
-            if not conversation.peer_ambiguous and (
-                group_evidence or (peer_id and conversation.peer_id and peer_id != conversation.peer_id)
-            ):
-                conversation.peer_id = ""
-                conversation.peer_ambiguous = True
-                conversation.revision += 1
-                conversation.save(update_fields=["peer_id", "peer_ambiguous", "revision", "updated_at"])
-                ConversationMessage.objects.filter(
-                    **_scope(account), conversation=conversation, conversation_attribution="verified_peer"
-                ).update(conversation=None, conversation_attribution="", updated_at=timezone.now())
-                from .reply_coordination import invalidate_conversations
-
-                invalidate_conversations(account, [conversation.pk])
-            if conversation.peer_ambiguous:
+            _apply_classification(account, conversation, peer_id, kind, reason)
+            if conversation.conversation_type != "direct":
                 return conversation
-            if peer_id and not conversation.peer_id:
-                conversation.peer_id = peer_id
-                conversation.revision += 1
-                conversation.save(update_fields=["peer_id", "revision", "updated_at"])
             _clear_ambiguous_peer_links(account, peer_id)
             if peer_id and scoped.filter(peer_id=peer_id, platform_conversation_id__isnull=False).count() == 1:
-                fallback = scoped.filter(peer_id=peer_id, platform_conversation_id__isnull=True).first()
+                fallback = scoped.filter(
+                    peer_id=peer_id, platform_conversation_id__isnull=True, conversation_type="direct"
+                ).first()
                 if fallback and not (
                     # Preserve local uncertainty/pause records across identity
                     # changes. Never move an operation onto another thread.
@@ -153,10 +173,12 @@ def _conversation(account, provider_id, peer_id, *, group_evidence=False):
             return conversation
         if (
             peer_id
-            and not group_evidence
+            and kind == "direct"
             and not scoped.filter(peer_id=peer_id, platform_conversation_id__isnull=False).exists()
         ):
-            fallback = scoped.filter(peer_id=peer_id, platform_conversation_id__isnull=True).first()
+            fallback = scoped.filter(
+                peer_id=peer_id, platform_conversation_id__isnull=True, conversation_type="direct"
+            ).first()
             if fallback:
                 fallback.platform_conversation_id = provider_id
                 fallback.identity_kind = InboxConversation.IdentityKind.PLATFORM
@@ -166,21 +188,29 @@ def _conversation(account, provider_id, peer_id, *, group_evidence=False):
         conversation = InboxConversation.objects.create(
             **_scope(account),
             platform_conversation_id=provider_id,
-            peer_id="" if group_evidence else peer_id,
-            peer_ambiguous=group_evidence,
+            peer_id=peer_id if kind == "direct" else "",
+            peer_ambiguous=kind == "group" or reason == "identity_conflict",
+            conversation_type=kind,
+            classification_reason=reason,
             identity_kind=InboxConversation.IdentityKind.PLATFORM,
         )
         _clear_ambiguous_peer_links(account, peer_id)
         return conversation
     if not peer_id:
         return None
-    candidates = list(scoped.filter(peer_id=peer_id, peer_ambiguous=False)[:2])
+    candidates = list(scoped.filter(peer_id=peer_id, peer_ambiguous=False, conversation_type="direct")[:2])
     if len(candidates) > 1:
         return None
     if candidates:
         return candidates[0]
+    if scoped.filter(peer_id=peer_id, platform_conversation_id__isnull=True).exists():
+        return None  # Existing unverified rows are not silently backfilled.
     return InboxConversation.objects.create(
-        **_scope(account), peer_id=peer_id, identity_kind=InboxConversation.IdentityKind.VERIFIED_PEER
+        **_scope(account),
+        peer_id=peer_id,
+        identity_kind=InboxConversation.IdentityKind.VERIFIED_PEER,
+        conversation_type=kind,
+        classification_reason=reason,
     )
 
 
@@ -237,7 +267,7 @@ def upsert_conversation_message(
         direction = ConversationMessage.Direction.OUTBOUND
     elif direction not in ConversationMessage.Direction.values:
         direction = ConversationMessage.Direction.INBOUND if _id(sender_id) else ConversationMessage.Direction.UNKNOWN
-    sender_id, recipient_id, peer_id = _identities(account, sender_id, extra, direction)
+    sender_id, recipient_id, peer_id, kind, reason = _identities(account, sender_id, extra, direction)
     scoped = ConversationMessage.objects.filter(**_scope(account))
     row = scoped.filter(platform_message_id=provider_id).first() if provider_id else None
     local_row = scoped.filter(legacy_reply=legacy_reply).first() if legacy_reply else None
@@ -250,11 +280,14 @@ def upsert_conversation_message(
         "conversation_attribution",
         "platform_message_id",
         "direction",
+        "conversation_type",
+        "classification_reason",
         "sender_id",
         "recipient_id",
         "sender_name",
         "body",
         "attachments",
+        "content_status",
         "occurred_at",
         "is_deleted",
         "delivery_status",
@@ -276,6 +309,12 @@ def upsert_conversation_message(
         # merge. Preserve tombstones and bump the removed row's thread too.
         removed_conversation_id = local_row.conversation_id
         row.sources = sorted(set(row.sources) | set(local_row.sources))
+        row.conversation_type, row.classification_reason = merge_conversation_classification(
+            local_row.conversation_type,
+            local_row.classification_reason,
+            row.conversation_type,
+            row.classification_reason,
+        )
         row.is_deleted = row.is_deleted or local_row.is_deleted
         row.body = row.body or local_row.body
         row.sender_id = row.sender_id or local_row.sender_id
@@ -284,12 +323,47 @@ def upsert_conversation_message(
         row.attachments = normalize_attachments(
             merge_message_extra({"inbox_attachments": local_row.attachments}, {"inbox_attachments": row.attachments})
         )
+        row.content_status = merge_content_status_evidence(
+            local_row.content_status,
+            row.content_status,
+            body=row.body,
+            attachments=row.attachments,
+            deleted=row.is_deleted,
+        )
         local_row.delete()
     if provider_id and row.platform_message_id is None:
         row.platform_message_id = provider_id
     conversation_id = _id(extra.get("conversation_id"))
-    participants = extra.get("participant_ids")
-    group_evidence = isinstance(participants, list) and len({_id(item) for item in participants} - {""}) > 2
+    if (
+        row.conversation_type == "direct"
+        and row.conversation_id
+        and peer_id
+        and row.conversation.peer_id
+        and peer_id != row.conversation.peer_id
+    ):
+        kind, reason, peer_id = "unknown", "identity_conflict", ""
+    if (
+        conversation_id
+        and row.conversation_id
+        and row.conversation_attribution == "platform"
+        and row.conversation.platform_conversation_id != conversation_id
+    ):
+        # A native message cannot prove membership in two different threads.
+        kind, reason, peer_id = "unknown", "identity_conflict", ""
+        conversation_id = row.conversation.platform_conversation_id
+    kind, reason = merge_conversation_classification(row.conversation_type, row.classification_reason, kind, reason)
+    if kind != "direct":
+        peer_id = ""
+    row.conversation_type, row.classification_reason = kind, reason
+    if (
+        row.conversation_id
+        and row.conversation_attribution == "verified_peer"
+        and kind != "direct"
+        and reason != "participants_missing"
+    ):
+        _apply_classification(account, row.conversation, "", kind, reason)
+        row.conversation = None
+        row.conversation_attribution = ""
     # The same exact provider message ID bridges later native participant
     # evidence to its already-known thread. App intent cannot make that claim.
     if (
@@ -302,7 +376,7 @@ def upsert_conversation_message(
     conversation = (
         row.conversation
         if row.conversation_id and row.conversation_attribution == "platform" and not conversation_id
-        else _conversation(account, conversation_id, peer_id, group_evidence=group_evidence)
+        else _conversation(account, conversation_id, peer_id, kind=kind, reason=reason)
     )
     if conversation and (
         row.conversation_id is None
@@ -349,6 +423,9 @@ def upsert_conversation_message(
             row.body = body
         projection = merge_message_extra({"inbox_attachments": row.attachments}, extra)
         row.attachments = normalize_attachments(projection)
+    row.content_status = merged_content_status(
+        row.content_status, extra, body=row.body, attachments=row.attachments, deleted=row.is_deleted
+    )
     timestamp = _timestamp(occurred_at)
     if timestamp and (
         row.occurred_at is None or (source in {"poll", "webhook"} and not {"poll", "webhook"} & set(row.sources))
@@ -445,8 +522,9 @@ def record_reply(reply, *, source="app_send"):
     # parent thread is not proof that the provider placed this reply in it.
     # Preserve known group/ambiguity evidence so a direct peer guess cannot
     # turn that parent into an unrelated one-to-one conversation.
-    if "participant_ids" in extra:
-        outbound_extra["participant_ids"] = extra["participant_ids"]
+    for key in ("participant_ids", "participants", "conversation_type", "classification_reason"):
+        if key in extra:
+            outbound_extra[key] = extra[key]
     return upsert_conversation_message(
         account,
         platform_message_id=reply.platform_reply_id,

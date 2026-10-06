@@ -465,7 +465,10 @@ def test_silent_ordinary_poll_remains_live_observation(settings, enrolled):
         message_type="dm",
         text="Synthetic current question",
         timestamp=timezone.now(),
-        extra={"message_recipient_id": enrolled.account_platform_id},
+        extra={
+            "message_recipient_id": enrolled.account_platform_id,
+            "participant_ids": [enrolled.account_platform_id, "synthetic-peer"],
+        },
     )
     InboxSyncEngine()._upsert_message(enrolled, message, notify=False)
     assert ConversationMessage.objects.get().sources == ["poll"]

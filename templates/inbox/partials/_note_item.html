@@ -6,7 +6,7 @@
     <div class="flex-1 min-w-0">
         <div class="bg-amber-50 border border-amber-200 rounded-xl rounded-tl-sm px-3.5 py-2.5">
             <div class="flex items-center gap-2 mb-1">
-                <span class="text-[12px] font-semibold text-amber-900">{{ note.author.get_short_name|default:note.author.email }}</span>
+                <span class="text-[12px] font-semibold text-amber-900">{% if note.author %}{{ note.author.get_short_name|default:note.author.email }}{% else %}Your team{% endif %}</span>
                 <span class="badge-pill" style="background: var(--warning-50); color: var(--warning-700); border: 1px solid rgba(234,179,8,0.2);">Internal</span>
                 <span class="text-[11px] text-stone-400 ml-auto">{{ note.created_at|timesince }} ago</span>
             </div>

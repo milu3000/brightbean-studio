@@ -47,36 +47,69 @@
 {% endblock %}
 
 {% block content %}
-<div class="analytics-shell" x-data="{ drawerOpen: false, drawerContent: '' }">
+<div class="analytics-shell" x-data="{ drawerOpen: false }">
     {% include "analytics/_page.html" %}
 
     <!-- Post detail drawer (slides from right) -->
     <div class="a-drawer-backdrop" :class="drawerOpen ? 'open' : ''" @click="drawerOpen = false"></div>
     <div class="a-drawer" :class="drawerOpen ? 'open' : ''" @keydown.escape.window="drawerOpen = false">
-        <div x-html="drawerContent" id="drawer-host" style="display: flex; flex-direction: column; height: 100%;"></div>
+        <div id="drawer-host" style="display: flex; flex-direction: column; height: 100%;"></div>
     </div>
 
     <script nonce="{{ request.csp_nonce }}">
+        const shell = document.querySelector('.analytics-shell');
+        const drawerHost = shell.querySelector('#drawer-host');
+        let drawerRequestVersion = 0;
+
         function openPost(url) {
-            const root = document.querySelector('.analytics-shell');
-            const drawer = window.Alpine ? window.Alpine.$data(root) : null;
+            const drawer = window.Alpine ? window.Alpine.$data(shell) : null;
             if (!drawer) return;
+            const version = ++drawerRequestVersion;
+            drawer.drawerOpen = true;
+            drawerHost.textContent = 'Loading post…';
             fetch(url, { headers: { 'HX-Request': 'true' } })
-                .then(r => r.text())
+                .then(r => {
+                    if (!r.ok) throw new Error('Post could not be loaded');
+                    return r.text();
+                })
                 .then(html => {
-                    drawer.drawerContent = html;
-                    drawer.drawerOpen = true;
+                    if (version !== drawerRequestVersion || !drawer.drawerOpen) return;
+                    drawerHost.innerHTML = html;
+                    if (window.htmx) window.htmx.process(drawerHost);
+                })
+                .catch(() => {
+                    if (version !== drawerRequestVersion || !drawer.drawerOpen) return;
+                    drawerHost.textContent = 'Unable to load this post. Close the drawer and try again.';
                 });
         }
         window.openPost = openPost;
 
-        const shell = document.querySelector('.analytics-shell');
         shell.addEventListener('click', (e) => {
             const row = e.target.closest('tr[data-post-url]');
             if (row) { openPost(row.dataset.postUrl); return; }
 
-            if (e.target.closest('[data-action="close-drawer"]')) {
+            if (e.target.closest('[data-action="close-drawer"], .a-drawer-backdrop')) {
+                ++drawerRequestVersion;
                 if (window.Alpine) window.Alpine.$data(shell).drawerOpen = false;
+            }
+        });
+        window.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') ++drawerRequestVersion;
+        });
+        // A response from a form in an old/closed drawer must not replace a
+        // newer post, including after a confirmation request is already sent.
+        shell.addEventListener('htmx:beforeSwap', (e) => {
+            if (e.detail.target !== drawerHost) return;
+            const form = e.detail.requestConfig && e.detail.requestConfig.elt;
+            const drawer = window.Alpine ? window.Alpine.$data(shell) : null;
+            if (!form || !drawerHost.contains(form) || !drawer || !drawer.drawerOpen) {
+                e.detail.shouldSwap = false;
+            }
+        });
+        shell.addEventListener('analyticsStatusChanged', () => {
+            const table = shell.querySelector('#analytics-post-table');
+            if (table && window.htmx) {
+                window.htmx.ajax('GET', table.dataset.refreshUrl, { target: table, swap: 'outerHTML' });
             }
         });
     </script>

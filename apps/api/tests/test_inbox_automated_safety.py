@@ -17,7 +17,8 @@ from apps.mcp.tests.test_reply_window import message as message_fixture
 
 context = context_fixture
 message = message_fixture
-pytestmark = pytest.mark.django_db
+# A durable pre-network receipt must commit outside a TestCase savepoint.
+pytestmark = pytest.mark.django_db(transaction=True)
 
 
 @pytest.fixture
@@ -82,15 +83,21 @@ def test_rest_recent_message_uses_no_human_agent_exemption(credential, message, 
 
 @pytest.mark.parametrize("mode", ["new", "draft"])
 def test_rest_unsupported_send_cannot_claim_delivery(credential, message, mode):
+    from apps.inbox.reply_safety import is_unresolved_reply
+
     with (
         patch("apps.inbox.services.timezone.now", return_value=NOW),
         patch("apps.inbox.services._dispatch_to_platform", side_effect=NotImplementedError),
     ):
         response = _send(credential, message, mode)
-    assert response.status_code == 502, response.content
+    # Shared pre-dispatch refusals are conflicts, not ambiguous provider errors.
+    assert response.status_code == 409, response.content
     assert "does not support" in response.json()["detail"]
     reply = InboxReply.objects.get()
     assert reply.status == "failed" and reply.sent_at is None
+    assert reply.platform_reply_id == ""
+    assert reply.not_sent_verified
+    assert not is_unresolved_reply(reply)
 
 
 @pytest.mark.parametrize("mode", ["new", "draft"])

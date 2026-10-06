@@ -6,6 +6,7 @@ import logging
 from datetime import UTC, datetime, timedelta
 from urllib.parse import urlencode, urlparse
 
+from .analytics_errors import classify_analytics_error
 from .base import SocialProvider
 from .exceptions import APIError, OAuthError, ProviderError, PublishError
 from .meta_accounts import fetch_me_accounts, page_can_publish
@@ -13,10 +14,16 @@ from .meta_comments import parse_graph_time
 from .meta_inbox_content import (
     BASIC_MESSAGE_FIELDS,
     CONTENT_MESSAGE_FIELDS,
+    polled_conversation_classification,
     polled_message_extra,
     request_with_content_fields,
 )
-from .meta_insights import fetch_insights_safe, parse_insights_response
+from .meta_insights import (
+    _is_unsupported_metric_error,
+    fetch_insights_safe,
+    is_missing_meta_field,
+    parse_insights_response,
+)
 from .meta_messaging import build_send_payload, resolve_recipient_id
 from .meta_oauth import facebook_login_params
 from .types import (
@@ -677,6 +684,8 @@ class FacebookProvider(SocialProvider):
     def get_post_metrics(self, access_token: str, post_id: str) -> PostMetrics:
         fields, insight_candidates = self._resolve_post_fields(access_token, post_id)
         values, errors, insight_post_id = self._get_post_insights(access_token, insight_candidates)
+        if errors and not values and not any(key in fields for key in ("comments", "shares", "reactions")):
+            raise APIError("No supported Facebook post metrics returned", platform=self.platform_name)
 
         reactions = values.get("post_reactions_by_type_total", {})
         if isinstance(reactions, dict) and reactions:
@@ -714,19 +723,33 @@ class FacebookProvider(SocialProvider):
 
         deduped_candidate_ids = list(dict.fromkeys(str(candidate_id) for candidate_id in candidate_ids if candidate_id))
         best_fields = fields
+        inaccessible_candidate_ids: set[str] = set()
 
         for candidate_id in deduped_candidate_ids:
             if not candidate_id or candidate_id == post_id:
                 continue
-            feed_fields = self._get_post_fields(access_token, candidate_id)
+            try:
+                feed_fields = self._get_post_fields(access_token, candidate_id)
+            except APIError as exc:
+                # The original object succeeded. An inaccessible alternative
+                # Page-scoped alias is not evidence that the original failed.
+                classification = classify_analytics_error(exc, "facebook", context="post")
+                if classification.category == "post_inaccessible":
+                    inaccessible_candidate_ids.add(candidate_id)
+                    continue
+                raise
             if feed_fields:
                 best_fields = {**fields, **feed_fields}
                 break
-        return best_fields, deduped_candidate_ids
+        # Do not retry a known-inaccessible alias for insights ahead of the
+        # original object whose fields already succeeded.
+        return best_fields, [
+            candidate for candidate in deduped_candidate_ids if candidate not in inaccessible_candidate_ids
+        ]
 
     def _get_post_insights(self, access_token: str, post_ids: list[str]) -> tuple[dict, dict[str, str], str]:
         metric = ",".join(FACEBOOK_POST_INSIGHTS)
-        errors_by_post_id: dict[str, str] = {}
+        unsupported_insights = False
         for post_id in post_ids:
             endpoint = f"{BASE_URL}/{post_id}/insights"
             try:
@@ -737,13 +760,35 @@ class FacebookProvider(SocialProvider):
                     params={"metric": metric},
                 )
             except APIError as exc:
-                errors_by_post_id[post_id] = str(exc)
-                logger.warning("Skipping unsupported Facebook post insights at %s: %s", endpoint, exc)
+                classification = classify_analytics_error(exc, "facebook", context="post")
+                if classification.category != "unknown":
+                    raise
+                if _is_unsupported_metric_error(exc):
+                    # A deprecated metric must not hide the other supported
+                    # metrics, but auth/object/transient failures still escape.
+                    values, errors = fetch_insights_safe(
+                        self._request,
+                        platform=self.platform_name,
+                        endpoint=endpoint,
+                        access_token=access_token,
+                        metrics=FACEBOOK_POST_INSIGHTS,
+                        endpoint_type="post",
+                    )
+                    return values, errors, post_id
+                if not is_missing_meta_field(exc, "insights"):
+                    raise
+                unsupported_insights = True
+                logger.warning(
+                    "Facebook post insights edge unavailable: category=%s evidence=%s",
+                    classification.category,
+                    classification.safe_evidence,
+                )
                 continue
             return parse_insights_response(resp.json()), {}, post_id
 
-        error_text = "; ".join(f"{post_id}: {error}" for post_id, error in errors_by_post_id.items())
-        return {}, {key: error_text for key in FACEBOOK_POST_INSIGHTS}, post_ids[0] if post_ids else ""
+        if not unsupported_insights:
+            raise APIError("No Facebook post insight target available", platform=self.platform_name)
+        return {}, dict.fromkeys(FACEBOOK_POST_INSIGHTS, "unsupported_insights"), post_ids[0]
 
     def _get_post_fields(self, access_token: str, post_id: str) -> dict:
         # ``post_id`` is a Video-node field, not a field on a plain Post node, so
@@ -761,13 +806,19 @@ class FacebookProvider(SocialProvider):
                 )
                 return fields_resp.json()
             except APIError as exc:
-                logger.debug("Facebook post %s fields unavailable: %s", post_id, exc)
-                if "post_id" not in str(exc):
-                    # Only the invalid-`post_id`-field error is worth retrying
-                    # without it; other errors (auth, 5xx, not-found) fail
-                    # identically, so don't issue a second doomed request.
-                    break
-        return {}
+                classification = classify_analytics_error(exc, "facebook", context="post")
+                if (
+                    classification.category != "unknown"
+                    or "post_id" not in fields
+                    or not is_missing_meta_field(exc, "post_id")
+                ):
+                    raise
+                logger.debug(
+                    "Facebook post_id field unsupported: category=%s evidence=%s",
+                    classification.category,
+                    classification.safe_evidence,
+                )
+        raise APIError("No Facebook post fields returned", platform=self.platform_name)  # pragma: no cover
 
     @staticmethod
     def _stored_post_id(graph_post_id: str) -> str:
@@ -830,7 +881,14 @@ class FacebookProvider(SocialProvider):
             )
             followers = page_resp.json().get("followers_count", 0)
         except APIError as exc:
-            logger.debug("Facebook page %s follower count unavailable: %s", page_id, exc)
+            classification = classify_analytics_error(exc, "facebook", context="account")
+            if classification.is_account_error or classification.category == "transient":
+                raise
+            logger.debug(
+                "Facebook follower count unavailable: category=%s evidence=%s",
+                classification.category,
+                classification.safe_evidence,
+            )
         if not followers:
             followers = values.get("page_follows", 0)
 
@@ -888,19 +946,21 @@ class FacebookProvider(SocialProvider):
     def _fetch_direct_messages(self, access_token: str, since: datetime | None = None) -> list[InboxMessage]:
         from apps.inbox.conversation_policy import provider_capture_allowed
 
-        conversation_v2 = provider_capture_allowed(self.credentials, platform="facebook")
         page_id = self.credentials.get("page_id", "me")
-        params: dict = {}
-        if conversation_v2:
-            params["fields"] = "id,participants"
+        # Verify the same conversations already polled without retaining a
+        # participant directory or enabling outbound history. IDs are enough;
+        # requesting names/emails would collect data unnecessary for this check.
+        params: dict = {"fields": "id,participants{id}"}
         if since:
             params["since"] = int(since.timestamp())
 
-        resp = self._request(
-            "GET",
+        resp = request_with_content_fields(
+            self._request,
             f"{BASE_URL}/{page_id}/conversations",
             access_token=access_token,
             params=params,
+            basic_fields="id",
+            optional_fields=("participants",),
         )
         conversations = resp.json().get("data", [])
 
@@ -914,20 +974,22 @@ class FacebookProvider(SocialProvider):
         for convo in conversations:
             convo_id = convo["id"]
             identity_fields = ",to" if provider_capture_allowed(self.credentials, platform="facebook") else ""
+            content_fallback: list[str] = []
             msg_resp = request_with_content_fields(
                 request_messages,
                 f"{BASE_URL}/{convo_id}/messages",
                 access_token=access_token,
                 params={"fields": CONTENT_MESSAGE_FIELDS + identity_fields},
                 basic_fields=BASIC_MESSAGE_FIELDS + identity_fields,
+                on_fallback=content_fallback.append,
             )
-            conversation_messages.append((convo, msg_resp.json().get("data", [])))
+            conversation_messages.append((convo, msg_resp.json().get("data", []), content_fallback))
 
         # Project only after all responses arrive: revocation during a later
         # conversation fetch also excludes earlier outbound/identity data.
         conversation_v2 = provider_capture_allowed(self.credentials, platform="facebook")
         messages: list[InboxMessage] = []
-        for convo, polled_messages in conversation_messages:
+        for convo, polled_messages, content_fallback in conversation_messages:
             convo_id = convo["id"]
             for msg in polled_messages:
                 sender = msg.get("from", {})
@@ -953,6 +1015,10 @@ class FacebookProvider(SocialProvider):
                             sender_id=sender_id,
                             own_id=str(self.credentials.get("page_id") or "") if conversation_v2 else None,
                             participant_ids=convo.get("participants") if conversation_v2 else None,
+                            content_fetch_status=content_fallback[-1] if content_fallback else "fields_requested",
+                            classification_summary=polled_conversation_classification(
+                                msg, own_id=str(page_id), sender_id=sender_id, participant_ids=convo.get("participants")
+                            ),
                         ),
                     )
                 )

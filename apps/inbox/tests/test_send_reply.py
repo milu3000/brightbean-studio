@@ -19,6 +19,8 @@ from apps.inbox.models import InboxMessage, InboxReply
 from apps.inbox.services import _dispatch_to_platform
 from apps.social_accounts.models import SocialAccount
 
+pytestmark = pytest.mark.django_db(transaction=True)
+
 
 @pytest.fixture
 def workspace(db, organization):
@@ -47,7 +49,9 @@ def _message(account, *, message_type, hours_ago=1, extra=None, sender_handle="p
         sender_name="Marta",
         sender_handle=sender_handle,
         body="Question?",
-        extra=extra or {},
+        extra=extra
+        if extra is not None
+        else {"conversation_type": "direct", "classification_reason": "participants_pair"},
         received_at=timezone.now() - timedelta(hours=hours_ago),
     )
 
@@ -104,14 +108,14 @@ def test_providers_without_a_comment_edge_alias_reply_to_comment():
         provider.reply_to_message.assert_called_once_with("token", "comment-1", "Thanks!", {"k": "v"})
 
 
-def test_a_provider_that_cannot_reply_records_the_reply_locally(client, fb_account, org_owner, user):
-    """Losing the platform call must not lose the team's written answer."""
+def test_unsupported_comment_reply_keeps_failed_body_without_claiming_delivery(client, fb_account, org_owner, user):
+    """A manual unsupported call never becomes a local-only SENT receipt."""
     from apps.members.models import WorkspaceMembership
 
     WorkspaceMembership.objects.create(
         user=user, workspace=fb_account.workspace, workspace_role=WorkspaceMembership.WorkspaceRole.OWNER
     )
-    message = _message(fb_account, message_type=InboxMessage.MessageType.DM)
+    message = _message(fb_account, message_type=InboxMessage.MessageType.COMMENT)
     client.force_login(user)
 
     with patch("apps.inbox.services._dispatch_to_platform", side_effect=NotImplementedError):
@@ -121,10 +125,12 @@ def test_a_provider_that_cannot_reply_records_the_reply_locally(client, fb_accou
         )
 
     assert response.status_code == 200
-    assert "HX-Reply-Failed" not in response
+    assert response["HX-Reply-Failed"] == "1"
     reply = InboxReply.objects.get(inbox_message=message)
-    assert reply.status == InboxReply.Status.SENT
+    assert reply.status == InboxReply.Status.FAILED
     assert reply.platform_reply_id == ""
+    assert reply.sent_at is None and reply.body == "Noted internally"
+    assert b"does not support" in response.content
 
 
 def test_the_error_shown_to_users_carries_no_raw_api_text(client, fb_account, org_owner, user):
@@ -146,7 +152,7 @@ def test_the_error_shown_to_users_carries_no_raw_api_text(client, fb_account, or
         )
 
     body = response.content.decode()
-    assert "Reply not sent" in body
+    assert "DM send stopped" in body
     assert "fbtrace_id" not in body
     assert "401" not in body
 
@@ -218,8 +224,8 @@ def test_existing_extra_recipient_is_not_overwritten(fb_account):
     assert provider.reply_to_message.call_args.kwargs["extra"]["recipient_id"] == "from-payload"
 
 
-def test_failed_send_records_no_reply(client, fb_account, org_owner, user):
-    """The thread must never show a reply the customer never received."""
+def test_failed_send_keeps_failed_receipt_without_claiming_delivery(client, fb_account, org_owner, user):
+    """A pre-dispatch failure retains the draft text and truthful receipt."""
     from apps.members.models import WorkspaceMembership
 
     WorkspaceMembership.objects.create(
@@ -236,8 +242,11 @@ def test_failed_send_records_no_reply(client, fb_account, org_owner, user):
 
     assert response.status_code == 200
     assert response["HX-Reply-Failed"] == "1"
-    assert b"Reply not sent" in response.content
-    assert InboxReply.objects.filter(inbox_message=message).count() == 0
+    assert b"DM send stopped" in response.content
+    reply = InboxReply.objects.get(inbox_message=message)
+    assert reply.status == "failed"
+    assert reply.body == "This will fail"
+    assert reply.platform_reply_id == "" and reply.sent_at is None
     # Status is untouched, so the message stays in the queue to be answered.
     message.refresh_from_db()
     assert message.status == InboxMessage.Status.UNREAD

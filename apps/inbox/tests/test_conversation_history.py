@@ -38,6 +38,7 @@ def _ingest(account, source, *, mid="native-1", outbound=True, recipient="custom
         payload = {
             "sender": {"id": sender},
             "recipient": {"id": recipient} if recipient else {},
+            "participant_ids": [sender, recipient] if recipient else None,
             "timestamp": int(now.timestamp() * 1000),
             "message": {"mid": mid, "text": "Native answer" if outbound else "Question", "is_deleted": deleted},
         }
@@ -58,6 +59,7 @@ def _ingest(account, source, *, mid="native-1", outbound=True, recipient="custom
                     "conversation_id": conversation,
                     "sender_id": sender,
                     "message_recipient_id": recipient,
+                    "participant_ids": [sender, recipient] if recipient else None,
                     "is_deleted": deleted,
                 },
             ),
@@ -74,7 +76,7 @@ def _original(account, *, status="archived"):
         sender_handle="not-an-identity-handle",
         body="Question",
         status=status,
-        extra={"sender_id": "customer-1"},
+        extra={"sender_id": "customer-1", "participant_ids": [account.account_platform_id, "customer-1"]},
         received_at=timezone.now() - timedelta(minutes=5),
     )
 
@@ -274,28 +276,51 @@ def test_sent_legacy_without_id_is_unverified_and_idempotent(inbox_account):
 
 
 @pytest.mark.parametrize("unsupported", [False, True])
-def test_send_path_records_provider_acceptance_or_uncertainty(inbox_account, unsupported):
-    reply = create_reply_draft(message=_original(inbox_account), body="App answer")
+@pytest.mark.django_db(transaction=True)
+def test_send_path_records_provider_acceptance_and_does_not_project_unsupported_dm(inbox_account, unsupported, user):
+    from apps.inbox.dm_send_gate import DMSendGateError, session_send_authorization
+    from apps.members.models import WorkspaceMembership
+
+    WorkspaceMembership.objects.create(user=user, workspace=inbox_account.workspace, workspace_role="owner")
+    original = _original(inbox_account)
+    original.sender_handle = "customer-1"
+    original.save(update_fields=["sender_handle"])
+    reply = create_reply_draft(message=original, body="App answer", author=user)
     with patch(
         "apps.inbox.services._dispatch_to_platform",
         side_effect=NotImplementedError if unsupported else None,
         return_value="sent-id",
     ):
-        send_reply_now(reply)
+        if unsupported:
+            with pytest.raises(DMSendGateError, match="does not support"):
+                send_reply_now(reply, actor=user, authorization=session_send_authorization(user))
+            reply.refresh_from_db()
+            assert reply.status == "failed"
+            assert not ConversationMessage.objects.exists()
+            return
+        send_reply_now(reply, actor=user, authorization=session_send_authorization(user))
     row = ConversationMessage.objects.get()
     assert row.legacy_reply_id == reply.pk
     assert row.direction == "outbound"
-    assert row.delivery_status == ("delivery_unverified" if unsupported else "provider_accepted")
-    assert row.platform_message_id == (None if unsupported else "sent-id")
+    assert row.delivery_status == "provider_accepted"
+    assert row.platform_message_id == "sent-id"
 
 
-def test_optional_history_failure_cannot_rollback_accepted_reply(inbox_account):
-    reply = create_reply_draft(message=_original(inbox_account), body="App answer")
+@pytest.mark.django_db(transaction=True)
+def test_optional_history_failure_cannot_rollback_accepted_reply(inbox_account, user):
+    from apps.inbox.dm_send_gate import session_send_authorization
+    from apps.members.models import WorkspaceMembership
+
+    WorkspaceMembership.objects.create(user=user, workspace=inbox_account.workspace, workspace_role="owner")
+    original = _original(inbox_account)
+    original.sender_handle = "customer-1"
+    original.save(update_fields=["sender_handle"])
+    reply = create_reply_draft(message=original, body="App answer", author=user)
     with (
         patch("apps.inbox.services._dispatch_to_platform", return_value="sent-id"),
         patch("apps.inbox.conversations.record_reply", side_effect=ValueError("projection failed")),
     ):
-        send_reply_now(reply)
+        send_reply_now(reply, actor=user, authorization=session_send_authorization(user))
     reply.refresh_from_db()
     assert reply.status == "sent"
     assert reply.platform_reply_id == "sent-id"

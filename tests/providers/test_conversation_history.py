@@ -65,7 +65,7 @@ def _provider(provider_type, messages, *, participants=None, credentials=None, a
 
 
 @pytest.mark.parametrize("provider_type", PROVIDERS)
-def test_unenrolled_preserves_legacy_skip_and_request_fields(settings, provider_type):
+def test_unenrolled_keeps_inbound_and_classification_without_identity_history(settings, provider_type):
     settings.INBOX_CONVERSATION_V2_ENABLED = True
     provider = _provider(
         provider_type,
@@ -79,11 +79,14 @@ def test_unenrolled_preserves_legacy_skip_and_request_fields(settings, provider_
     assert messages[0].extra == {
         "conversation_id": "provider-conversation-id",
         "sender_id": PEER,
+        "conversation_type": "direct",
+        "classification_reason": "participants_pair",
         "inbox_attachments": [],
+        "content_fetch_status": "fields_requested",
     }
     calls = provider._request.call_args_list
     if provider_type is FacebookProvider:
-        assert calls[0].kwargs["params"] == {}
+        assert calls[0].kwargs["params"] == {"fields": "id,participants{id}"}
         assert calls[1].kwargs["params"]["fields"] == CONTENT_MESSAGE_FIELDS
     else:
         assert calls[0].kwargs["params"]["fields"] == f"id,participants,messages{{{CONTENT_MESSAGE_FIELDS}}}"
@@ -109,14 +112,17 @@ def test_enabled_keeps_native_outbound_and_exact_pair_identity(settings, provide
         "sender_id": OWNER,
         "message_recipient_id": PEER,
         "participant_ids": [OWNER, PEER],
+        "conversation_type": "direct",
+        "classification_reason": "participants_pair",
         "direction": "outbound",
         "inbox_attachments": [],
+        "content_fetch_status": "fields_requested",
     }
     assert "recipient_id" not in inbound.extra
     assert "recipient_id" not in outbound.extra
     assert ",to" in provider._request.call_args.kwargs["params"]["fields"]
     if provider_type is FacebookProvider:
-        assert provider._request.call_args_list[0].kwargs["params"] == {"fields": "id,participants"}
+        assert provider._request.call_args_list[0].kwargs["params"] == {"fields": "id,participants{id}"}
 
 
 @pytest.mark.parametrize("provider_type", PROVIDERS)
@@ -134,7 +140,7 @@ def test_only_exact_account_is_enriched_when_same_provider_has_two_accounts(sett
         fields = provider._request.call_args.kwargs["params"]["fields"]
         assert (",to" in fields) is (account_id == ACCOUNT_ID)
         if provider_type is FacebookProvider:
-            expected_params = {"fields": "id,participants"} if account_id == ACCOUNT_ID else {}
+            expected_params = {"fields": "id,participants{id}"}
             assert provider._request.call_args_list[0].kwargs["params"] == expected_params
 
     assert [message.platform_message_id for message in results[ACCOUNT_ID]] == ["inbound", "native-outbound"]
@@ -143,7 +149,10 @@ def test_only_exact_account_is_enriched_when_same_provider_has_two_accounts(sett
     assert results[OTHER_ACCOUNT_ID][0].extra == {
         "conversation_id": "provider-conversation-id",
         "sender_id": PEER,
+        "conversation_type": "direct",
+        "classification_reason": "participants_pair",
         "inbox_attachments": [],
+        "content_fetch_status": "fields_requested",
     }
 
 
@@ -168,7 +177,7 @@ def test_enrollment_requires_exact_scope_bound_to_provider(settings, provider_ty
     assert ",to" not in provider._request.call_args.kwargs["params"]["fields"]
     assert "message_recipient_id" not in messages[0].extra
     if provider_type is FacebookProvider:
-        assert provider._request.call_args_list[0].kwargs["params"] == {}
+        assert provider._request.call_args_list[0].kwargs["params"] == {"fields": "id,participants{id}"}
 
 
 @pytest.mark.parametrize("provider_type", PROVIDERS)
@@ -225,7 +234,10 @@ def test_revocation_while_fetching_messages_drops_outbound_and_identity(settings
     assert messages[0].extra == {
         "conversation_id": "provider-conversation-id",
         "sender_id": PEER,
+        "conversation_type": "direct",
+        "classification_reason": "participants_pair",
         "inbox_attachments": [],
+        "content_fetch_status": "fields_requested",
     }
 
 
@@ -256,7 +268,19 @@ def test_facebook_revocation_between_conversations_also_discards_earlier_enrichm
         "second-inbound",
         "third-inbound",
     ]
-    assert all(set(message.extra) == {"conversation_id", "sender_id", "inbox_attachments"} for message in messages)
+    assert all(
+        set(message.extra)
+        == {
+            "conversation_id",
+            "sender_id",
+            "inbox_attachments",
+            "conversation_type",
+            "classification_reason",
+            "content_fetch_status",
+        }
+        for message in messages
+    )
+    assert all(message.extra["conversation_type"] == "direct" for message in messages)
     assert ",to" in provider._request.call_args_list[1].kwargs["params"]["fields"]
     assert provider._request.call_args.kwargs["params"]["fields"] == CONTENT_MESSAGE_FIELDS
 
@@ -277,6 +301,7 @@ def test_attachment_fallback_rechecks_revoked_enrollment(settings, provider_type
             settings.INBOX_CONVERSATION_V2_CAPTURE_ACCOUNTS = "[]"
             raise APIError(
                 "unsupported attachment field",
+                status_code=400,
                 raw_response={"error": {"code": 100, "message": "Tried accessing nonexisting field (attachments)"}},
             )
         return responses.pop(0)
@@ -295,7 +320,7 @@ def test_attachment_fallback_rechecks_revoked_enrollment(settings, provider_type
 
 
 @pytest.mark.parametrize("provider_type", PROVIDERS)
-def test_message_to_single_recipient_is_sufficient_evidence(settings, provider_type):
+def test_message_to_single_recipient_proves_addressing_only(settings, provider_type):
     _enroll(settings, provider_type)
     provider = _provider(provider_type, [_message(to={"data": [{"id": PEER, "name": "Not retained"}]})])
 
@@ -305,6 +330,8 @@ def test_message_to_single_recipient_is_sufficient_evidence(settings, provider_t
     assert extra["direction"] == "outbound"
     assert "to" not in extra
     assert "participant_ids" not in extra
+    assert extra["conversation_type"] == "unknown"
+    assert extra["classification_reason"] == "participants_missing"
 
 
 @pytest.mark.parametrize("provider_type", PROVIDERS)
@@ -362,6 +389,7 @@ def test_unsupported_attachment_fallback_preserves_requested_identity_fields(set
     request = provider._request
     error = APIError(
         "unsupported attachment field",
+        status_code=400,
         raw_response={"error": {"code": 100, "message": "Tried accessing nonexisting field (attachments)"}},
     )
     if provider_type is FacebookProvider:
@@ -389,6 +417,8 @@ def test_identity_projection_does_not_copy_raw_participants_or_recipient_metadat
         "sender_id",
         "direction",
         "participant_ids",
+        "conversation_type",
+        "classification_reason",
         "message_recipient_id",
         "inbox_attachments",
     }

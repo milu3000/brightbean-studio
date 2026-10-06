@@ -20,6 +20,7 @@ from ninja.openapi.docs import Swagger
 from apps.api.auth import ApiKeyAuth, McpAuth
 from apps.api.routers.accounts import router as accounts_router
 from apps.api.routers.analytics import router as analytics_router
+from apps.api.routers.conversation_dispatch import router as conversation_dispatch_router
 from apps.api.routers.inbox import router as inbox_router
 from apps.api.routers.me import router as me_router
 from apps.api.routers.media import router as media_router
@@ -93,6 +94,7 @@ api.add_router("/posts", posts_router)
 api.add_router("/media", media_router)
 api.add_router("/analytics", analytics_router)
 api.add_router("/inbox", inbox_router)
+api.add_router("/conversation-replies", conversation_dispatch_router)
 # MCP Streamable HTTP transport. Same audit + rate limits as REST, but a
 # wider auth class: ``McpAuth`` accepts both bb_studio_ keys AND OAuth 2.1
 # access tokens (Claude Desktop's native connector flow). Mounted last so

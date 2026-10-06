@@ -22,7 +22,7 @@ from apps.inbox.models import ConversationMessage, ConversationSyncState, InboxC
 from apps.mcp.handlers import _parse_uuid, _require_perm, _wrap_text
 from apps.mcp.protocol import INVALID_PARAMS, JsonRpcError
 from apps.mcp.tools import Tool, register_tool
-from providers.meta_inbox_content import normalize_attachments
+from providers.meta_inbox_content import message_content_status, normalize_attachments
 
 _FLAG = "INBOX_CONVERSATION_V2_ENABLED"
 _CURSOR_SALT = "brightbean.conversation.read.v1"
@@ -162,26 +162,61 @@ def _conversation(row):
         "peer_id": row.peer_id or None,
         "peer_ambiguous": row.peer_ambiguous,
         "identity_kind": row.identity_kind,
+        "conversation_type": row.conversation_type,
+        "classification_reason": row.classification_reason,
         "revision": row.revision,
         "created_at": _iso(row.created_at),
         "updated_at": _iso(row.updated_at),
     }
 
 
-def _safe_attachments(attachments, *, deleted=False):
+def _safe_attachments(attachments, *, deleted=False, limit=3):
     result = []
     # Revalidate even persisted data and hide internal provider attachment IDs.
-    for item in normalize_attachments({"inbox_attachments": attachments, "is_deleted": deleted})[:3]:
-        result.append({key: item.get(key, "") for key in ("type", "url", "title", "preview_url", "availability")})
+    for item in normalize_attachments({"inbox_attachments": attachments, "is_deleted": deleted})[:limit]:
+        projected = {
+            key: item.get(key, "")
+            for key in ("type", "url", "title", "preview_url", "availability", "availability_reason")
+        }
+        if len(json.dumps(projected)) > _MAX_MESSAGE_CHARS:
+            projected["metadata_truncated"] = True
+            for field in ("preview_url", "url"):
+                if len(json.dumps(projected)) > _MAX_MESSAGE_CHARS:
+                    projected[field] = ""
+            if not projected["url"]:
+                projected["availability"] = "unavailable"
+                projected["availability_reason"] = "size_limited"
+            if len(json.dumps(projected)) > _MAX_MESSAGE_CHARS:
+                projected["title"] = ""
+        result.append(projected)
     return result
+
+
+def _row_content_status(row):
+    if row.is_deleted:
+        return "removed"
+    if row.content_status in {
+        "partial",
+        "unsupported",
+        "fields_unavailable",
+        "link_provided",
+        "unavailable",
+        "text",
+        "no_metadata",
+    }:
+        return row.content_status
+    return message_content_status({"inbox_attachments": row.attachments}, row.body or "")
 
 
 def _message(row):
     body = "" if row.is_deleted else row.body or ""
+    attachments = _safe_attachments(row.attachments, deleted=row.is_deleted, limit=None)
     result: dict[str, Any] = {
         "id": str(row.pk),
         "conversation_id": str(row.conversation_id) if row.conversation_id else None,
         "conversation_attribution": row.conversation_attribution,
+        "conversation_type": row.conversation_type,
+        "classification_reason": row.classification_reason,
         "workspace_id": str(row.workspace_id),
         "social_account_id": str(row.social_account_id),
         "platform": row.platform,
@@ -192,11 +227,13 @@ def _message(row):
         "sender_name": row.sender_name,
         "body": body[:2000],
         "body_truncated": len(body) > 2000,
-        "attachments": _safe_attachments(row.attachments, deleted=row.is_deleted),
-        "attachments_truncated": len(row.attachments) > 3,
-        "content_available": bool(body or any(item.get("url") for item in _safe_attachments(row.attachments)))
-        and not row.is_deleted,
+        "attachments": attachments[:3],
+        "attachment_metadata_count": len(attachments),
+        "attachments_tool": "get_conversation_attachments",
+        "attachments_truncated": len(attachments) > 3,
+        "content_available": bool(body or any(item.get("url") for item in attachments)) and not row.is_deleted,
         "is_deleted": row.is_deleted,
+        "content_status": _row_content_status(row),
         "occurred_at": _iso(row.occurred_at),
         "first_seen_at": _iso(row.first_seen_at),
         "updated_at": _iso(row.updated_at),
@@ -405,6 +442,64 @@ def _get_reply_context(args: dict, context: dict[str, Any]) -> dict:
     return _wrap_text(result)
 
 
+def _get_conversation_attachments(args: dict, context: dict[str, Any]) -> dict:
+    """Page stored, sanitized metadata only; never fetch or cache media bytes."""
+    key, accounts, scoped = _scope(context)
+    message_id = _parse_uuid(args.get("message_id"), "message_id")
+    limit = args.get("limit", 10)
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 10:
+        raise JsonRpcError(INVALID_PARAMS, "limit must be an integer between 1 and 10")
+    row = ConversationMessage.objects.filter(**scoped, pk=message_id).first()
+    if row is None:
+        raise JsonRpcError(INVALID_PARAMS, "Conversation message not found")
+    items = _safe_attachments(row.attachments, deleted=row.is_deleted, limit=None)
+    scope = _cursor_scope(key, accounts, "attachments", {"message_id": str(message_id)})
+    version = hashlib.sha256(json.dumps([_iso(row.updated_at), items], sort_keys=True).encode()).hexdigest()
+    salt = _CURSOR_SALT + ".attachments"
+    offset = 0
+    if args.get("cursor") is not None:
+        try:
+            cursor = args["cursor"]
+            if not isinstance(cursor, str) or not 1 <= len(cursor) <= 4096:
+                raise ValueError
+            payload = signing.loads(cursor, salt=salt, max_age=_CURSOR_MAX_AGE)
+            offset = payload["offset"]
+            if (
+                payload.get("scope") != scope
+                or payload.get("version") != version
+                or isinstance(offset, bool)
+                or not isinstance(offset, int)
+                or not 0 <= offset <= len(items)
+            ):
+                raise ValueError
+        except (signing.BadSignature, ValueError, TypeError, KeyError) as exc:
+            raise JsonRpcError(INVALID_PARAMS, "Invalid, expired, changed, or out-of-scope attachment cursor") from exc
+    page: list[dict[str, Any]] = []
+    for item in items[offset : offset + limit]:
+        if len(json.dumps(page + [item])) > _MAX_RESPONSE_CHARS - 4096:
+            break
+        page.append(item)
+    end = offset + len(page)
+    more = end < len(items)
+    return _wrap_text(
+        {
+            "message_id": str(row.pk),
+            "items": page,
+            "attachment_metadata_count": len(items),
+            "has_more": more,
+            "next_cursor": signing.dumps({"scope": scope, "version": version, "offset": end}, salt=salt, compress=True)
+            if more
+            else None,
+            "observed_at": _iso(timezone.now()),
+            "is_deleted": row.is_deleted,
+            "content_status": _row_content_status(row),
+            "media_fetched": False,
+            "platform_media_complete": False,
+            "note": "Stored metadata only. Links may expire or require sign-in; unavailable content is not reconstructed.",
+        }
+    )
+
+
 _PAGING = {
     "limit": {"type": "integer", "minimum": 1, "maximum": 100},
     "cursor": {"type": "string", "description": "Opaque cursor returned by this exact tool and scope."},
@@ -432,6 +527,19 @@ for _name, _description, _properties, _required, _handler in (
         },
         [],
         _get_conversation_messages,
+    ),
+    (
+        "get_conversation_attachments",
+        "Read all retained attachment/share metadata for an authorized V2 message in bounded pages. Does not download, "
+        "cache or inspect media, infer missing group content, or claim links are readable. Use this when a history item "
+        "reports attachments_truncated; attachment_metadata_count counts retained metadata, not all native platform media.",
+        {
+            "message_id": {"type": "string", "format": "uuid"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 10},
+            "cursor": _PAGING["cursor"],
+        },
+        ["message_id"],
+        _get_conversation_attachments,
     ),
     (
         "get_reply_context",

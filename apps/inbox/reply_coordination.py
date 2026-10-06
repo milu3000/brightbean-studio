@@ -1,11 +1,11 @@
-"""Default-off local DM burst coordination. There is deliberately no dispatcher.
+"""Default-off local DM burst coordination, with optional explicit ownership.
 
 Callers supply a freshly authorized actor scope; this module rechecks persisted
 workspace/account/platform ownership. PostgreSQL account/conversation locks
 serialize ingestion and local reservations. SQLite tests do not establish this
 cross-worker contract. Native activity can arrive late: freshness is incomplete
-and no local transaction makes an external send atomic. No worker consumes the
-due times or dispatches prepared operations in this phase.
+and no local transaction makes an external send atomic. No worker consumes due times. The separate reply_dispatch bridge can send only
+explicitly enrolled, currently authorized, fenced operations.
 """
 
 from __future__ import annotations
@@ -118,7 +118,8 @@ def _verified(conversation):
     # Conservative one-to-one phase: a provider thread alone is not proof of a
     # recipient. Retained conflicting fallback identities require reconciliation.
     return bool(
-        conversation.peer_id
+        conversation.conversation_type == InboxConversation.ConversationType.DIRECT
+        and conversation.peer_id
         and not conversation.peer_ambiguous
         and conversation.identity_kind in InboxConversation.IdentityKind.values
         and not InboxConversation.objects.filter(
@@ -173,8 +174,6 @@ def _invalidate(state, reason):
 @transaction.atomic
 def invalidate_conversations(account, conversation_ids):
     """Internal identity-withdrawal hook; preserve unknown outcomes and pause."""
-    if not enabled():
-        return
     account = _capture_account(account)
     if account is None:
         return
@@ -315,7 +314,28 @@ def observe_message(
         # A clearly older outgoing is context, not proof the current question
         # was answered. Unknown/equal/later timestamps still pause conservatively.
         outgoing = False
-    if not valid_identity or outgoing:
+    own_confirmed_outgoing = bool(
+        outgoing
+        and source == "app_send"
+        and row.legacy_reply_id
+        and SendOperation.objects.filter(
+            **_scope(account),
+            conversation=conversation,
+            reply_id=row.legacy_reply_id,
+            ownership__isnull=False,
+            status="confirmed",
+            attempt__outcome="sent",
+        ).exists()
+    )
+    if valid_identity and own_confirmed_outgoing:
+        # The dispatch transaction already settled and consumed this operation.
+        # Record its observation without treating our own accepted send as a new
+        # native takeover. Never clear an existing hold or reinstate due work.
+        _invalidate(state, "outgoing_observed")
+        state.generation += 1
+        state.burst_started_at = None
+        state.due_at = None
+    elif not valid_identity or outgoing:
         _invalidate(state, "identity_uncertain" if not valid_identity else "outgoing_observed")
         state.generation += 1
         state.owner_paused = True
@@ -451,6 +471,9 @@ def prepare_reply(
         or expected_generation < 0
     ):
         raise ReplyCoordinationError("invalid_payload")
+    from .reply_dispatch import check_coordinator_owner
+
+    owner = check_coordinator_owner(scope, account, conversation)
     fingerprint = _payload(body, target_message_id, expected_revision, expected_generation)
     existing = SendOperation.objects.filter(
         **_scope(account), conversation=conversation, actor_scope=scope.actor_id, idempotency_key=idempotency_key
@@ -476,7 +499,20 @@ def prepare_reply(
         due=False,
         now=_now(now),
     )
+    if (
+        SendOperation.objects.filter(conversation=conversation, status="confirmed")
+        .filter(Q(target_id=target.pk) | Q(target_platform_message_id=target.platform_message_id))
+        .exists()
+    ):
+        raise ReplyCoordinationError("target_already_answered")
+    if target.legacy_message_id:
+        from .reply_safety import check_dm_receipts
+
+        check_dm_receipts(target.legacy_message, include_drafts=True)
     operation = SendOperation.objects.create(
+        ownership=owner,
+        owner_epoch=owner.epoch if owner else 0,
+        target_platform_message_id=target.platform_message_id if owner else "",
         **_scope(account),
         conversation=conversation,
         actor_scope=scope.actor_id,
@@ -502,6 +538,9 @@ def _load_operation(scope, operation_id):
         raise ReplyCoordinationError("not_found_or_denied")
     account = _account(scope, snapshot.social_account_id, snapshot.platform)
     conversation = _conversation(account, snapshot.conversation_id)
+    from .reply_dispatch import check_coordinator_owner
+
+    check_coordinator_owner(scope, account, conversation, operation=snapshot, allow_paused=True)
     state = _state(conversation)
     operation = SendOperation.objects.select_for_update().get(pk=snapshot.pk)
     if operation.actor_scope != scope.actor_id:
@@ -608,6 +647,10 @@ def set_owner_paused(
     """Explicit owner pause/resume clears pending work; resume never revives it."""
     account = _account(scope, social_account_id, platform)
     conversation = _conversation(account, conversation_id)
+    from .models import DMConversationOwnership
+
+    if DMConversationOwnership.objects.filter(conversation=conversation).exists():
+        raise ReplyCoordinationError("ownership_control_required")
     if (
         not isinstance(paused, bool)
         or isinstance(expected_revision, bool)

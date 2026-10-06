@@ -20,6 +20,12 @@ class InboxMessageAdmin(admin.ModelAdmin):
 
 @admin.register(InboxReply)
 class InboxReplyAdmin(admin.ModelAdmin):
+    # Receipt state and intent can only change through the shared services.
+    readonly_fields = [field.name for field in InboxReply._meta.fields]
+
+    def has_add_permission(self, request):
+        return False
+
     list_display = ["inbox_message", "author", "sent_at"]
     raw_id_fields = ["inbox_message", "author"]
 

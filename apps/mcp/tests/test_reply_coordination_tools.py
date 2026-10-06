@@ -167,7 +167,13 @@ def test_old_tool_wire_schemas_unchanged_by_coordination_flag(settings):
 def test_capture_only_hides_all_v2_tools_and_denies_cached_coordination_handler(
     settings, user, memberships, workspace, account, conversation, state, operation
 ):
-    names = {"list_conversations", "get_conversation_messages", "get_reply_context", "get_reply_coordination"}
+    names = {
+        "list_conversations",
+        "get_conversation_messages",
+        "get_reply_context",
+        "get_reply_coordination",
+        "get_conversation_attachments",
+    }
     tool = get_tool("get_reply_coordination")
     original = {item.name: deepcopy(item.to_mcp_dict()) for item in all_tools() if item.name not in names}
     key = issue_api_key(

@@ -1,5 +1,5 @@
 {% load analytics_extras %}
-<div id="analytics-post-table">
+<div id="analytics-post-table" data-refresh-url="?range={{ days }}&sort={{ table.sort_key }}&dir={{ table.sort_dir }}&type={{ table.type_filter }}&table_range={{ table.days_filter|default_if_none:'all' }}&page={{ table.page }}&partial=table">
     {# Toolbar #}
     <div style="display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; padding: 12px 16px; border-bottom: 1px solid var(--neutral-100);">
         <span style="font-size: 0.8125rem; color: var(--text-secondary);">
@@ -84,12 +84,19 @@
                             {% else %}
                             <div style="width: 36px; height: 36px; border-radius: 6px; background: var(--surface-2); flex-shrink: 0;"></div>
                             {% endif %}
-                            <span style="overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical;">{{ r.caption|default:"(no caption)" }}</span>
+                            <div style="min-width: 0;">
+                                <span style="overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical;">{{ r.caption|default:"(no caption)" }}</span>
+                                <div data-analytics-availability="{{ r.analytics_status.availability }}" data-analytics-error-category="{{ r.analytics_status.error_category }}" style="font-size: 0.6875rem; color: var(--text-secondary); margin-top: 4px;">{{ r.analytics_status.label }}</div>
+                                <div style="font-size: 0.625rem; color: var(--text-tertiary); margin-top: 2px;">
+                                    {% if r.analytics_status.source == 'user' %}User-confirmed{% elif r.analytics_status.source == 'platform' %}Platform observation{% else %}Unverified{% endif %}{% if r.analytics_status.checked_at %} · <time datetime="{{ r.analytics_status.checked_at|date:'c' }}">{{ r.analytics_status.checked_at|date:'Y-m-d H:i T' }}</time>{% endif %}
+                                </div>
+                                {% if r.captured_at %}<div style="font-size: 0.625rem; color: var(--text-tertiary); margin-top: 2px;">Latest saved snapshot <time datetime="{{ r.captured_at|date:'c' }}">{{ r.captured_at|date:'Y-m-d H:i T' }}</time>{% if r.analytics_status.error_category %} · Refresh failed{% endif %}</div>{% elif table.metric_labels %}<div style="font-size: 0.625rem; color: var(--text-tertiary); margin-top: 2px;">No saved metrics</div>{% endif %}
+                            </div>
                         </div>
                     </td>
                     <td style="font-size: 0.75rem; color: var(--text-tertiary);">{{ r.date }}</td>
                     {% for ml in table.metric_labels %}
-                    <td class="{% if ml.key == table.sort_key %}sort-col{% endif %}">{{ r.stats|get_stat:ml.key|fmt_metric:ml.kind }}</td>
+                    <td class="{% if ml.key == table.sort_key %}sort-col{% endif %}">{% with value=r.stats|get_item:ml.key %}{% if value is None %}<span aria-label="No saved value">—</span>{% else %}{{ value|fmt_metric:ml.kind }}{% endif %}{% endwith %}</td>
                     {% endfor %}
                 </tr>
                 {% empty %}

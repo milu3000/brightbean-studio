@@ -1,0 +1,20 @@
+{% load humanize %}
+<article id="incoming-{{ incoming.id }}" data-incoming-message-id="{{ incoming.id }}"
+         class="bg-stone-50 rounded-xl p-4 border {% if incoming.id == message.id %}border-orange-300{% else %}border-stone-100{% endif %}">
+    <div class="flex items-center gap-2 flex-wrap mb-2">
+        <span class="text-[12px] font-semibold text-stone-800">{{ incoming.sender_name|default:"Unknown sender" }}</span>
+        <span class="badge-pill badge-type">Received</span>
+        <span class="badge-pill badge-status-{{ incoming.status }}">{{ incoming.get_status_display }}</span>
+        <time datetime="{{ incoming.received_at|date:'c' }}" class="text-[11px] text-stone-400 ml-auto">{{ incoming.received_at|date:"N j, Y g:i A" }}</time>
+    </div>
+    {% if incoming.body %}<p class="text-[14px] text-stone-800 leading-relaxed whitespace-pre-wrap">{{ incoming.body }}</p>{% endif %}
+    {% include "inbox/partials/_attachment_cards.html" with message=incoming %}
+    <div class="flex justify-between gap-2 text-[10px] text-stone-500 mt-2">
+        <span>{% if incoming.assigned_to %}Assigned to {{ incoming.assigned_to.get_short_name|default:incoming.assigned_to.email }}{% else %}Unassigned{% endif %}</span>
+        {% if incoming.id == message.id %}<span>Selected message</span>{% else %}
+        <a href="{% url 'inbox:message_detail' workspace_id=workspace.id message_id=incoming.id %}"
+           hx-get="{% url 'inbox:message_detail' workspace_id=workspace.id message_id=incoming.id %}"
+           data-inbox-open-message="{{ incoming.id }}" hx-target="#inbox-detail-panel" hx-sync="#inbox-detail-panel:queue last" class="underline">Select this message</a>
+        {% endif %}
+    </div>
+</article>

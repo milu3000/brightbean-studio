@@ -558,6 +558,57 @@ class EngagementCardResponse(Schema):
     )
 
 
+class AccountAnalyticsStatusResponse(Schema):
+    """Evidence-backed analytics authorization, separate from connection status."""
+
+    needs_reconnect: bool = Field(..., description="True only when reliable account authorization evidence exists.")
+    verification_pending: bool = Field(
+        ...,
+        description="A legacy warning exists without verified account authorization evidence. Do not request reconnect.",
+    )
+    category: str = ""
+    checked_at: dt.datetime | None = Field(
+        None,
+        description="Latest relevant authorization failure time. An earlier unresolved account-scope cause may be retained.",
+    )
+    context: str = ""
+    evidence: dict[str, object] = Field(
+        default_factory=dict, description="Allowlisted diagnostic facts; never raw payloads."
+    )
+
+    @field_serializer("checked_at")
+    def _serialize_dt(self, value: dt.datetime | None) -> str | None:
+        return _serialize_utc_z(value)
+
+
+class PostAnalyticsStatusResponse(Schema):
+    """Read-only analytics availability, independent of the original publish status."""
+
+    availability: Literal["unknown", "available", "inaccessible", "archived", "deleted"]
+    label: str
+    source: Literal["", "platform", "user"] = ""
+    checked_at: dt.datetime | None = None
+    error_category: Literal[
+        "",
+        "account_auth",
+        "account_scope",
+        "post_inaccessible",
+        "post_archived",
+        "post_deleted",
+        "transient",
+        "unknown",
+    ] = ""
+    error_evidence: dict[str, object] = Field(
+        default_factory=dict, description="Allowlisted diagnostic facts; never credentials or raw platform payloads."
+    )
+    attempted_at: dt.datetime | None = Field(None, description="Latest analytics fetch attempt, successful or failed.")
+    version: int = Field(..., description="Version of the independently managed analytics status.")
+
+    @field_serializer("checked_at", "attempted_at")
+    def _serialize_dt(self, value: dt.datetime | None) -> str | None:
+        return _serialize_utc_z(value)
+
+
 class AccountAnalyticsResponse(Schema):
     """Channel-level analytics summary over a rolling window of days."""
 
@@ -571,6 +622,7 @@ class AccountAnalyticsResponse(Schema):
             "Disconnected accounts still return historical analytics, but new data may not be flowing."
         ),
     )
+    analytics_status: AccountAnalyticsStatusResponse
     days: int = Field(..., description="Window size (in days) used for derivation. One of 7, 30, or 90.")
     analytics_available: bool = Field(
         ...,
@@ -635,13 +687,18 @@ class PlatformPostAnalyticsResponse(Schema):
     platform_post_id: uuid.UUID
     social_account_id: uuid.UUID
     platform: str
-    status: str
+    status: str = Field(..., description="Original publish status; not changed by analytics availability failures.")
     published_at: dt.datetime | None
+    analytics_status: PostAnalyticsStatusResponse
+    account_status: AccountAnalyticsStatusResponse = Field(
+        ..., description="Account authorization verdict; a failed grant is not a post visibility verdict."
+    )
     analytics_available: bool = Field(
         ...,
         description=(
             "``false`` for platforms without analytics. ``true`` for everything else — including "
-            "drafts and scheduled posts, which simply return empty metric tiles until publish."
+            "drafts and scheduled posts, which simply return empty metric tiles until publish. "
+            "This is platform capability, not fetch success; inspect analytics_status for post availability."
         ),
     )
     unavailable_reason: str | None = None
@@ -651,7 +708,7 @@ class PlatformPostAnalyticsResponse(Schema):
     )
     captured_at: dt.datetime | None = Field(
         None,
-        description="Most recent ``captured_at`` across this platform-post's snapshots.",
+        description="Most recent saved snapshot time. A failed refresh does not make these historical values current.",
     )
     next_sync_eta: dt.datetime | None = Field(
         None,
@@ -700,6 +757,9 @@ class InboxReplyResponse(Schema):
     status: str
     body: str
     author_email: str = ""
+    follow_up_reply_id: uuid.UUID | None = None
+    is_follow_up: bool = False
+    not_sent_verified: bool = False
     platform_reply_id: str = ""
     send_error: str = ""
     created_at: dt.datetime
@@ -718,6 +778,9 @@ class InboxReplyResponse(Schema):
             inbox_message_id=reply.inbox_message_id,
             status=reply.status,
             body=reply.body,
+            follow_up_reply_id=getattr(reply, "follow_up_of_id", None),
+            is_follow_up=getattr(reply, "is_follow_up", False),
+            not_sent_verified=getattr(reply, "not_sent_verified", False),
             author_email=(getattr(author, "email", "") or ""),
             platform_reply_id=reply.platform_reply_id or "",
             send_error=reply.send_error or "",
@@ -740,6 +803,25 @@ class AttachmentResponse(Schema):
     title: str = ""
     preview_url: str = Field("", description="Safe Meta-hosted image preview URL, if supplied. May expire.")
     availability: Literal["available", "unavailable"] = "unavailable"
+    availability_reason: Literal[
+        "link_provided",
+        "missing_url",
+        "unsafe_url",
+        "preview_only",
+        "unsupported",
+        "removed",
+        "fields_unavailable",
+        "invalid_metadata",
+        "size_limited",
+    ] = "missing_url"
+
+
+class InboxReplyEligibilityResponse(Schema):
+    allowed: bool
+    code: str
+    reason: str
+    existing_reply_id: uuid.UUID | None = None
+    requires_current_authorization: bool = True
 
 
 class InboxMessageResponse(Schema):
@@ -750,6 +832,9 @@ class InboxMessageResponse(Schema):
     social_account_id: uuid.UUID
     platform: str
     message_type: str
+    conversation_type: Literal["", "unknown", "direct", "group"] = "unknown"
+    classification_reason: str = ""
+    type_display: str = ""
     status: str
     sentiment: str
     sender_name: str
@@ -757,18 +842,29 @@ class InboxMessageResponse(Schema):
     body: str
     content_type: Literal["text", "attachment", "mixed", "unknown"] = "unknown"
     content_preview: str = Field("", description="Message text or a truthful label for non-text content.")
+    content_status: Literal[
+        "removed", "partial", "unsupported", "fields_unavailable", "link_provided", "unavailable", "text", "no_metadata"
+    ] = "no_metadata"
     attachments: list[AttachmentResponse] = Field(default_factory=list)
     related_post_id: uuid.UUID | None = None
     received_at: dt.datetime
     created_at: dt.datetime
     replies: list[InboxReplyResponse] = Field(default_factory=list)
+    reply_eligibility: InboxReplyEligibilityResponse | None = Field(
+        None, description="Read-only message eligibility; sending always rechecks current permission and state."
+    )
 
     @field_serializer("received_at", "created_at")
     def _serialize_dt(self, value: dt.datetime | None) -> str | None:
         return _serialize_utc_z(value)
 
     @classmethod
-    def from_message(cls, message, *, include_replies: bool = False) -> InboxMessageResponse:
+    def from_message(
+        cls, message, *, include_replies: bool = False, include_eligibility: bool = False
+    ) -> InboxMessageResponse:
+        from apps.inbox.services import reply_send_availability
+        from providers.meta_inbox_content import message_content_status
+
         replies: list[InboxReplyResponse] = []
         if include_replies:
             if "replies" in getattr(message, "_prefetched_objects_cache", {}):
@@ -782,6 +878,9 @@ class InboxMessageResponse(Schema):
             social_account_id=message.social_account_id,
             platform=message.social_account.platform,
             message_type=message.message_type,
+            conversation_type=message.conversation_type,
+            classification_reason=message.classification_reason,
+            type_display=message.type_display,
             status=message.status,
             sentiment=message.sentiment,
             sender_name=message.sender_name,
@@ -789,12 +888,35 @@ class InboxMessageResponse(Schema):
             body=message.body or "",
             content_type=message.content_type,
             content_preview=message.content_preview,
+            content_status=message_content_status(message.extra, message.body or ""),
             attachments=message.attachments,
             related_post_id=message.related_post_id,
             received_at=message.received_at,
             created_at=message.created_at,
             replies=replies,
+            reply_eligibility=reply_send_availability(message) if include_eligibility else None,
         )
+
+
+class StoredThreadMessageResponse(InboxMessageResponse):
+    body_truncated: bool = False
+    attachment_metadata_count: int = 0
+    attachments_truncated: bool = False
+    reply_count: int = 0
+    replies_truncated: bool = False
+    detail_tool: str = "get_inbox_message"
+
+
+class InboxThreadResponse(Schema):
+    anchor_message_id: uuid.UUID
+    latest_message_id: uuid.UUID | None
+    grouping: Literal["native_conversation", "single_message"]
+    messages: list[StoredThreadMessageResponse]
+    limit: int
+    next_cursor: str | None = None
+    history_complete: bool = False
+    outbound_coverage: str = "brightbean_replies_only"
+    response_truncated: bool = False
 
 
 class InboxMessagesListResponse(Schema):
@@ -804,6 +926,10 @@ class InboxMessagesListResponse(Schema):
 
 
 class CreateReplyRequest(Schema):
+    follow_up_reply_id: uuid.UUID | None = Field(
+        None,
+        description="Explicit sent receipt to follow with another reply to the same incoming message. Never use for a retry.",
+    )
     body: str = Field(..., min_length=1, max_length=10_000, description="The reply text.")
     idempotency_key: str | None = Field(
         None,

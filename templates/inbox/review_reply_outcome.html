@@ -1,0 +1,118 @@
+{% extends "base.html" %}
+
+{% block title %}Review Delivery Outcome - {{ workspace.name }} - BrightBean{% endblock %}
+
+{% block content %}
+<div class="max-w-2xl mx-auto space-y-5">
+    <div>
+        <a href="{% url 'inbox:message_detail' workspace_id=workspace.id message_id=message.id %}" class="text-sm text-stone-500 underline">Back to the conversation</a>
+        <h1 class="text-xl font-semibold text-stone-900 mt-3">Review delivery outcome</h1>
+        <p class="text-sm text-stone-600 mt-2">Check the original platform before recording a result. Recording a result saves your manual finding and does not send or retry a message. The separate lookup below can help you find a receipt; you must still verify the outcome yourself.</p>
+    </div>
+
+    <section class="border border-stone-200 rounded-xl bg-white p-5 space-y-3" aria-label="Reply being reviewed">
+        <div class="text-sm text-stone-600">
+            <p>{{ message.social_account.get_platform_display }} · {{ message.social_account.account_name|default:message.social_account.account_handle }}</p>
+            <p>Reply to {{ message.sender_name }} · incoming {{ message.received_at|date:"N j, Y g:i A" }}</p>
+        </div>
+        <div class="bg-stone-50 rounded-lg p-3">
+            <p class="text-[11px] font-semibold text-stone-500 mb-1">Original incoming message</p>
+            {% if message.body %}<p class="text-sm text-stone-700 whitespace-pre-wrap">{{ message.body }}</p>{% endif %}
+            {% include "inbox/partials/_attachment_cards.html" %}
+        </div>
+        <div>
+            <p class="text-[11px] font-semibold text-stone-500 mb-1">Reply to verify · {{ reply.get_status_display }}</p>
+            <p class="text-sm text-stone-900 whitespace-pre-wrap">{{ reply.body }}</p>
+            <p class="text-[11px] text-stone-500 mt-2">Saved {{ reply.created_at|date:"N j, Y g:i A" }} · last updated {{ reply.updated_at|date:"N j, Y g:i A" }}</p>
+        </div>
+    </section>
+
+    {% if review_errors %}
+    <div role="alert" class="border border-red-200 bg-red-50 rounded-xl p-4 text-sm text-red-800">
+        {% for error in review_errors %}<p class="mb-1">{{ error }}</p>{% endfor %}
+        <a href="{% url 'inbox:review_reply_outcome' workspace_id=workspace.id reply_id=reply.id %}" class="underline font-medium">Reload the current reply and review again</a>
+    </div>
+    {% endif %}
+
+    {% if can_lookup %}
+    <section class="border border-stone-200 bg-white rounded-xl p-5 space-y-3" aria-label="Read-only platform receipt lookup">
+        <h2 class="text-sm font-semibold text-stone-900">Look up a possible receipt</h2>
+        <p class="text-[12px] text-stone-600">Check one page of the original platform conversation for possible matching receipt IDs and times. This does not change the recorded delivery outcome.</p>
+        <form method="post">
+            {% csrf_token %}
+            <input type="hidden" name="action" value="lookup">
+            <input type="hidden" name="expected_updated_at" value="{{ values.expected_updated_at }}">
+            <input type="hidden" name="expected_send_generation" value="{{ values.expected_send_generation }}">
+            <button type="submit" class="px-4 py-2 rounded-full border border-stone-300 text-sm font-medium text-stone-700">Look up platform receipt</button>
+        </form>
+        {% if lookup_result != None %}
+        <div role="status" class="border-t border-stone-100 pt-3">
+            {% if lookup_result.candidates %}
+            <p class="text-sm text-stone-700 mb-2">Possible matching receipts are listed below. Check the message and time on the original platform before recording a result.</p>
+            <ul class="space-y-2 text-[12px] text-stone-700">
+                {% for candidate in lookup_result.candidates %}
+                <li class="bg-stone-50 rounded-lg p-3 break-words">
+                    <p>Platform message ID: {{ candidate.platform_reply_id }}</p>
+                    <p>Sent time: {% if candidate.sent_at %}{{ candidate.sent_at }}{% else %}Unavailable; check the original platform{% endif %}</p>
+                </li>
+                {% endfor %}
+            </ul>
+            {% else %}
+            <p class="text-sm text-amber-800">This lookup could not confirm whether the reply was sent. A missing result is not proof of non-delivery. Keep the outcome unknown unless you have other reliable evidence.</p>
+            {% endif %}
+            {% if lookup_result.more_available %}<p class="text-[11px] text-stone-500 mt-2">More messages may be available on the original platform. No additional page was loaded.</p>{% endif %}
+            {% if lookup_result.checked_at %}<p class="text-[11px] text-stone-500 mt-2">Checked {{ lookup_result.checked_at|date:"N j, Y g:i A T" }}</p>{% endif %}
+        </div>
+        {% endif %}
+    </section>
+    {% endif %}
+
+    {% if availability.allowed %}
+    <form method="post" class="border border-stone-200 bg-white rounded-xl p-5 space-y-5"
+          x-data="{ outcome: '{{ values.outcome|escapejs }}' }">
+        {% csrf_token %}
+        <input type="hidden" name="action" value="reconcile">
+        <input type="hidden" name="expected_updated_at" value="{{ values.expected_updated_at }}">
+        <input type="hidden" name="expected_send_generation" value="{{ values.expected_send_generation }}">
+        <fieldset>
+            <legend class="text-sm font-semibold text-stone-900 mb-3">What did you verify on the original platform?</legend>
+            <label class="flex items-start gap-2 text-sm text-stone-700 mb-3">
+                <input type="radio" name="outcome" value="sent" required x-model="outcome" {% if values.outcome == 'sent' %}checked{% endif %}>
+                <span>This reply was sent. I found the matching message and its platform message ID.</span>
+            </label>
+            <label class="flex items-start gap-2 text-sm text-stone-700">
+                <input type="radio" name="outcome" value="not_sent" required x-model="outcome" {% if values.outcome == 'not_sent' %}checked{% endif %}>
+                <span>This reply was not sent. I have positive confirmation that it was not delivered.</span>
+            </label>
+        </fieldset>
+        <p class="text-sm text-amber-800 bg-amber-50 rounded-lg p-3">Not finding a message in an inbox or search is not proof that it was not sent. If you are uncertain, return to the conversation and keep its outcome unknown.</p>
+
+        <fieldset x-show="outcome === 'sent'" x-cloak class="space-y-3">
+            <legend class="text-sm font-semibold text-stone-800">Verified sent receipt</legend>
+            <div>
+                <label for="review-platform-id" class="block text-sm text-stone-700 mb-1">Platform message ID</label>
+                <input id="review-platform-id" name="platform_reply_id" type="text" maxlength="255" value="{{ values.platform_reply_id }}"
+                       :required="outcome === 'sent'" :disabled="outcome !== 'sent'" class="form-input w-full" autocomplete="off">
+            </div>
+            <div>
+                <label for="review-sent-at" class="block text-sm text-stone-700 mb-1">Sent time, including timezone</label>
+                <input id="review-sent-at" name="sent_at" type="text" value="{{ values.sent_at }}" placeholder="2026-10-06T15:30:00+08:00"
+                       :required="outcome === 'sent'" :disabled="outcome !== 'sent'" aria-describedby="review-time-help" class="form-input w-full" autocomplete="off">
+                <p id="review-time-help" class="text-[11px] text-stone-500 mt-1">Use the time shown on the platform with its timezone, for example +08:00 or Z for UTC.</p>
+            </div>
+        </fieldset>
+
+        <label class="flex items-start gap-2 text-sm text-stone-800">
+            <input type="checkbox" name="confirmed" value="yes" required {% if values.confirmed %}checked{% endif %}>
+            <span>I personally checked the original platform and verified the selected outcome. For “not sent”, I confirmed it was not sent; an absent search result is not enough.</span>
+        </label>
+        <p class="text-[12px] text-stone-500">Your identity, review time and recorded outcome will be added to the conversation's internal notes.</p>
+        <button type="submit" class="px-4 py-2 rounded-full text-sm font-semibold text-white" style="background: var(--primary);">Record verified result</button>
+    </form>
+    {% else %}
+    <p role="status" class="border border-amber-200 bg-amber-50 rounded-xl p-4 text-sm text-amber-900">{{ availability.reason }}</p>
+    {% endif %}
+
+    <a href="{% url 'inbox:message_detail' workspace_id=workspace.id message_id=message.id %}" class="inline-flex text-sm font-medium text-stone-600 underline">Keep the current outcome and return</a>
+</div>
+{% endblock %}

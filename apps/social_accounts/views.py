@@ -14,6 +14,8 @@ from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.core import signing
 from django.core.exceptions import PermissionDenied
+from django.db import transaction
+from django.http import HttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.utils import timezone
 from django.views.decorators.http import require_GET, require_POST
@@ -838,9 +840,23 @@ def _render_account_card(request, account, workspace_id):
 @login_required
 @require_permission("manage_social_accounts")
 @require_POST
+@transaction.atomic
 def disconnect(request, workspace_id, account_id):
     """Disconnect a social account."""
-    account = get_object_or_404(SocialAccount.objects.for_workspace(workspace_id), id=account_id)
+    account = get_object_or_404(SocialAccount.objects.for_workspace(workspace_id).select_for_update(), id=account_id)
+    from apps.inbox.models import DMSendControl
+
+    if DMSendControl.objects.filter(social_account=account).exists():
+        return HttpResponse(
+            "This account has a persisted DM send control. Disconnect requires a controlled process "
+            "that preserves its send history and unresolved attempts.",
+            status=409,
+        )
+
+    from apps.inbox.receipt_retention import UNRESOLVED_HISTORY, has_unresolved_replies
+
+    if has_unresolved_replies(account.pk):
+        return HttpResponse(UNRESOLVED_HISTORY, status=409)
 
     # Stop the platform pushing us this account's activity before we drop the
     # token that would let us unsubscribe.
@@ -1008,6 +1024,11 @@ def _create_or_update_account(
             "last_error": "",
             # Fresh OAuth grant invalidates any prior analytics-scope failure.
             "analytics_needs_reconnect": False,
+            "analytics_reconnect_reason": "",
+            "analytics_reconnect_context": "",
+            "analytics_reconnect_checked_at": None,
+            "analytics_reconnect_evidence": {},
+            "analytics_auth_updated_at": timezone.now(),
             # Likewise the webhook verdict: the subscription is about to be
             # retried below, and subscribe_account_webhooks returns early
             # without recording when the provider has no webhooks at all — so

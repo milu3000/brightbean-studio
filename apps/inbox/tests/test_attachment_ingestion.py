@@ -92,8 +92,7 @@ def test_explicit_deleted_content_stays_unavailable_after_poll(inbox_account):
         InboxSyncEngine()._upsert_message(inbox_account, _poll(now, text="Stale copy"))
     message = InboxMessage.objects.get()
     assert message.body == ""
-    assert message.attachments[0]["availability"] == "unavailable"
-    assert message.attachments[0]["url"] == ""
+    assert message.attachments == [] and message.content_status == "removed"
     enqueue.assert_called_once()
 
 
@@ -119,7 +118,6 @@ def test_unknown_deletion_is_silent_tombstone_and_cannot_resurrect(inbox_account
     assert message.status == "archived"
     assert message.received_at == UNKNOWN_MESSAGE_TIMESTAMP
     assert message.body == ""
-    assert message.attachments[0]["availability"] == "unavailable"
-    assert message.attachments[0]["url"] == ""
+    assert message.attachments == [] and message.content_status == "removed"
     notify.assert_not_called()
     enqueue.assert_not_called()

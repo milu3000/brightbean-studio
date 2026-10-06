@@ -7,6 +7,7 @@ from . import views
 app_name = "inbox"
 
 urlpatterns = [
+    path("accounts/<uuid:account_id>/dm-send-status/", views.dm_send_gate_status, name="dm_send_status"),
     # Main inbox feed
     path("", views.inbox_feed, name="feed"),
     # Message detail + thread
@@ -15,8 +16,10 @@ urlpatterns = [
     path("<uuid:message_id>/reply/", views.send_reply, name="send_reply"),
     # Draft replies
     path("<uuid:message_id>/reply/draft/", views.save_reply_draft, name="save_reply_draft"),
+    path("replies/<uuid:reply_id>/edit/", views.update_reply_draft, name="update_reply_draft"),
     path("replies/<uuid:reply_id>/send/", views.send_reply_draft, name="send_reply_draft"),
     path("replies/<uuid:reply_id>/discard/", views.discard_reply_draft, name="discard_reply_draft"),
+    path("replies/<uuid:reply_id>/review-delivery/", views.review_reply_outcome, name="review_reply_outcome"),
     # Internal notes
     path("<uuid:message_id>/note/", views.add_note, name="add_note"),
     # Assignment
