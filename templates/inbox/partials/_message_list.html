@@ -1,8 +1,29 @@
 {% load humanize %}
-{% if inbox_messages %}
+<div data-inbox-results data-current-view="{{ current_view|default:'all' }}">
+{% if inbox_rows %}
+{% for row in inbox_rows %}
+{% include "inbox/partials/_message_row.html" with message=row.message inbox_row=row %}
+{% endfor %}
+{% elif inbox_messages %}
 {% for msg in inbox_messages %}
 {% include "inbox/partials/_message_row.html" with message=msg %}
 {% endfor %}
 {% else %}
 {% include "inbox/partials/_empty_state.html" %}
 {% endif %}
+{% if inbox_page.paginator.num_pages > 1 %}
+<nav class="flex items-center justify-between gap-3 px-4 py-3 border-t border-stone-200 text-[12px]" aria-label="Inbox pages">
+    {% if inbox_page.has_previous %}
+    <a href="?{{ list_query }}&amp;page={{ inbox_page.previous_page_number }}"
+       hx-get="{% url 'inbox:feed' workspace_id=workspace.id %}?{{ list_query }}&amp;page={{ inbox_page.previous_page_number }}"
+       hx-target="#inbox-message-list" hx-push-url="true" class="underline">Previous</a>
+    {% endif %}
+    <span>Page {{ inbox_page.number }} of {{ inbox_page.paginator.num_pages }}</span>
+    {% if inbox_page.has_next %}
+    <a href="?{{ list_query }}&amp;page={{ inbox_page.next_page_number }}"
+       hx-get="{% url 'inbox:feed' workspace_id=workspace.id %}?{{ list_query }}&amp;page={{ inbox_page.next_page_number }}"
+       hx-target="#inbox-message-list" hx-push-url="true" class="underline">Next</a>
+    {% endif %}
+</nav>
+{% endif %}
+</div>

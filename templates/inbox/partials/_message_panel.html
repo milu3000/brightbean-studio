@@ -1,6 +1,15 @@
 {% load humanize %}
-<div class="flex flex-col h-full">
-    {% if dm_gate_reason %}<p role="alert" class="px-5 py-3 text-sm text-red-700">{{ dm_gate_reason }}</p>{% endif %}
+<div class="flex flex-col h-full" data-inbox-panel data-selected-message-id="{{ message.id }}">
+    <a href="{% url 'inbox:feed' workspace_id=workspace.id %}"
+       @click="if (typeof activePanel !== 'undefined') { $event.preventDefault(); activePanel = 'list'; }"
+       class="md:hidden px-5 py-2 text-sm text-stone-600 border-b border-stone-100">Back to inbox</a>
+    {% if dm_gate_reason %}<p role="alert" class="px-5 py-3 text-sm text-red-700">{% if reply_error_title %}<strong>{{ reply_error_title }}.</strong> {% endif %}{{ dm_gate_reason }}</p>{% endif %}
+    {% if unsaved_draft_body %}
+    <details open class="px-5 py-3 border-b border-amber-200 text-[12px] text-amber-900">
+        <summary>Your draft edits were not saved. Copy this text before leaving.</summary>
+        <p class="whitespace-pre-wrap mt-2">{{ unsaved_draft_body }}</p>
+    </details>
+    {% endif %}
     <!-- Message header -->
     <div class="px-5 py-4 border-b border-stone-100 flex-shrink-0">
         <div class="flex items-start justify-between gap-4">
@@ -14,7 +23,7 @@
                 {% endif %}
                 <div class="min-w-0">
                     <div class="flex items-center gap-2">
-                        <span class="text-sm font-semibold text-stone-900">{{ message.sender_name }}</span>
+                        <h2 class="text-sm font-semibold text-stone-900">{% if conversation_view %}{{ message.type_display }} · {% endif %}{{ message.sender_name }}</h2>
                         {% if message.sender_handle %}
                         <span class="text-[12px] text-stone-400">@{{ message.sender_handle }}</span>
                         {% endif %}
@@ -56,10 +65,19 @@
                 {% include "inbox/partials/_assignment_dropdown.html" %}
             </div>
         </div>
+        {% if conversation_view %}
+        <p class="text-[11px] text-stone-500 mt-2">{{ stored_message_count }} stored incoming message{{ stored_message_count|pluralize }}. Status and assignment above apply only to the selected message from {{ message.received_at|date:"N j, Y g:i A" }}.</p>
+        {% if not has_native_thread %}<p class="text-[11px] text-stone-500 mt-1">The conversation could not be matched reliably, so this message is shown on its own.</p>{% endif %}
+        {% endif %}
     </div>
 
     <!-- Message body + thread -->
     <div class="flex-1 overflow-y-auto px-5 py-4">
+        {% if conversation_view %}
+        <div id="inbox-thread" class="space-y-3" aria-label="Conversation history" aria-live="polite">
+            {% include "inbox/partials/_conversation_timeline.html" %}
+        </div>
+        {% else %}
         <!-- Original message -->
         <div class="bg-stone-50 rounded-xl p-4 mb-4 border border-stone-100">
             <div class="flex items-center gap-2 mb-2">
@@ -99,6 +117,7 @@
             {% include "inbox/partials/_attachment_cards.html" with message=child %}
         </div>
         {% endfor %}
+        {% endif %}
     </div>
 
     <!-- Reply composer (pinned to bottom) -->

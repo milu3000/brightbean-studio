@@ -1,0 +1,32 @@
+{% if selected_outside_history %}
+<aside class="mb-4" aria-label="Selected message outside this history page">
+    <p class="text-[11px] font-semibold text-stone-600 mb-2">Selected message · outside this history page</p>
+    {% include "inbox/partials/_incoming_item.html" with incoming=message %}
+</aside>
+{% endif %}
+{% if history_page.paginator.num_pages > 1 %}
+<nav class="flex items-center justify-between gap-3 text-[12px] mb-3" aria-label="Conversation history pages">
+    {% if history_page.has_next %}
+    <a href="{% url 'inbox:message_detail' workspace_id=workspace.id message_id=message.id %}?history_page={{ history_page.next_page_number }}"
+       hx-get="{% url 'inbox:message_detail' workspace_id=workspace.id message_id=message.id %}?history_page={{ history_page.next_page_number }}"
+       hx-target="#inbox-thread" hx-sync="#inbox-detail-panel:queue last" class="underline">Older messages</a>
+    {% endif %}
+    <span>{{ history_page.start_index }}–{{ history_page.end_index }} of {{ history_page.paginator.count }} stored events, newest first by page</span>
+    {% if history_page.has_previous %}
+    <a href="{% url 'inbox:message_detail' workspace_id=workspace.id message_id=message.id %}?history_page={{ history_page.previous_page_number }}"
+       hx-get="{% url 'inbox:message_detail' workspace_id=workspace.id message_id=message.id %}?history_page={{ history_page.previous_page_number }}"
+       hx-target="#inbox-thread" hx-sync="#inbox-detail-panel:queue last" class="underline">Newer messages</a>
+    {% endif %}
+</nav>
+{% endif %}
+{% for item_type, item, timestamp in thread %}
+{% ifchanged timestamp.date %}<p class="text-[11px] text-stone-500 text-center py-2">{{ timestamp|date:"l, N j, Y" }}</p>{% endifchanged %}
+{% if item_type == "incoming" %}
+{% include "inbox/partials/_incoming_item.html" with incoming=item %}
+{% elif item_type == "reply" %}
+{% include "inbox/partials/_reply_item.html" with reply=item %}
+{% elif item_type == "note" %}
+{% include "inbox/partials/_note_item.html" with note=item %}
+{% endif %}
+{% endfor %}
+<p class="text-[10px] text-stone-400 pt-3">This history contains messages already saved in BrightBean. Earlier or external activity may be missing.</p>

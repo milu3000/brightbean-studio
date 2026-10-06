@@ -1,11 +1,12 @@
 {% load humanize %}
+{% with reply_target=reply_target|default:message %}
 <!-- Reply composer -->
 <div class="border-t border-stone-200 px-5 py-3 flex-shrink-0" style="background: var(--surface-1);"
-     x-data="{ mode: 'reply', noteText: '', replyText: '' }">
+     x-data="{ mode: 'reply', noteText: '', replyText: '{{ composer_body|default:''|escapejs }}' }">
 
     <!-- Pending draft replies (agent-created or saved for later) -->
     {% if draft_replies %}
-    <div class="space-y-2 mb-3">
+    <div class="space-y-2 mb-3 max-h-64 overflow-y-auto" aria-label="Pending replies">
         <p class="text-[10px] font-semibold uppercase tracking-wide text-stone-400">Pending replies</p>
         {% for draft in draft_replies %}
         {% include "inbox/partials/_draft_reply_item.html" with draft=draft %}
@@ -18,7 +19,7 @@
         <button @click="mode = 'reply'"
                 class="text-[12px] font-semibold px-3 py-1 rounded-full transition-all"
                 :class="mode === 'reply' ? 'bg-white text-stone-900 shadow-sm border border-stone-200' : 'text-stone-500 hover:text-stone-700'">
-            Reply
+            {% if follow_up_reply_id %}Additional reply{% else %}Reply{% endif %}
         </button>
         <button @click="mode = 'note'"
                 class="text-[12px] font-semibold px-3 py-1 rounded-full transition-all"
@@ -50,12 +51,35 @@
 
     <!-- Reply form -->
     <div x-show="mode === 'reply'" x-transition>
-        <form hx-post="{% url 'inbox:send_reply' workspace_id=workspace.id message_id=message.id %}"
-              hx-target="#inbox-thread"
-              hx-swap="beforeend"
-              @htmx:after-request="if (!$event.detail.xhr.getResponseHeader('HX-Reply-Failed')) replyText = ''">
+        {% if follow_up_reply_id %}
+        <div class="rounded-lg border border-orange-200 bg-orange-50 px-3 py-2 mb-2" data-follow-up-parent-id="{{ follow_up_reply_id }}">
+            <div class="flex items-center justify-between gap-3">
+                <p class="text-[12px] font-semibold text-stone-800">Additional reply</p>
+                <a href="{% url 'inbox:message_detail' workspace_id=workspace.id message_id=reply_target.id %}"
+                   hx-get="{% url 'inbox:message_detail' workspace_id=workspace.id message_id=reply_target.id %}"
+                   hx-target="#inbox-detail-panel" hx-sync="#inbox-detail-panel:queue last"
+                   data-inbox-open-message="{{ reply_target.id }}" class="text-[11px] underline">Cancel additional reply</a>
+            </div>
+            {% if follow_up_parent %}<p class="text-[11px] text-stone-600 mt-1">After your sent reply from {{ follow_up_parent.sent_at|date:"N j, Y g:i A" }}: {{ follow_up_parent.body|truncatewords:20 }}</p>{% endif %}
+            <p class="text-[10px] text-stone-500 mt-1">This sends a new message after the selected reply.</p>
+        </div>
+        {% endif %}
+        {% if conversation_view or follow_up_reply_id %}
+        <p class="text-[11px] text-stone-600 mb-1" data-reply-target-id="{{ reply_target.id }}">Reply target: {{ reply_target.sender_name }} · {{ reply_target.received_at|date:"N j, Y g:i A" }} · {{ reply_target.content_preview|truncatewords:16 }}</p>
+        <p class="text-[10px] text-stone-500 mb-2">This reply stays attached to that message. Refresh to review newer incoming messages.</p>
+        {% endif %}
+        {% if send_availability and not send_availability.allowed %}
+        <p id="reply-hold-reason" role="status" class="text-[12px] text-amber-800 mb-2">{{ send_availability.reason }}</p>
+        {% endif %}
+        <form hx-post="{% url 'inbox:send_reply' workspace_id=workspace.id message_id=reply_target.id %}"
+              hx-target="#inbox-detail-panel" hx-swap="innerHTML" hx-disabled-elt="find button"
+              hx-sync="#inbox-detail-panel:drop">
             {% csrf_token %}
+            <input type="hidden" name="panel_message_id" value="{{ message.id }}">
+            {% if follow_up_reply_id %}<input type="hidden" name="follow_up_reply_id" value="{{ follow_up_reply_id }}">{% endif %}
+            <label for="inbox-reply-body" class="sr-only">Reply text</label>
             <textarea name="body"
+                      id="inbox-reply-body"
                       x-model="replyText"
                       placeholder="Write a reply..."
                       rows="2"
@@ -65,18 +89,19 @@
                 <p class="text-[10px] text-stone-400">Reply will be posted on {{ message.social_account.get_platform_display|default:message.social_account.platform|title }}</p>
                 <div class="flex items-center gap-2">
                     <button type="button"
-                            hx-post="{% url 'inbox:save_reply_draft' workspace_id=workspace.id message_id=message.id %}"
+                            hx-post="{% url 'inbox:save_reply_draft' workspace_id=workspace.id message_id=reply_target.id %}"
                             hx-target="#inbox-detail-panel"
                             hx-swap="innerHTML"
-                            :disabled="!replyText.trim()"
+                            {% if can_save_draft == False %}disabled{% else %}:disabled="!replyText.trim()"{% endif %}
                             class="inline-flex items-center gap-1.5 px-4 py-1.5 text-[12px] font-semibold text-stone-600 rounded-full border border-stone-200 hover:bg-stone-50 transition-all duration-150 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed">
                         Save as draft
                     </button>
                     <button type="submit"
+                            {% if send_availability and not send_availability.allowed %}disabled aria-describedby="reply-hold-reason"{% endif %}
                             class="btn-primary-hover inline-flex items-center gap-1.5 px-4 py-1.5 text-[12px] font-semibold text-white rounded-full transition-all duration-150 cursor-pointer"
-                            style="background: var(--primary); box-shadow: var(--shadow-primary);">
+                            style="background: var(--primary); box-shadow: var(--shadow-primary);" {% if send_availability and not send_availability.allowed %}aria-disabled="true"{% endif %}>
                         <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
-                        Send Reply
+                        {% if follow_up_reply_id %}Send additional reply{% else %}Send Reply{% endif %}
                     </button>
                 </div>
             </div>
@@ -86,11 +111,12 @@
     <!-- Note form -->
     <div x-show="mode === 'note'" x-transition>
         <form hx-post="{% url 'inbox:add_note' workspace_id=workspace.id message_id=message.id %}"
-              hx-target="#inbox-thread"
-              hx-swap="beforeend"
-              @htmx:after-request="noteText = ''">
+              hx-target="#inbox-detail-panel" hx-swap="innerHTML" hx-disabled-elt="find button"
+              hx-sync="#inbox-detail-panel:drop">
             {% csrf_token %}
+            <label for="inbox-note-body" class="sr-only">Internal note for the selected message</label>
             <textarea name="body"
+                      id="inbox-note-body"
                       x-model="noteText"
                       placeholder="Add an internal note (only visible to your team)..."
                       rows="2"
@@ -106,3 +132,4 @@
         </form>
     </div>
 </div>
+{% endwith %}

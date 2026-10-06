@@ -1,5 +1,10 @@
 # V2 dispatch ownership and current-actor send bridge
 
+For the subsequent single-inbox release over already-stored messages, see
+[unified release and recovery](UNIFIED_INBOX_RELEASE.md). Its read projection and
+ordinary send safety do not require enabling this optional capture/ownership
+bridge. Existing enrolled ownership continues to be enforced.
+
 This change is stacked on the DM send gate in PR #11. It does not include the
 synthetic dispatcher from PR #9 or the isolated timeline preview from PR #10.
 The new code is an actual request-driven bridge to the existing Facebook and

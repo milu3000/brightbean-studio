@@ -42,6 +42,7 @@
         cursor: pointer; transition: background var(--dur-fast) ease;
         position: relative;
     }
+    [data-inbox-panel] button:disabled { opacity: .45; cursor: not-allowed; }
     .inbox-row:hover { background: var(--surface-1); }
     .inbox-row.is-active { background: var(--primary-soft); border-left: 3px solid var(--primary); padding-left: 13px; }
     .inbox-row.is-unread .inbox-row-sender { font-weight: 700; color: var(--text-primary); }
@@ -123,7 +124,8 @@
 {% endblock %}
 
 {% block content %}
-<div class="inbox-shell" x-data="inboxController()">
+<div class="inbox-shell" x-data="inboxController()" @inbox-select.window="selectMessage($event.detail.messageId)"
+     @inbox-refresh.window="refreshList()" @inbox-list-changed.window="closeBulk()">
 
     <!-- Header -->
     <div class="flex flex-wrap items-center justify-between gap-2 px-3 sm:px-5 py-3 border-b border-stone-200 flex-shrink-0">
@@ -131,23 +133,11 @@
             <h1 class="text-base font-semibold text-stone-900" style="letter-spacing: -0.01em;">Inbox</h1>
             <div class="flex items-center gap-1 bg-stone-50 rounded-full p-0.5">
                 <a href="{% url 'inbox:feed' workspace_id=workspace.id %}"
-                   class="inbox-tab {% if current_view == 'all' %}active{% endif %}"
-                   hx-get="{% url 'inbox:feed' workspace_id=workspace.id %}?view=all"
-                   hx-target="#inbox-message-list"
-                   hx-swap="innerHTML"
-                   hx-push-url="true">All</a>
+                   class="inbox-tab {% if current_view == 'all' %}active{% endif %}">All</a>
                 <a href="{% url 'inbox:feed' workspace_id=workspace.id %}?view=mine"
-                   class="inbox-tab {% if current_view == 'mine' %}active{% endif %}"
-                   hx-get="{% url 'inbox:feed' workspace_id=workspace.id %}?view=mine"
-                   hx-target="#inbox-message-list"
-                   hx-swap="innerHTML"
-                   hx-push-url="true">My Queue</a>
+                   class="inbox-tab {% if current_view == 'mine' %}active{% endif %}">My Queue</a>
                 <a href="{% url 'inbox:feed' workspace_id=workspace.id %}?view=unassigned"
-                   class="inbox-tab {% if current_view == 'unassigned' %}active{% endif %}"
-                   hx-get="{% url 'inbox:feed' workspace_id=workspace.id %}?view=unassigned"
-                   hx-target="#inbox-message-list"
-                   hx-swap="innerHTML"
-                   hx-push-url="true">Unassigned</a>
+                   class="inbox-tab {% if current_view == 'unassigned' %}active{% endif %}">Unassigned</a>
             </div>
         </div>
         <div class="flex items-center gap-2">
@@ -178,13 +168,13 @@
             {% include "inbox/partials/_filter_bar.html" %}
 
             <!-- Message list (HTMX target) -->
-            <div class="flex-1 overflow-y-auto" id="inbox-message-list">
+            <div class="flex-1 overflow-y-auto" id="inbox-message-list" aria-label="Inbox messages" hx-sync="#inbox-message-list:queue last">
                 {% include "inbox/partials/_message_list.html" %}
             </div>
 
             <!-- Bulk action bar -->
             <div x-show="selectedCount > 0" x-cloak class="bulk-bar">
-                <span x-text="selectedCount + ' selected'"></span>
+                <span x-text="selectedCount + ' messages selected'"></span>
                 <button @click="bulkAction('mark_read')">Mark Read</button>
                 <button @click="bulkAction('resolve')">Resolve</button>
                 <button @click="bulkAction('archive')">Archive</button>
@@ -218,10 +208,12 @@
 
 {% block extra_js %}
 <script src="{% static 'js/inbox-media.js' %}" defer></script>
+<script src="{% static 'js/inbox-navigation.js' %}" defer></script>
 <script nonce="{{ request.csp_nonce }}">
 function inboxController() {
     return {
         activePanel: 'list',
+        activeMessageId: '',
         selected: new Set(),
         get selectedCount() { return this.selected.size; },
 
@@ -253,34 +245,49 @@ function inboxController() {
                 <input type="hidden" name="action" value="${action}">
             </form>`;
             const form = container.querySelector('form');
+            form.setAttribute('hx-sync', '#inbox-message-list:queue last');
             document.body.appendChild(form);
 
             htmx.ajax('POST',
-                '{% url "inbox:bulk_action" workspace_id=workspace.id %}',
+                '{% url "inbox:bulk_action" workspace_id=workspace.id %}?' + this.listParams(),
                 {
                     source: form,
                     target: '#inbox-message-list',
                     swap: 'innerHTML',
                 }
-            );
-            setTimeout(() => form.remove(), 100);
+            ).finally(() => form.remove());
             this.selected = new Set();
         },
 
-        selectMessage(id, url) {
-            /* Load detail panel via HTMX */
-            htmx.ajax('GET', url, { target: '#inbox-detail-panel', swap: 'innerHTML' });
-            /* Highlight active row */
-            document.querySelectorAll('.inbox-row').forEach(el => el.classList.remove('is-active'));
-            const row = document.getElementById('msg-' + id);
-            if (row) {
-                row.classList.add('is-active');
-                row.classList.remove('is-unread');
+        selectMessage(id) {
+            this.activeMessageId = id;
+            if (window.innerWidth < 768) this.activePanel = 'detail';
+        },
+
+        listParams() {
+            const normalize = (params) => {
+                const cleaned = new URLSearchParams(params);
+                cleaned.delete('page');
+                for (const [key, value] of Array.from(cleaned.entries())) {
+                    if (!value || (key === 'view' && value === 'all')) cleaned.delete(key);
+                }
+                cleaned.sort();
+                return cleaned;
+            };
+            const current = new URLSearchParams(window.location.search);
+            const form = document.getElementById('inbox-filters');
+            const requested = normalize(new URLSearchParams(new FormData(form)));
+            if (requested.toString() === normalize(current).toString() && current.has('page')) {
+                requested.set('page', current.get('page'));
             }
-            /* Switch to detail panel on mobile */
-            if (window.innerWidth < 768) {
-                this.activePanel = 'detail';
-            }
+            return requested.toString();
+        },
+
+        refreshList() {
+            htmx.ajax('GET', '{% url "inbox:feed" workspace_id=workspace.id %}?' + this.listParams(), {
+                source: document.getElementById('inbox-message-list'),
+                target: '#inbox-message-list', swap: 'innerHTML'
+            });
         },
 
         /* SLA countdown timer */

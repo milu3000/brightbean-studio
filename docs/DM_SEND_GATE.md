@@ -1,5 +1,10 @@
 # BrightBean DM send gate: local implementation and acceptance boundary
 
+The later unified-inbox release also protects ordinary, unenrolled DM replies
+through the existing InboxReply receipt. See [unified release and recovery](UNIFIED_INBOX_RELEASE.md).
+The "unenrolled legacy lifecycle" description below records this gate's original
+scope; it does not override the current shared receipt/uncertainty checks.
+
 This account-scoped barrier covers BrightBean's classic inbox composer, draft
 send, REST create-and-send / draft send, and MCP new / draft send. Those paths
 use `apps.inbox.services.send_reply_now`. The supported enrolled platforms are

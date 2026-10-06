@@ -5,6 +5,7 @@
 
 {% block extra_head %}
 <style>
+    [data-inbox-panel] button:disabled { opacity: .45; cursor: not-allowed; }
     .inbox-detail-full { margin: -1.5rem; height: calc(100% + 3rem); }
     .badge-pill {
         display: inline-flex; align-items: center; gap: 3px;
@@ -28,6 +29,7 @@
 
 {% block extra_js %}
 <script src="{% static 'js/inbox-media.js' %}" defer></script>
+<script src="{% static 'js/inbox-navigation.js' %}" defer></script>
 {% endblock %}
 
 {% block content %}
