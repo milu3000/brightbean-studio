@@ -108,7 +108,9 @@ def test_echo_before_send_response_waits_for_persisted_outbound_id(inbox_account
     if connection.vendor != "postgresql":
         pytest.skip("Requires PostgreSQL row-level locks")
     reply = _sent_reply(inbox_account)
-    WorkspaceMembership.objects.create(user=user, workspace=inbox_account.workspace, workspace_role="owner")
+    WorkspaceMembership.objects.update_or_create(
+        user=user, workspace=inbox_account.workspace, defaults={"workspace_role": "owner"}
+    )
     message = reply.inbox_message
     message.extra = {"conversation_type": "direct", "classification_reason": "participants_pair"}
     message.save(update_fields=["extra"])

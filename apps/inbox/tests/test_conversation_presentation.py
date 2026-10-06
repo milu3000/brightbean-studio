@@ -55,7 +55,7 @@ def feed_url(workspace):
     return reverse("inbox:feed", kwargs={"workspace_id": workspace.pk})
 
 
-@pytest.mark.parametrize("native", [None, "", 123, True, {}, ["thread"], " space", "tab\tid", "x\x00", "x" * 256])
+@pytest.mark.parametrize("native", [None, "", 123, True, {}, ["thread"], " space", "tab\tid", "x\x01", "x" * 256])
 def test_missing_or_malformed_native_ids_never_group_by_sender(inbox_account, native):
     first = incoming(inbox_account, "first", native=native)
     incoming(inbox_account, "second", native=native)
@@ -63,6 +63,12 @@ def test_missing_or_malformed_native_ids_never_group_by_sender(inbox_account, na
     assert list(presentation.stored_thread_messages(first)) == [first]
     page = presentation.inbox_page(InboxMessage.objects.all(), 1)
     assert len(page) == 2
+
+
+def test_nul_native_id_is_rejected_before_database_storage():
+    # PostgreSQL JSONB cannot store NUL. Keep this parser edge case separate
+    # from the database grouping contract, which uses persistable controls.
+    assert presentation.native_thread_id("x\x00") == ""
 
 
 @pytest.mark.parametrize("native", ["123", "true", "null", "opaque:thread/abc"])
