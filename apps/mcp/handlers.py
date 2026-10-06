@@ -1400,8 +1400,10 @@ register_tool(
     Tool(
         name="get_inbox_message",
         description=(
-            "Retrieve one inbox message by ID, including its full reply thread and any draft "
-            "replies. Returns 'Inbox message not found' for IDs outside this key's workspace or "
+            "Retrieve one stored inbox message by ID, including BrightBean replies and drafts. "
+            "Native Instagram/Facebook replies may be absent; an empty replies array does not mean unanswered. "
+            "Use read_native_inbox_thread for an explicit one-time platform snapshot when a native thread ID is known. "
+            "Returns 'Inbox message not found' for IDs outside this key's workspace or "
             "account allowlist (same as a truly nonexistent ID). Requires the use_inbox permission."
         ),
         input_schema={
@@ -1455,6 +1457,59 @@ register_tool(
             "additionalProperties": False,
         },
         handler=_get_inbox_thread,
+    )
+)
+
+
+def _read_native_inbox_thread(args: dict, context: dict[str, Any]) -> dict:
+    from apps.inbox.native_thread_reads import (
+        NativeThreadReadError,
+        key_read_authorization,
+        read_native_thread,
+    )
+
+    _require_perm(context, "use_inbox")
+    if "message_id" not in args or set(args) - {"message_id", "limit"}:
+        raise JsonRpcError(INVALID_PARAMS, "message_id and optional limit are the only supported arguments")
+    key = context["api_key"]
+    message = _get_inbox_message_for_key(key, args["message_id"])
+    request = context.get("request")
+    if request is not None:
+        request._native_inbox_snapshot = True
+    try:
+        result = read_native_thread(
+            message, authorization=key_read_authorization(key, request), limit=args.get("limit", 50)
+        )
+    except NativeThreadReadError as exc:
+        raise JsonRpcError(INVALID_PARAMS, str(exc)) from exc
+    except Exception:
+        # The generic MCP exception handler logs traceback messages; keep
+        # transient provider data out of that path and out of error text.
+        raise JsonRpcError(INVALID_PARAMS, "The platform conversation could not be read.") from None
+    return _wrap_text(result)
+
+
+register_tool(
+    Tool(
+        name="read_native_inbox_thread",
+        description=(
+            "Explicitly read one current Instagram/Facebook conversation using an existing authorized inbox message's "
+            "native thread ID. May show native app replies absent from BrightBean's stored replies. Makes one bounded "
+            "platform read per invocation; does not poll, follow pagination, save message content, mark work answered, "
+            "change capture, or send. Only verified direct conversations are returned. The snapshot is incomplete and "
+            "transient; empty/unavailable results never prove no reply. It never grants permission to send or extends "
+            "the automated reply window. Requires the current use_inbox permission and account allowlist."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "message_id": {"type": "string", "format": "uuid"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50},
+            },
+            "required": ["message_id"],
+            "additionalProperties": False,
+        },
+        handler=_read_native_inbox_thread,
     )
 )
 

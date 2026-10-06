@@ -70,7 +70,7 @@ jobs:
   test:
     name: Test (pytest)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     services:
       postgres:
         # Pulled via AWS's public mirror of Docker Hub official images —

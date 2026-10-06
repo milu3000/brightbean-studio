@@ -12,6 +12,7 @@ from django.http import HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.utils import timezone
 from django.utils.dateparse import parse_date, parse_datetime
+from django.views.decorators.cache import never_cache
 from django.views.decorators.http import require_GET, require_http_methods, require_POST
 
 from apps.members.decorators import require_permission
@@ -402,6 +403,40 @@ def message_detail(request, workspace_id, message_id):
             response["HX-Trigger"] = "inbox:refresh"
         return response
     return render(request, "inbox/message_detail.html", context)
+
+
+@never_cache
+@login_required
+@require_permission("use_inbox")
+@require_POST
+def native_thread_refresh(request, workspace_id, message_id):
+    """Read a temporary platform snapshot only after an explicit CSRF-protected click."""
+    from .native_thread_reads import NativeThreadReadError, read_native_thread, session_read_authorization
+
+    workspace = _get_workspace(request, workspace_id)
+    message = get_object_or_404(
+        InboxMessage.objects.select_related("social_account"),
+        id=message_id,
+        workspace=workspace,
+        social_account__workspace=workspace,
+    )
+    try:
+        result = read_native_thread(message, authorization=session_read_authorization(request.user), limit=50)
+    except NativeThreadReadError as exc:
+        # Never return raw provider errors or re-render the composer/timeline.
+        result = {"status": "unavailable", "reason_code": exc.code, "anchor_message_id": str(message.pk)}
+        status = {
+            "authorization_required": 403,
+            "authorization_revoked": 403,
+            "invalid_limit": 400,
+        }.get(exc.code, 409)
+        return JsonResponse(result, status=status)
+    except Exception:
+        # Provider exceptions can contain credentials or message bodies. Keep
+        # this boundary content-free, including logs and browser error output.
+        result = {"status": "unavailable", "reason_code": "read_failed", "anchor_message_id": str(message.pk)}
+        return JsonResponse(result, status=502)
+    return JsonResponse(result)
 
 
 # --- Reply ---

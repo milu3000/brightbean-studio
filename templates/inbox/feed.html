@@ -209,6 +209,7 @@
 {% block extra_js %}
 <script src="{% static 'js/inbox-media.js' %}" defer></script>
 <script src="{% static 'js/inbox-navigation.js' %}" defer></script>
+<script src="{% static 'js/inbox-native-thread.js' %}" defer></script>
 <script nonce="{{ request.csp_nonce }}">
 function inboxController() {
     return {

@@ -16,7 +16,7 @@ from __future__ import annotations
 import uuid
 
 from django.db.models import QuerySet
-from django.http import Http404, HttpRequest
+from django.http import Http404, HttpRequest, JsonResponse
 from django.shortcuts import get_object_or_404
 from ninja import Query, Router
 from ninja.errors import HttpError
@@ -36,6 +36,7 @@ from apps.api.schemas import (
     InboxMessagesListResponse,
     InboxReplyResponse,
     InboxThreadResponse,
+    NativeInboxThreadReadRequest,
     UpdateReplyRequest,
 )
 from apps.inbox.dm_send_gate import key_send_authorization
@@ -170,6 +171,34 @@ def retrieve_thread(
         raise HttpError(422, str(exc)) from exc
     log_audit_entry(request, action="inbox.thread.read", target_id=message.id, status_code=200)
     return result
+
+
+@router.post("/{message_id}/native-thread/read", response=dict, summary="Read one existing platform conversation once")
+def read_native_conversation(request, message_id: uuid.UUID, payload: NativeInboxThreadReadRequest):
+    from apps.inbox.native_thread_reads import (
+        NativeThreadReadError,
+        key_read_authorization,
+        read_native_thread,
+    )
+
+    enforce_http_rate_limits(request, is_write=False)
+    _require_perm(request, "use_inbox")
+    message = _get_message(request, message_id)
+    try:
+        result = read_native_thread(
+            message, authorization=key_read_authorization(request.api_key, request), limit=payload.limit
+        )
+    except NativeThreadReadError as exc:
+        status = 422 if exc.code == "invalid_limit" else 409 if exc.code == "stale" else 404
+        raise HttpError(status, str(exc)) from exc
+    except Exception:
+        # Unexpected projection/auth failures must not log or reflect a
+        # transient provider response through the generic exception handler.
+        raise HttpError(502, "The platform conversation could not be read.") from None
+    log_audit_entry(request, action="inbox.native_thread.read", target_id=message.id, status_code=200)
+    response = JsonResponse(result)
+    response["Cache-Control"] = "private, no-store"
+    return response
 
 
 @router.post(
