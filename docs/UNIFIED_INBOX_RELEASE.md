@@ -47,6 +47,13 @@ in API/MCP responses; callers cannot assert a not-sent result. Truncated
 previews identify the existing full-message read path. They explicitly report
 incomplete native history and BrightBean-only outbound coverage.
 
+A separate, explicit [one-time platform read](NATIVE_THREAD_READ.md) can show a
+temporary snapshot of a known native conversation, including replies made in
+Instagram or Facebook itself. This is not automatic synchronization: it saves
+no fetched messages and does not change these stored-history projections or
+their capture/read gates. Empty saved replies never prove a conversation is
+unanswered.
+
 Instagram group messages or media omitted by Meta cannot be reconstructed.
 Unknown/group identity is shown honestly and cannot use the direct-message send
 API. Links may expire; a supplied link does not prove media contents were read.

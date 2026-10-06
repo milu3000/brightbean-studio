@@ -12,6 +12,7 @@ urlpatterns = [
     path("", views.inbox_feed, name="feed"),
     # Message detail + thread
     path("<uuid:message_id>/", views.message_detail, name="message_detail"),
+    path("<uuid:message_id>/native-thread/", views.native_thread_refresh, name="native_thread_refresh"),
     # Reply to message
     path("<uuid:message_id>/reply/", views.send_reply, name="send_reply"),
     # Draft replies

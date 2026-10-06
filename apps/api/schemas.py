@@ -849,9 +849,16 @@ class InboxMessageResponse(Schema):
     related_post_id: uuid.UUID | None = None
     received_at: dt.datetime
     created_at: dt.datetime
-    replies: list[InboxReplyResponse] = Field(default_factory=list)
+    replies: list[InboxReplyResponse] = Field(
+        default_factory=list,
+        description="BrightBean reply records only. Empty does not mean no native platform reply exists.",
+    )
     reply_eligibility: InboxReplyEligibilityResponse | None = Field(
-        None, description="Read-only message eligibility; sending always rechecks current permission and state."
+        None,
+        description=(
+            "Read-only send eligibility, not proof that the platform conversation is unanswered. "
+            "Sending always rechecks current permission and state."
+        ),
     )
 
     @field_serializer("received_at", "created_at")
@@ -923,6 +930,12 @@ class InboxMessagesListResponse(Schema):
     messages: list[InboxMessageResponse]
     limit: int
     next_cursor: str | None = None
+
+
+class NativeInboxThreadReadRequest(Schema):
+    limit: int = Field(
+        50, ge=1, le=100, strict=True, description="Maximum messages in this one-time platform snapshot."
+    )
 
 
 class CreateReplyRequest(Schema):

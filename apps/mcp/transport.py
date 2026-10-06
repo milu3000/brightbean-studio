@@ -249,7 +249,10 @@ def mcp_endpoint(request: HttpRequest):
                 responses.append(r)
         if not responses:
             return HttpResponse(status=202)
-        return JsonResponse(responses, safe=False, status=200)
+        result = JsonResponse(responses, safe=False, status=200)
+        if getattr(request, "_native_inbox_snapshot", False):
+            result["Cache-Control"] = "private, no-store"
+        return result
 
     # Single message.
     if isinstance(body, dict):
@@ -260,7 +263,10 @@ def mcp_endpoint(request: HttpRequest):
         if response is None:
             # Notification — fire-and-forget per JSON-RPC.
             return HttpResponse(status=202)
-        return JsonResponse(response, status=200)
+        result = JsonResponse(response, status=200)
+        if getattr(request, "_native_inbox_snapshot", False):
+            result["Cache-Control"] = "private, no-store"
+        return result
 
     enforce_http_rate_limits(request, is_write=True)
     return JsonResponse(
