@@ -7,6 +7,7 @@ const {PassThrough} = require('node:stream');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const {withCleanup} = require('./cdp.cjs');
 
 function fixture() {
     const child = new EventEmitter();
@@ -95,4 +96,26 @@ test('spawn failures and CDP protocol errors remain failures', async () => {
     g.reply({id: 1, error: {code: -32601, message: 'method not found'}});
     await protocolError;
     assert.equal(g.timers.size, 0);
+});
+
+test('cleanup cannot hide the original scenario failure', async () => {
+    const original = new Error('original synthetic assertion');
+    const cleanup = new Error('synthetic ENOTEMPTY');
+    await assert.rejects(withCleanup(async () => { throw original; }, async () => { throw cleanup; }), error => {
+        assert(error instanceof AggregateError);
+        assert.equal(error.errors[0], original);
+        assert.equal(error.errors[1], cleanup);
+        assert.match(error.message, /original synthetic assertion/);
+        assert.match(error.message, /synthetic ENOTEMPTY/);
+        return true;
+    });
+});
+
+test('cleanup still fails after a successful operation, and successful cleanup preserves results', async () => {
+    await assert.rejects(withCleanup(async () => 1, async () => { throw new Error('cleanup failed'); }), /cleanup failed/);
+    let cleaned = false;
+    assert.equal(await withCleanup(async () => 42, async () => { cleaned = true; }), 42);
+    assert.equal(cleaned, true);
+    const original = new Error('primary failure');
+    await assert.rejects(withCleanup(async () => { throw original; }, async () => {}), error => error === original);
 });

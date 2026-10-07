@@ -35,4 +35,15 @@ class Browser {
     }
     async close(){if(this.closed)return;const exited=new Promise(resolve=>this.process.once('exit',resolve));this.process.kill('SIGKILL');await exited;}
 }
-module.exports={Browser};
+async function withCleanup(operation, cleanup) {
+    let result, failure;
+    try { result = await operation(); } catch (error) { failure = error; }
+    try { await cleanup(); } catch (error) {
+        if (failure) throw new AggregateError([failure, error],
+            `Original failure:\n${failure.stack || failure}\nCleanup failure:\n${error.stack || error}`);
+        throw error;
+    }
+    if (failure) throw failure;
+    return result;
+}
+module.exports={Browser,withCleanup};

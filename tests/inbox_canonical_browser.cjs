@@ -7,7 +7,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const {Browser} = require('./browser/cdp.cjs');
+const {Browser,withCleanup} = require('./browser/cdp.cjs');
 const root = path.resolve(__dirname, '..');
 const args = process.argv.slice(2);
 const option = name => args[args.indexOf(name) + 1];
@@ -456,7 +456,7 @@ async function main() {
     const binary = option('--browser'); assert(binary && fs.existsSync(binary),'Installed Chrome/Chromium is required');
     const profile=fs.mkdtempSync(path.join(os.tmpdir(),'brightbean-chromium-'));
     const browser=new Browser(binary,profile);
-    try {
+    await withCleanup(async () => { try {
         // Cold browser startup is separate from the 8-second command/DOM budget.
         // A real handshake must still succeed; this never retries or skips it.
         const version=await browser.command('Browser.getVersion',{},undefined,30000);
@@ -472,9 +472,11 @@ async function main() {
         assert.deepEqual(browser.errors,[]);
         process.stdout.write('CHROMIUM DOM REGRESSIONS PASSED\n');
     } catch (error) {
-        throw new Error(`${error.stack}\nChromium stderr:\n${browser.stderr}`);
-    } finally {
-        await browser.close(); fs.rmSync(profile,{recursive:true,force:true});
-    }
+        throw new Error(`${error.stack}\nAsync CDP failures:\n${browser.errors.join('\n')}\nChromium stderr:\n${browser.stderr}`);
+    } }, async () => {
+        await browser.close();
+        // Child processes can finish writing the temporary profile after exit.
+        fs.rmSync(profile,{recursive:true,force:true,maxRetries:5,retryDelay:100});
+    });
 }
 main().catch(error=>{process.stderr.write(`${error.stack}\n`);process.exitCode=1;});
