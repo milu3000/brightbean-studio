@@ -70,7 +70,9 @@ jobs:
   test:
     name: Test (pytest)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # The expanded PostgreSQL migration/concurrency suite exceeded 20 minutes
+    # while still making progress. Keep every test and give it a bounded run.
+    timeout-minutes: 45
     services:
       postgres:
         # Pulled via AWS's public mirror of Docker Hub official images —
@@ -116,6 +118,11 @@ jobs:
       # seeded data (see apps/inbox/tests/test_reply_lifecycle_migrations.py).
       - name: makemigrations --check
         run: python manage.py makemigrations --check --dry-run
+
+      # Print complete browser failure details before the aggregate suite,
+      # including when a later job timeout prevents pytest's final summary.
+      - name: Real Chromium regression
+        run: pytest apps/inbox/tests/test_canonical_browser.py -vv --tb=long --show-capture=all
 
       - name: pytest
         run: pytest --cov=apps --cov-report=term-missing
