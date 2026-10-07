@@ -13,9 +13,7 @@ from .models import (
 )
 
 
-@login_required
-@require_GET
-def notification_drawer(request):
+def _render_drawer(request):
     """HTMX partial: renders the 50 most recent notifications for the drawer."""
     notifications = Notification.objects.filter(user=request.user).order_by("-created_at")[:50]
     return render(
@@ -27,9 +25,7 @@ def notification_drawer(request):
     )
 
 
-@login_required
-@require_GET
-def notification_list(request):
+def _render_history(request):
     """Full notification history page with filtering."""
     event_type = request.GET.get("event_type", "")
     read_status = request.GET.get("read_status", "")
@@ -44,7 +40,10 @@ def notification_list(request):
         qs = qs.filter(is_read=False)
 
     # Pagination
-    page = int(request.GET.get("page", 1))
+    try:
+        page = max(1, int(request.GET.get("page", 1)))
+    except (ValueError, TypeError):
+        page = 1
     per_page = 30
     offset = (page - 1) * per_page
     notifications = qs[offset : offset + per_page]
@@ -69,6 +68,18 @@ def notification_list(request):
 
 
 @login_required
+@require_GET
+def notification_drawer(request):
+    return _render_drawer(request)
+
+
+@login_required
+@require_GET
+def notification_list(request):
+    return _render_history(request)
+
+
+@login_required
 @require_POST
 def mark_as_read(request, notification_id):
     """Mark a single notification as read."""
@@ -88,7 +99,11 @@ def mark_all_read(request):
     Notification.objects.filter(user=request.user, is_read=False).update(is_read=True, read_at=timezone.now())
 
     if request.htmx:
-        return notification_drawer(request)
+        # Render the appropriate surface directly. Calling a GET-only view
+        # after a successful POST previously returned 405 after the write.
+        if request.headers.get("HX-Target") == "notification-history-list":
+            return _render_history(request)
+        return _render_drawer(request)
     return JsonResponse({"ok": True})
 
 
