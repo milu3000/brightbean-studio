@@ -68,24 +68,18 @@ def validate_automated_reply_window(message: InboxMessage) -> None:
 def reply_failure_reason(exc: Exception) -> str:
     """A short, actionable reason for the user.
 
-    The platform's own error text carries internal diagnostics (trace IDs,
-    raw API JSON) that mean nothing to a workspace member, so it stays in
-    the log and the UI/API gets a stable sentence instead.
+    The UI/API receives a fixed category-specific sentence. DM dispatch logs
+    only allowlisted numeric diagnostics, never raw provider text or JSON.
     """
-    from providers.exceptions import OAuthError, RateLimitError, TokenExpiredError
-
     from .dm_send_gate import DMSendGateError
+    from .provider_failures import provider_failure_reason
 
     if isinstance(exc, DMSendGateError):
         return str(exc)
     if isinstance(exc, NotImplementedError):
         return "this platform does not support sending this reply."
 
-    if isinstance(exc, RateLimitError):
-        return "the account has hit its rate limit. Wait a few minutes and try again."
-    if isinstance(exc, TokenExpiredError | OAuthError):
-        return "the connection has expired. Reconnect the account in Workspace Settings."
-    return "the platform rejected it. Try again, or reconnect the account if this keeps happening."
+    return provider_failure_reason(exc)
 
 
 def _dispatch_to_platform(message: InboxMessage, body: str, *, automated: bool = False, before_provider=None) -> str:

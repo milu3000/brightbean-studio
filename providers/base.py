@@ -430,10 +430,13 @@ class SocialProvider(ABC):
         """
         if response.status_code == 429:
             retry_after = response.headers.get("Retry-After")
-            logger.error("%s API 429 response: %s", self.platform_name, response.text[:1000])
+            # Provider bodies can contain private content or credentials.
+            # Callers may log allowlisted numeric diagnostics, never this body.
+            logger.error("%s API HTTP 429 rate limit response", self.platform_name)
             return RateLimitError(
                 f"Rate limit exceeded for {self.platform_name}: {response.text[:500]}",
                 retry_after=int(retry_after) if retry_after else None,
+                status_code=429,
                 platform=self.platform_name,
                 raw_response=self._safe_json(response),
             )

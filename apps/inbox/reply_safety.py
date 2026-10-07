@@ -382,7 +382,10 @@ def _check_send_generation(reply, generation):
 
 
 def send_unenrolled_dm(reply, *, snapshot, actor, authorization, automated, dispatch_binding):
+    from providers.exceptions import ProviderError
+
     from .dm_send_gate import _known_refusal
+    from .provider_failures import log_dm_provider_failure
     from .services import ReplyStateError, _apply_post_send_side_effects, _dispatch_to_platform, reply_failure_reason
 
     generation = _prepare_receipt(reply, snapshot, authorization, automated, dispatch_binding)
@@ -411,6 +414,8 @@ def send_unenrolled_dm(reply, *, snapshot, actor, authorization, automated, disp
             except Exception as exc:
                 if getattr(exc, "code", None) == "receipt_changed":
                     raise
+                if entered_provider or isinstance(exc, ProviderError):
+                    log_dm_provider_failure(reply.pk, exc)
                 if not entered_provider or _known_refusal(exc, account.platform):
                     if not entered_provider and isinstance(exc, ReplyStateError):
                         failure = exc

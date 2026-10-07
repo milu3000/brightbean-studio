@@ -2,6 +2,7 @@
 
 import logging
 from datetime import datetime
+from urllib.parse import urlencode
 from uuid import UUID
 
 from django.contrib import messages as flash_messages
@@ -10,6 +11,7 @@ from django.core.exceptions import PermissionDenied
 from django.db.models import Q
 from django.http import HttpResponse, JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
+from django.urls import reverse
 from django.utils import timezone
 from django.utils.dateparse import parse_date, parse_datetime
 from django.views.decorators.cache import never_cache
@@ -58,7 +60,7 @@ DRAFT_CREATION_HOLDS = {
 }
 
 
-def _detail_context(workspace, message, request=None):
+def _detail_context(workspace, message, request=None, *, history_before=None):
     """Build the full context needed for the message detail panel."""
     sla_config = InboxSLAConfig.objects.filter(workspace=workspace, is_active=True).first()
     saved_replies = SavedReply.objects.for_workspace(workspace.id)
@@ -113,7 +115,11 @@ def _detail_context(workspace, message, request=None):
         social_account__workspace=workspace,
     ).select_related("social_account")
     history = (
-        presentation.timeline_page(stored_messages, request.GET.get("history_page", 1) if request else 1)
+        presentation.timeline_page(
+            stored_messages,
+            1 if history_before else request.GET.get("history_page", 1) if request else 1,
+            before=history_before,
+        )
         if conversation_view
         else None
     )
@@ -125,8 +131,22 @@ def _detail_context(workspace, message, request=None):
         **composer,
         "conversation_view": conversation_view,
         "has_native_thread": bool(presentation.thread_id(message)),
+        "native_view_scope": (
+            presentation.native_view_scope(message, request.user.pk)
+            if conversation_view and request and permissions.get("use_inbox") is True
+            else ""
+        ),
         "stored_message_count": stored_messages.count(),
         "history_page": history,
+        "timeline_events": presentation.timeline_events(thread) if history is not None else [],
+        "history_page_key": request.GET.get("history_before", "") if request else "",
+        "history_older_url": (
+            reverse("inbox:message_detail", kwargs={"workspace_id": workspace.pk, "message_id": message.pk})
+            + "?"
+            + urlencode({"history_before": presentation.history_cursor(message, thread[0])})
+            if history is not None and history.has_next() and thread
+            else ""
+        ),
         "selected_outside_history": bool(history)
         and not any(kind == "incoming" and item.pk == message.pk for kind, item, _ in thread),
         "thread": thread,
@@ -383,6 +403,13 @@ def message_detail(request, workspace_id, message_id):
         social_account__workspace=workspace,
     )
 
+    history_before = None
+    if "history_before" in request.GET:
+        try:
+            history_before = presentation.parse_history_cursor(message, request.GET["history_before"])
+        except ValueError:
+            return HttpResponse("This history position is invalid or expired. Reopen the conversation.", status=400)
+
     # Mark as read → open
     marked_read = False
     if message.status == InboxMessage.Status.UNREAD:
@@ -393,7 +420,7 @@ def message_detail(request, workspace_id, message_id):
         )
         message.refresh_from_db(fields=["status"])
 
-    context = _detail_context(workspace, message, request)
+    context = _detail_context(workspace, message, request, history_before=history_before)
 
     if request.htmx:
         if request.headers.get("HX-Target") == "inbox-thread" and context["conversation_view"]:
@@ -410,7 +437,7 @@ def message_detail(request, workspace_id, message_id):
 @require_permission("use_inbox")
 @require_POST
 def native_thread_refresh(request, workspace_id, message_id):
-    """Read a temporary platform snapshot only after an explicit CSRF-protected click."""
+    """Read a temporary page after a scoped, CSRF-protected conversation interaction."""
     from .native_thread_reads import NativeThreadReadError, read_native_thread, session_read_authorization
 
     workspace = _get_workspace(request, workspace_id)
@@ -421,7 +448,13 @@ def native_thread_refresh(request, workspace_id, message_id):
         social_account__workspace=workspace,
     )
     try:
-        result = read_native_thread(message, authorization=session_read_authorization(request.user), limit=50)
+        continuation = request.POST.get("continuation")
+        if len(request.POST.getlist("continuation")) > 1:
+            raise NativeThreadReadError("invalid_continuation", "This history position is invalid or expired.")
+        options = {"continuation": continuation} if continuation is not None else {}
+        result = read_native_thread(
+            message, authorization=session_read_authorization(request.user), limit=50, **options
+        )
     except NativeThreadReadError as exc:
         # Never return raw provider errors or re-render the composer/timeline.
         result = {"status": "unavailable", "reason_code": exc.code, "anchor_message_id": str(message.pk)}
@@ -429,6 +462,8 @@ def native_thread_refresh(request, workspace_id, message_id):
             "authorization_required": 403,
             "authorization_revoked": 403,
             "invalid_limit": 400,
+            "invalid_continuation": 400,
+            "stale_continuation": 409,
         }.get(exc.code, 409)
         return JsonResponse(result, status=status)
     except Exception:

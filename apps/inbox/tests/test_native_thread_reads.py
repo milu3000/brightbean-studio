@@ -1,6 +1,7 @@
 """Transient native observations must not become history, receipts or send grants."""
 
 import json
+import time
 from copy import deepcopy
 from datetime import timedelta
 from types import SimpleNamespace
@@ -8,6 +9,7 @@ from unittest.mock import patch
 
 import httpx
 import pytest
+from django.core import signing
 from django.db import connection
 from django.test import RequestFactory
 from django.test.utils import CaptureQueriesContext
@@ -49,10 +51,13 @@ def payload(dm, *, own=None):
     }
 
 
-def read(dm, data=None, *, authorization=None, limit=50, side_effect=None):
+def read(dm, data=None, *, authorization=None, limit=50, side_effect=None, continuation=None):
     with patch.object(reads, "_request_native_thread", return_value=data, side_effect=side_effect) as request:
         result = reads.read_native_thread(
-            dm.message, authorization=authorization or reads.session_read_authorization(dm.user), limit=limit
+            dm.message,
+            authorization=authorization or reads.session_read_authorization(dm.user),
+            limit=limit,
+            continuation=continuation,
         )
     return result, request
 
@@ -436,21 +441,22 @@ def test_deleted_and_unsupported_provider_content_stays_honest(dm, flag, status)
         assert item["body"] == "" and item["attachments"] == []
 
 
-def test_first_page_and_requested_limit_are_bounded_without_pagination(dm):
+def test_excess_provider_rows_fail_closed_without_losing_a_page(dm):
     data = payload(dm)
     template = data["messages"]["data"][0]
     data["messages"]["data"] = [{**template, "id": f"mid-{i:03}"} for i in range(130)]
     data["messages"]["paging"] = {"next": "https://must-not-follow.example"}
     result, request = read(dm, data, limit=7)
-    assert len(result["items"]) == 7
-    assert result["coverage"]["scanned_count"] == 100 and result["coverage"]["returned_count"] == 7
+    assert result["status"] == "unavailable" and result["items"] == []
+    assert result["coverage"]["scanned_count"] == 130 and result["coverage"]["returned_count"] == 0
     assert result["more_available"] and result["coverage"]["truncated"]
-    assert all(int(item["platform_message_id"].split("-")[-1]) < 100 for item in result["items"])
+    assert result["older_continuation"] is None
     request.assert_called_once()
+    assert request.call_args.args[2] == 7
 
 
 @pytest.mark.parametrize("fault", ["mid", "naive_time", "future_time", "body", "row", "time_type"])
-def test_invalid_rows_are_omitted_with_explicit_coverage(dm, fault):
+def test_invalid_rows_fail_closed_with_no_cursor_advancement(dm, fault):
     data = payload(dm)
     row = data["messages"]["data"][0]
     if fault == "mid":
@@ -466,7 +472,8 @@ def test_invalid_rows_are_omitted_with_explicit_coverage(dm, fault):
     else:
         row["created_time"] = True
     result, _ = read(dm, data)
-    assert len(result["items"]) == 1 and result["coverage"]["skipped_count"] == 1
+    assert result["status"] == "unavailable" and result["items"] == []
+    assert result["coverage"]["skipped_count"] == 1 and result["older_continuation"] is None
     assert result["coverage"]["truncated"] and not result["history_complete"]
 
 
@@ -515,7 +522,7 @@ def test_transport_is_one_streamed_get_with_no_redirects_sends_or_body_logs(dm, 
         requests.append(request)
         assert request.method == "GET" and request.url.host == host
         assert request.url.path == "/v25.0/conversation-1"
-        assert "messages.limit(100)" in request.url.params["fields"]
+        assert "messages.limit(20)" in request.url.params["fields"]
         assert request.headers["Authorization"] == "Bearer tok"
         assert "tok" not in str(request.url)
         return httpx.Response(200, json=payload(dm))
@@ -619,7 +626,7 @@ def test_canonical_identity_change_during_read_discards_remote_body(dm):
     assert error.value.code == "stale"
 
 
-def test_output_budget_preserves_newest_data_with_explicit_text_media_and_item_truncation(dm):
+def test_output_budget_preserves_every_row_with_explicit_text_and_media_truncation(dm):
     data = payload(dm)
     template = data["messages"]["data"][0]
     template["message"] = "中" * reads.MAX_BODY_CHARACTERS
@@ -629,14 +636,23 @@ def test_output_budget_preserves_newest_data_with_explicit_text_media_and_item_t
             for index in range(30)
         ]
     }
-    data["messages"]["data"] = [{**deepcopy(template), "id": f"mid-{index:03}"} for index in range(50)]
+    data["messages"]["data"] = [
+        {**deepcopy(template), "id": f"mid-{index:03}"} for index in range(reads.PROVIDER_PAGE_LIMIT)
+    ]
+    data["messages"]["paging"] = {
+        "next": "https://graph.facebook.com/v25.0/conversation-1/messages?after=older-cursor",
+        "cursors": {"after": "older-cursor"},
+    }
     result, _ = read(dm, data)
     assert len(json.dumps(result).encode()) < reads.MAX_RESULT_BYTES
-    assert result["items"] and result["items"][-1]["platform_message_id"] == "mid-049"
+    assert {item["platform_message_id"] for item in result["items"]} == {
+        f"mid-{index:03}" for index in range(reads.PROVIDER_PAGE_LIMIT)
+    }
     assert result["items"][-1]["body_truncated"] is True
     assert result["items"][-1]["attachments_truncated"] is True
     assert result["coverage"]["output_truncated"] is True
-    assert result["coverage"]["output_omitted_count"] > 0
+    assert result["coverage"]["output_omitted_count"] == 0
+    assert result["older_continuation"]
     assert result["more_available"] is True and not result["history_complete"]
     # Worst-case envelope that places the whole result inside an MCP text block.
     envelope = {"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": json.dumps(result)}]}}
@@ -708,4 +724,395 @@ def test_sibling_classification_in_other_native_thread_does_not_expand_scope(dm)
     )
     result, request = read(dm, payload(dm))
     assert result["status"] == "observed"
+    request.assert_called_once()
+
+
+def paged_payload(dm, *, page=0, count=20, more=True):
+    data = payload(dm)
+    row = data["messages"]["data"][0]
+    data["messages"]["data"] = [
+        {
+            **deepcopy(row),
+            "id": f"page-{page}-message-{index}",
+            "created_time": (timezone.now() - timedelta(minutes=page * 30 + index + 1)).isoformat(),
+            "message": "中" * 10000,
+        }
+        for index in range(count)
+    ]
+    if more:
+        host = "graph.facebook.com" if dm.account.platform == "facebook" else "graph.instagram.com"
+        data["messages"]["paging"] = {
+            "next": f"https://{host}/v25.0/conversation-1/messages?after=older-page-{page + 1}&access_token=PRIVATE_NEXT_TOKEN",
+            "cursors": {"after": f"older-page-{page + 1}"},
+        }
+    return data
+
+
+def test_older_pages_preserve_every_identity_despite_large_bodies_without_writes(dm):
+    observed = []
+    continuation, page_keys = None, set()
+    with CaptureQueriesContext(connection) as queries:
+        for page in range(3):
+            data = paged_payload(dm, page=page, more=page < 2)
+            result, request = read(dm, data, continuation=continuation)
+            assert result["status"] == "observed" and len(result["items"]) == 20
+            assert result["coverage"]["output_omitted_count"] == 0
+            assert result["coverage"]["body_truncated_count"] == 20
+            assert result["page_key"] not in page_keys
+            assert len(json.dumps(result).encode()) < reads.MAX_RESULT_BYTES
+            assert "PRIVATE_NEXT_TOKEN" not in str(result)
+            assert request.call_args.args[3] == (None if page == 0 else f"older-page-{page}")
+            assert result["older_history_status"] == ("available" if page < 2 else "not_indicated")
+            assert result["history_complete"] is False and result["persisted"] is False
+            observed.extend(item["platform_message_id"] for item in result["items"])
+            page_keys.add(result["page_key"])
+            continuation = result["older_continuation"]
+    assert continuation is None
+    assert len(observed) == len(set(observed)) == 60
+    assert not any(query["sql"].lstrip().upper().startswith(("INSERT", "UPDATE", "DELETE")) for query in queries)
+    assert not ConversationMessage.objects.exists() and not InboxReply.objects.exists()
+
+
+@pytest.mark.parametrize("limit", [1, 7, 20, 50, 100])
+def test_provider_page_alignment_preserves_public_requested_limit(dm, limit):
+    data = paged_payload(dm, count=min(limit, reads.PROVIDER_PAGE_LIMIT))
+    data["messages"]["summary"] = {"total_count": 200}
+    result, request = read(dm, data, limit=limit)
+    assert result["status"] == "observed" and result["older_continuation"]
+    assert len(result["items"]) == min(limit, reads.PROVIDER_PAGE_LIMIT)
+    assert result["coverage"]["requested_limit"] == limit
+    assert result["coverage"]["provider_page_limit"] == min(limit, reads.PROVIDER_PAGE_LIMIT)
+    assert request.call_args.args[2] == min(limit, reads.PROVIDER_PAGE_LIMIT)
+
+
+@pytest.mark.parametrize("cursor", ["", "https://graph.facebook.com/other", {}, [], 1, True, "x" * 6145])
+def test_arbitrary_continuations_are_rejected_before_provider_read(dm, cursor):
+    with patch.object(reads, "_request_native_thread") as request, pytest.raises(reads.NativeThreadReadError) as error:
+        reads.read_native_thread(
+            dm.message, authorization=reads.session_read_authorization(dm.user), continuation=cursor
+        )
+    assert error.value.code == "invalid_continuation"
+    request.assert_not_called()
+
+
+def test_expired_and_tampered_continuations_are_rejected_before_provider_read(dm):
+    result, _ = read(dm, paged_payload(dm))
+    token = result["older_continuation"]
+    for candidate, timestamp in [(token + "x", time.time()), (token, time.time() + reads.CONTINUATION_MAX_AGE + 2)]:
+        with (
+            patch("django.core.signing.time.time", return_value=timestamp),
+            patch.object(reads, "_request_native_thread") as request,
+            pytest.raises(reads.NativeThreadReadError) as error,
+        ):
+            reads.read_native_thread(
+                dm.message, authorization=reads.session_read_authorization(dm.user), continuation=candidate
+            )
+        assert error.value.code == "invalid_continuation"
+        request.assert_not_called()
+
+
+@pytest.mark.parametrize("change", ["token", "platform", "thread", "anchor", "limit", "caller_credential"])
+def test_signed_continuations_pin_scope_and_stable_credentials_without_granting_access(dm, change):
+    key = key_for(dm)
+    authorization = reads.key_read_authorization(key)
+    first, _ = read(dm, paged_payload(dm), authorization=authorization)
+    message, limit = dm.message, 50
+    if change == "token":
+        dm.account.oauth_access_token = "rotated-platform-token"
+        dm.account.save(update_fields=["oauth_access_token"])
+    elif change == "platform":
+        dm.account.platform = "instagram_login"
+        dm.account.save(update_fields=["platform"])
+    elif change == "thread":
+        dm.message.extra["conversation_id"] = "different-conversation"
+        dm.message.save(update_fields=["extra"])
+    elif change == "anchor":
+        message = InboxMessage.objects.create(
+            workspace=dm.account.workspace,
+            social_account=dm.account,
+            platform_message_id="different-anchor",
+            message_type="dm",
+            sender_handle="peer-1",
+            body="Different saved anchor",
+            received_at=timezone.now(),
+            extra=deepcopy(dm.message.extra),
+        )
+    elif change == "limit":
+        limit = 19
+    else:
+        authorization = reads.key_read_authorization(key_for(dm))
+    with patch.object(reads, "_request_native_thread") as request, pytest.raises(reads.NativeThreadReadError) as error:
+        reads.read_native_thread(
+            message, authorization=authorization, limit=limit, continuation=first["older_continuation"]
+        )
+    assert error.value.code == "stale_continuation"
+    request.assert_not_called()
+
+
+def test_continuation_never_overrides_revoked_authority(dm):
+    first, _ = read(dm, paged_payload(dm))
+    dm.member.delete()
+    with patch.object(reads, "_request_native_thread") as request, pytest.raises(reads.NativeThreadReadError) as error:
+        reads.read_native_thread(
+            dm.message,
+            authorization=reads.session_read_authorization(dm.user),
+            continuation=first["older_continuation"],
+        )
+    assert error.value.code == "authorization_revoked"
+    request.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "fault", ["repeat_cursor", "repeat_row", "newer_row", "wrong_order", "invalid_row", "excess_rows"]
+)
+def test_unsafe_or_nonprogressing_older_pages_release_no_content_or_cursor(dm, fault):
+    first_data = paged_payload(dm)
+    first, _ = read(dm, first_data)
+    older = paged_payload(dm, page=1)
+    rows = older["messages"]["data"]
+    if fault == "repeat_cursor":
+        older["messages"]["paging"]["cursors"]["after"] = "older-page-1"
+    elif fault == "repeat_row":
+        rows[0]["id"] = first_data["messages"]["data"][-1]["id"]
+    elif fault == "newer_row":
+        rows[0]["created_time"] = timezone.now().isoformat()
+    elif fault == "wrong_order":
+        rows.reverse()
+    elif fault == "invalid_row":
+        rows[-1]["id"] = None
+    else:
+        rows.append({**deepcopy(rows[-1]), "id": "excess-mid"})
+    result, _ = read(dm, older, continuation=first["older_continuation"])
+    assert result["status"] == "unavailable" and result["items"] == []
+    assert result["older_continuation"] is None and result["page_key"] is None
+
+
+@pytest.mark.parametrize(
+    "paging",
+    [
+        {"next": "https://must-not-follow.example"},
+        {"previous": "https://must-not-follow.example", "cursors": {"after": "cursor"}},
+        {"cursors": {"after": "cursor"}},
+        {"next": "https://must-not-follow.example", "cursors": {"after": "https://must-not-follow.example"}},
+        {"next": "https://must-not-follow.example", "cursors": {"after": "x" * 1025}},
+    ],
+)
+def test_other_more_available_signals_never_substitute_for_older_cursor(dm, paging):
+    data = payload(dm)
+    data["messages"]["paging"] = paging
+    result, _ = read(dm, data)
+    assert result["status"] == "observed" and len(result["items"]) == 2
+    assert result["older_continuation"] is None and not result["history_complete"]
+    assert result["older_history_status"] != "available"
+
+
+@pytest.mark.parametrize(
+    "platform,host", [("facebook", "graph.facebook.com"), ("instagram_login", "graph.instagram.com")]
+)
+def test_older_transport_uses_two_fixed_same_thread_gets_and_no_next_url(dm, platform, host, caplog):
+    dm.account.platform = platform
+    dm.account.save(update_fields=["platform"])
+    first, _ = read(dm, paged_payload(dm))
+    older = paged_payload(dm, page=1)
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        assert request.method == "GET" and request.url.host == host
+        assert request.headers["Authorization"] == "Bearer tok"
+        assert "access_token" not in request.url.params and "tok" not in str(request.url)
+        if len(requests) == 1:
+            assert request.url.path == "/v25.0/conversation-1"
+            assert dict(request.url.params) == {"fields": "id,participants{id}"}
+            return httpx.Response(200, json={"id": older["id"], "participants": older["participants"]})
+        assert request.url.path == "/v25.0/conversation-1/messages"
+        assert request.url.params["after"] == "older-page-1" and request.url.params["limit"] == "20"
+        assert request.url.params["fields"] == reads._MESSAGE_FIELDS
+        return httpx.Response(200, json=older["messages"])
+
+    client = httpx.Client(transport=httpx.MockTransport(handle), follow_redirects=False)
+    with patch.object(reads.httpx, "Client", return_value=client):
+        result = reads.read_native_thread(
+            dm.message,
+            authorization=reads.session_read_authorization(dm.user),
+            continuation=first["older_continuation"],
+        )
+    assert result["status"] == "observed" and len(requests) == 2 and result["older_continuation"]
+    assert "PRIVATE_NEXT_TOKEN" not in caplog.text + str(result)
+
+
+def test_older_transport_rejects_changed_participants_before_messages_get(dm):
+    first, _ = read(dm, paged_payload(dm))
+    requests = []
+    data = payload(dm)
+    data["participants"]["data"].append({"id": "private-third-party"})
+
+    def handle(request):
+        requests.append(request)
+        return httpx.Response(200, json=data)
+
+    client = httpx.Client(transport=httpx.MockTransport(handle), follow_redirects=False)
+    with patch.object(reads.httpx, "Client", return_value=client):
+        result = reads.read_native_thread(
+            dm.message,
+            authorization=reads.session_read_authorization(dm.user),
+            continuation=first["older_continuation"],
+        )
+    assert result["reason_code"] == "participants_unverified" and not result["items"]
+    assert result["older_continuation"] is None and len(requests) == 1
+
+
+def test_cursor_contains_no_platform_credential_or_message_content_and_is_bounded(dm):
+    data = paged_payload(dm)
+    data["messages"]["paging"]["cursors"]["after"] = "x" * reads.MAX_PROVIDER_CURSOR_LENGTH
+    data["messages"]["paging"]["next"] = (
+        "https://graph.facebook.com/v25.0/conversation-1/messages?after=" + "x" * reads.MAX_PROVIDER_CURSOR_LENGTH
+    )
+    result, _ = read(dm, data)
+    token = result["older_continuation"]
+    assert len(token) <= reads.MAX_CONTINUATION_LENGTH
+    decoded = signing.loads(token, salt=reads.CONTINUATION_SALT)
+    assert set(decoded) == {"scope", "after", "oldest", "previous_ids"}
+    assert dm.account.oauth_access_token not in json.dumps(decoded)
+    assert "中" not in json.dumps(decoded, ensure_ascii=False)
+    assert "page-0-message-0" not in json.dumps(decoded)
+    assert len(json.dumps(result).encode()) < reads.MAX_RESULT_BYTES
+    envelope = {"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": json.dumps(result)}]}}
+    assert len(json.dumps(envelope).encode()) < 64 * 1024
+
+
+@pytest.mark.parametrize("fault", ["revocation", "account_token", "anchor_thread"])
+def test_older_page_rechecks_authority_and_identity_after_second_get(dm, fault):
+    first, _ = read(dm, paged_payload(dm))
+    older = paged_payload(dm, page=1)
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(200, json={"id": older["id"], "participants": older["participants"]})
+        if fault == "revocation":
+            dm.member.delete()
+        elif fault == "account_token":
+            SocialAccount.objects.filter(pk=dm.account.pk).update(oauth_access_token="rotated")
+        else:
+            InboxMessage.objects.filter(pk=dm.message.pk).update(extra={"conversation_id": "other-thread"})
+        return httpx.Response(200, json=older["messages"])
+
+    client = httpx.Client(transport=httpx.MockTransport(handle), follow_redirects=False)
+    with patch.object(reads.httpx, "Client", return_value=client), pytest.raises(reads.NativeThreadReadError) as error:
+        reads.read_native_thread(
+            dm.message,
+            authorization=reads.session_read_authorization(dm.user),
+            continuation=first["older_continuation"],
+        )
+    assert error.value.code == ("authorization_revoked" if fault == "revocation" else "stale")
+    assert len(requests) == 2 and not ConversationMessage.objects.exists()
+
+
+@pytest.mark.parametrize("flag", ["truncated", "is_truncated"])
+def test_provider_reported_omissions_cannot_be_skipped_with_a_cursor(dm, flag):
+    data = paged_payload(dm)
+    data["messages"][flag] = True
+    result, _ = read(dm, data)
+    assert result["status"] == "observed" and len(result["items"]) == 20
+    assert result["older_history_status"] == "unavailable"
+    assert result["older_continuation"] is None and result["history_complete"] is False
+
+
+@pytest.mark.parametrize("total", [True, "20", -1, 19])
+def test_contradictory_provider_summary_does_not_advance(dm, total):
+    data = paged_payload(dm)
+    data["messages"]["summary"] = {"total_count": total}
+    result, _ = read(dm, data)
+    assert result["status"] == "observed" and len(result["items"]) == 20
+    assert result["older_history_status"] == "unavailable"
+    assert result["older_continuation"] is None
+
+
+@pytest.mark.parametrize("more", [False, True])
+def test_initial_unordered_observations_remain_visible_without_older_cursor(dm, more):
+    data = paged_payload(dm, more=more)
+    data["messages"]["data"].reverse()
+    result, _ = read(dm, data)
+    assert result["status"] == "observed" and len(result["items"]) == 20
+    assert [item["occurred_at"] for item in result["items"]] == sorted(row["occurred_at"] for row in result["items"])
+    assert result["older_history_status"] == "unavailable" and result["older_continuation"] is None
+    assert result["coverage"]["output_omitted_count"] == 0 and result["history_complete"] is False
+
+
+@pytest.mark.parametrize("fault", ["paging", "next", "cursors", "summary"])
+def test_initial_unknown_pagination_keeps_valid_rows_but_cannot_advance(dm, fault):
+    data = paged_payload(dm)
+    if fault == "paging":
+        data["messages"]["paging"] = []
+    elif fault == "next":
+        data["messages"]["paging"]["next"] = []
+    elif fault == "cursors":
+        data["messages"]["paging"]["cursors"] = []
+    else:
+        data["messages"]["summary"] = []
+    result, _ = read(dm, data)
+    assert result["status"] == "observed" and len(result["items"]) == 20
+    assert result["older_history_status"] == "unavailable" and result["older_continuation"] is None
+
+
+@pytest.mark.parametrize("platform", ["facebook", "instagram_login"])
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "external_host",
+        "other_provider_host",
+        "wrong_thread",
+        "wrong_version",
+        "nested_shape",
+        "userinfo",
+        "fragment",
+        "http",
+        "duplicate_after",
+        "mismatched_after",
+        "missing_after",
+        "time_filter",
+        "raw_newline",
+    ],
+)
+def test_older_cursor_requires_provider_evidence_of_exact_supported_route(dm, platform, fault):
+    dm.account.platform = platform
+    dm.account.save(update_fields=["platform"])
+    data = paged_payload(dm)
+    host = "graph.facebook.com" if platform == "facebook" else "graph.instagram.com"
+    route = f"https://{host}/v25.0/conversation-1/messages"
+    url = route + "?after=older-page-1&access_token=PRIVATE_NEXT_TOKEN"
+    if fault == "external_host":
+        url = url.replace(host, "evil.example")
+    elif fault == "other_provider_host":
+        url = url.replace(host, "graph.instagram.com" if platform == "facebook" else "graph.facebook.com")
+    elif fault == "wrong_thread":
+        url = url.replace("conversation-1/messages", "foreign-thread/messages")
+    elif fault == "wrong_version":
+        url = url.replace("v25.0", "v99.0")
+    elif fault == "nested_shape":
+        url = url.replace("/messages?", "?fields=messages&")
+    elif fault == "userinfo":
+        url = url.replace("https://", "https://private-user:private-password@")
+    elif fault == "fragment":
+        url += "#fragment"
+    elif fault == "http":
+        url = url.replace("https:", "http:")
+    elif fault == "duplicate_after":
+        url += "&%61fter=older-page-1"
+    elif fault == "mismatched_after":
+        url = url.replace("after=older-page-1", "after=other-cursor")
+    elif fault == "missing_after":
+        url = route + "?access_token=PRIVATE_NEXT_TOKEN"
+    elif fault == "time_filter":
+        url += "&since=123"
+    else:
+        url += "\n"
+    data["messages"]["paging"]["next"] = url
+    result, request = read(dm, data)
+    assert result["status"] == "observed" and len(result["items"]) == 20
+    assert result["older_history_status"] == "unavailable" and result["older_continuation"] is None
+    assert result["more_available"] and not result["history_complete"]
+    assert "PRIVATE_NEXT_TOKEN" not in str(result) and "private-password" not in str(result)
     request.assert_called_once()

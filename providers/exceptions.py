@@ -92,9 +92,11 @@ class RateLimitError(ProviderError):
         self,
         message: str,
         retry_after: int | None = None,
+        status_code: int | None = None,
         **kwargs,
     ):
         self.retry_after = retry_after
+        self.status_code = status_code
         super().__init__(message, **kwargs)
 
 
@@ -129,9 +131,8 @@ class QuotaExceededError(RateLimitError):
         **kwargs,
     ):
         self.resets_at = resets_at
-        self.status_code = status_code
         self.quota_scope = quota_scope
-        super().__init__(message, **kwargs)
+        super().__init__(message, status_code=status_code, **kwargs)
 
 
 class PublishError(ProviderError):

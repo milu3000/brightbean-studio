@@ -936,6 +936,13 @@ class NativeInboxThreadReadRequest(Schema):
     limit: int = Field(
         50, ge=1, le=100, strict=True, description="Maximum messages in this one-time platform snapshot."
     )
+    continuation: str | None = Field(
+        None,
+        min_length=1,
+        max_length=6144,
+        strict=True,
+        description="An unexpired older_continuation returned for this same authorized conversation and limit.",
+    )
 
 
 class CreateReplyRequest(Schema):
