@@ -13,7 +13,8 @@ function fixture() {
     const child = new EventEmitter();
     child.stderr = new PassThrough();
     child.stdio = [null, null, child.stderr, new PassThrough(), new PassThrough()];
-    child.kill = () => { child.emit('exit', null, 'SIGKILL'); return true; };
+    child.kills = 0;
+    child.kill = () => { child.kills++; child.emit('exit', null, 'SIGKILL'); child.emit('close', null, 'SIGKILL'); return true; };
     const writes = [], timers = new Set(), launches = [];
     child.stdio[3].on('data', bytes => writes.push(bytes.toString()));
     const module = {exports: {}};
@@ -118,4 +119,31 @@ test('cleanup still fails after a successful operation, and successful cleanup p
     assert.equal(cleaned, true);
     const original = new Error('primary failure');
     await assert.rejects(withCleanup(async () => { throw original; }, async () => {}), error => error === original);
+});
+
+test('graceful browser shutdown waits for stdio close rather than process exit', async () => {
+    const f = fixture();
+    let settled = false;
+    const closing = f.browser.close().then(() => { settled = true; });
+    assert.equal(JSON.parse(f.writes[0].slice(0, -1)).method, 'Browser.close');
+    f.reply({id: 1, result: {}});
+    f.child.emit('exit', 0, null);
+    await Promise.resolve(); await Promise.resolve();
+    assert.equal(settled, false, 'Profile cleanup must wait for inherited streams to close');
+    f.child.emit('close', 0, null);
+    await closing;
+    assert.equal(f.child.kills, 0);
+    assert.equal(f.timers.size, 0);
+});
+
+test('browser shutdown accepts exit before its response, but a deadline remains failure', async () => {
+    const f = fixture(), closing = f.browser.close();
+    f.child.emit('exit', 0, null); f.child.emit('close', 0, null);
+    await closing;
+    assert.equal(f.timers.size, 0);
+    const g = fixture(), timed = g.browser.close();
+    const failure = assert.rejects(timed, /Chromium shutdown timed out/);
+    [...g.timers][0].callback();
+    await failure;
+    assert.equal(g.child.kills, 1);
 });

@@ -11,6 +11,7 @@ class Browser {
             '--proxy-server=http://127.0.0.1:9',
             '--host-resolver-rules=MAP * ~NOTFOUND','--user-data-dir='+profile,'about:blank'
         ],{stdio:['ignore','ignore','pipe','pipe','pipe']});
+        this.finished=new Promise(resolve=>this.process.once('close',()=>{this.streamsClosed=true;resolve();}));
         this.process.stderr.setEncoding('utf8').on('data',text=>{this.stderr+=text;});
         let buffer='';
         this.process.stdio[4].setEncoding('utf8').on('data',text=>{
@@ -33,7 +34,20 @@ class Browser {
         return new Promise((resolve,reject)=>{const timer=setTimeout(()=>{this.pending.delete(id);reject(new Error('CDP timeout: '+method));},timeout);
             this.pending.set(id,{resolve,reject,timer});this.process.stdio[3].write(JSON.stringify({id,method,params,...(sessionId?{sessionId}:{})})+'\0');});
     }
-    async close(){if(this.closed)return;const exited=new Promise(resolve=>this.process.once('exit',resolve));this.process.kill('SIGKILL');await exited;}
+    async close(){
+        if(this.streamsClosed)return;
+        let timer;
+        const finished=new Promise((resolve,reject)=>{
+            timer=setTimeout(()=>{this.process.kill('SIGKILL');reject(new Error('Chromium shutdown timed out'));},8000);
+            this.finished.then(resolve);
+        });
+        // CDP shutdown lets Chromium stop its profile writers. Node's close
+        // event additionally waits for inherited stdio; exit alone does not.
+        const graceful=this.closed?Promise.resolve():this.command('Browser.close').catch(error=>{
+            if(!this.closed){this.process.kill('SIGKILL');throw error;}
+        });
+        try { await Promise.all([graceful,finished]); } finally { clearTimeout(timer); }
+    }
 }
 async function withCleanup(operation, cleanup) {
     let result, failure;
