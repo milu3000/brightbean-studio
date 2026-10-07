@@ -104,6 +104,17 @@
     function storedEvents(timeline) {
         return Array.from(timeline.children).filter(element => element.dataset.timelineEvent === 'stored');
     }
+    function removeLoadedSelectedAside(state) {
+        const rows = storedEvents(state.timeline).filter(element => element.dataset.eventId === 'incoming:' + state.anchor);
+        if (rows.length !== 1 || rows[0].dataset.eventKind !== 'incoming' || rows[0].dataset.eventDirection !== 'inbound') return;
+        const selected = element => Array.from(element.querySelectorAll('[data-incoming-message-id]'))
+            .filter(bubble => bubble.dataset.incomingMessageId === state.anchor);
+        if (selected(rows[0]).length !== 1) return;
+        state.panel.querySelectorAll('aside').forEach(aside => {
+            if (!state.timeline.contains(aside) && aside.getAttribute('aria-label') === 'Selected message outside this history page' &&
+                selected(aside).length === 1) aside.remove();
+        });
+    }
     function restoreTimeline(timeline) {
         // DOM markers also survive a history clone; no in-memory state is needed.
         timeline.querySelectorAll('[data-native-thread-transient]').forEach(element => element.remove());
@@ -556,6 +567,12 @@
         const keys = fresh.map(savedEventKey);
         if (!fresh.length || keys.some(key => !key) || state.timeline.dataset.historyComplete === 'true') return false;
         const boundary = keys.reduce((oldest, key) => beforeSaved(key, oldest) ? key : oldest);
+        // New notes/replies can displace the whole first page without changing
+        // native scope. Reusing an old cursor then would skip an unseen gap.
+        const overlap = saved.rows.filter(element => element.dataset.eventId === boundary[2]);
+        const oldBoundary = overlap.length === 1 && savedEventKey(overlap[0]);
+        if (!oldBoundary || oldBoundary.some((value, index) => value !== boundary[index]) ||
+            fresh.filter(element => element.dataset.eventId === boundary[2]).length !== 1) return false;
         const freshIds = new Set(fresh.map(element => element.dataset.eventId));
         // Only earlier rows lie outside the new response's authoritative
         // range. Missing IDs inside that range must not be resurrected.
@@ -585,6 +602,7 @@
         storedEvents(state.timeline).forEach((element, index) => { element.dataset.storedOrder = String(index); });
         state.root.querySelector('[data-stored-history-status]').textContent = saved.status;
         state.root.querySelector('[data-stored-history-retry]').hidden = saved.retryHidden;
+        removeLoadedSelectedAside(state);
         return true;
     }
     async function loadOlder(state) {
@@ -665,6 +683,7 @@
             state.timeline.dataset.historyComplete = page.dataset.historyComplete;
             state.pageKeys.add(page.dataset.timelinePageKey);
             state.savedPages += 1;
+            removeLoadedSelectedAside(state);
             localTimes(state.panel);
             if (state.items) merge(state, state.items);
             status.textContent = olderUrl ? 'Earlier saved messages loaded. Scroll up to load more.' : 'Beginning of saved history reached. Platform history may still be incomplete.';

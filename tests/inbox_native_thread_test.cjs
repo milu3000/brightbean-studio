@@ -372,6 +372,69 @@ test('a newly loaded saved exact match merges an existing native card without du
     assert.match(app.timeline.textContent, /Also observed on platform/);
 });
 
+test('loading the uniquely identified selected saved incoming removes its outside-history duplicate', async () => {
+    const app = setup();
+    app.outside['aria-label'] = 'Selected message outside this history page';
+    const selected = app.outside.appendChild(new Element('article', { incomingMessageId: 'anchor-a' }));
+    selected.textContent = 'Selected message shown outside history';
+    await resolve(app, 0, snapshot([native('anchor-a', 'Native selected observation', '2026-10-05T08:00:00Z', 'inbound')]));
+    assert.equal(app.outside.parent, app.history, 'A native observation alone is not proof of a saved row');
+    app.scroll(80);
+    const saved = stored('anchor-a', 'inbound', '2026-10-05T08:00:00Z', 'Selected incoming in saved history');
+    saved.querySelector('[data-stored-event-bubble]').dataset.incomingMessageId = 'anchor-a';
+    await resolve(app, 1, app.page([saved]));
+    assert.equal(app.outside.parent, null);
+    assert.equal(app.timeline.querySelectorAll('[data-incoming-message-id="anchor-a"]').length, 1);
+    assert.match(app.timeline.textContent, /Selected incoming in saved history/);
+    assert.equal(app.composer.value, 'My interrupted unsaved reply');
+});
+
+test('unloaded, failed, wrong-scope or ambiguous saved evidence keeps the selected outside-history message', async () => {
+    for (const mode of ['not-yet-loaded', 'failed', 'wrong-scope', 'missing-bubble-id', 'ambiguous']) {
+        const app = setup(); app.outside['aria-label'] = 'Selected message outside this history page';
+        app.outside.appendChild(new Element('article', { incomingMessageId: 'anchor-a' }));
+        await resolve(app, 0, snapshot([]));
+        if (mode === 'ambiguous') {
+            for (let i = 0; i < 2; i++) {
+                const row = stored('anchor-a', 'inbound', '2026-10-05T08:00:00Z', 'Ambiguous selected copy');
+                row.querySelector('[data-stored-event-bubble]').dataset.incomingMessageId = 'anchor-a';
+                app.timeline.appendChild(row);
+            }
+        }
+        app.scroll(80);
+        if (mode === 'failed') app.requests[1].reject(new Error('Unavailable'));
+        else {
+            const row = stored(mode === 'not-yet-loaded' || mode === 'ambiguous' ? 'other' : 'anchor-a',
+                'inbound', '2026-10-05T08:00:00Z', 'Loaded row');
+            if (mode !== 'missing-bubble-id') row.querySelector('[data-stored-event-bubble]').dataset.incomingMessageId = 'anchor-a';
+            await resolve(app, 1, app.page([row], { anchor: mode === 'wrong-scope' ? 'anchor-b' : 'anchor-a' }));
+        }
+        await flush();
+        assert.ok(app.outside.parent === app.history, mode);
+        assert.equal(app.composer.value, 'My interrupted unsaved reply');
+    }
+});
+
+test('same-scope retention keeps the fresh selected bubble and removes only its duplicate aside', async () => {
+    const app = setup(); app.root.dataset.nativeViewScope = 'verified-server-scope';
+    const fresh = app.panel.cloneNode(true);
+    const aside = fresh.querySelector('aside'); aside['aria-label'] = 'Selected message outside this history page';
+    const selected = aside.appendChild(new Element('article', { incomingMessageId: 'anchor-a', storedEventBubble: '' }));
+    selected.textContent = 'Fresh selected status: resolved';
+    await resolve(app, 0, snapshot([])); app.scroll(80);
+    const saved = stored('anchor-a', 'inbound', '2026-10-05T08:00:00Z', 'Old selected status: open');
+    saved.querySelector('[data-stored-event-bubble]').dataset.incomingMessageId = 'anchor-a';
+    await resolve(app, 1, app.page([saved], { older: '/inbox/anchor-a/?history_before=next', complete: 'false' }));
+    const detail = savedAction(app); app.document.emit('htmx:beforeRequest', { detail });
+    app.container.replaceChildren(fresh);
+    app.document.emit('htmx:afterSwap', { detail: { ...detail, xhr: { status: 200 } } });
+    assert.ok(aside.parent === null);
+    assert.equal(fresh.querySelectorAll('[data-incoming-message-id="anchor-a"]').length, 1);
+    assert.match(fresh.querySelector('[data-stored-timeline-events]').textContent, /Fresh selected status: resolved/);
+    assert.doesNotMatch(fresh.textContent, /Old selected status: open/);
+    assert.equal(fresh.querySelector('textarea').value, 'My interrupted unsaved reply');
+});
+
 test('paging errors or wrong-anchor fragments retain current view and permit a bounded retry', async () => {
     const app = setup(); await resolve(app, 0); const before = app.timeline.outerHTML;
     app.scroll(50); await resolve(app, 1, app.page([stored('bad', 'inbound', '2026-10-05T08:00:00Z', 'Wrong thread')], { anchor: 'anchor-b' }));
@@ -1041,6 +1104,30 @@ test('unknown fresh timestamps refuse old-row restoration and explain that the f
     const status = fresh.querySelector('[data-stored-history-status]').textContent;
     assert.match(status, /fresh saved page is shown; scroll up/);
     assert.doesNotMatch(status, /preserved|position retained|anchor retained/);
+    assert.equal(fresh.querySelector('textarea').value, 'My interrupted unsaved reply');
+});
+
+test('a wholly new first page keeps its fresh cursor instead of skipping an unseen history gap', async () => {
+    const app = setup(); app.root.dataset.nativeViewScope = 'verified-server-scope';
+    const fresh = app.panel.cloneNode(true);
+    const timeline = fresh.querySelector('[data-stored-timeline-events]');
+    // Unlike incoming-message identity changes, new internal notes do not
+    // alter native_view_scope; 50 newest notes can hide another unseen note.
+    timeline.replaceChildren(...Array.from({ length: 50 }, (_, index) =>
+        stored('new-note-' + String(index + 1).padStart(2, '0'), 'internal', '2026-10-08T08:00:00Z',
+            'New note after unseen gap ' + (index + 1), 'note')));
+    timeline.dataset.olderUrl = '/inbox/anchor-a/?history_before=fresh-gap';
+    await resolve(app, 0, snapshot([])); app.scroll(80);
+    await resolve(app, 1, app.page([stored('older', 'inbound', '2026-10-05T08:00:00Z', 'Cached row before unseen gap')],
+        { older: '/inbox/anchor-a/?history_before=old-cursor', complete: 'false' }));
+    const detail = savedAction(app); app.document.emit('htmx:beforeRequest', { detail });
+    app.container.replaceChildren(fresh);
+    app.document.emit('htmx:afterSwap', { detail: { ...detail, xhr: { status: 200 } } });
+    assert.doesNotMatch(timeline.textContent, /Cached row before unseen gap|Stored incoming|Stored sent reply/);
+    assert.equal(timeline.dataset.olderUrl, '/inbox/anchor-a/?history_before=fresh-gap');
+    assert.match(fresh.querySelector('[data-stored-history-status]').textContent, /fresh saved page is shown/);
+    const scroller = fresh.querySelector('[data-inbox-scroll]'); scroller.scrollTop = 20; scroller.emit('scroll');
+    assert.equal(app.requests[2].url, 'https://example.com/inbox/anchor-a/?history_before=fresh-gap');
     assert.equal(fresh.querySelector('textarea').value, 'My interrupted unsaved reply');
 });
 
