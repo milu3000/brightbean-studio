@@ -25,6 +25,26 @@
         authorization_revoked: 'Your access changed while reading. No platform content is shown.',
         stale: 'The selected message or account changed. Reopen it before reading again.'
     };
+    const diagnosticReasons = new Set(Object.keys(reasons).concat([
+        'bounded_snapshot', 'no_messages_observed', 'read_failed', 'invalid_limit', 'stale_page',
+        'pagination_unavailable', 'invalid_continuation', 'expired_continuation', 'stale_continuation'
+    ]));
+    const diagnosticCounts = {
+        scanned_count: 'nativeReadScannedCount', returned_count: 'nativeReadReturnedCount', skipped_count: 'nativeReadSkippedCount'
+    };
+    function clearReadMetadata(root) {
+        delete root.dataset.nativeReadReasonCode;
+        Object.values(diagnosticCounts).forEach(key => { delete root.dataset[key]; });
+    }
+    function readMetadata(root, result) {
+        clearReadMetadata(root);
+        root.dataset.nativeReadReasonCode = diagnosticReasons.has(result.reason_code) ? result.reason_code : 'unrecognized_response';
+        const coverage = result.coverage || {};
+        Object.entries(diagnosticCounts).forEach(([field, key]) => {
+            const value = coverage[field];
+            if (Number.isInteger(value) && value >= 0 && value <= 100) root.dataset[key] = String(value);
+        });
+    }
     function node(parent, tag, text, className) {
         const element = document.createElement(tag);
         if (text) element.textContent = text;
@@ -124,6 +144,7 @@
         });
     }
     function clearControls(root) {
+        clearReadMetadata(root);
         const button = root.querySelector('[data-native-thread-refresh]');
         button.disabled = false;
         button.hidden = true;
@@ -324,6 +345,7 @@
     }
     async function refresh(state) {
         if (!current(state) || (state.controller && state.loading)) return;
+        clearReadMetadata(state.root);
         if (state.controller) state.controller.abort();
         restoreTimeline(state.timeline);
         if (state.nativePageController) state.nativePageController.abort();
@@ -361,6 +383,7 @@
             const result = await response.json();
             if (!valid()) return;
             if (result.anchor_message_id !== state.anchor) throw new Error('mismatched_anchor');
+            readMetadata(state.root, result);
             if (result.status !== 'observed' || !response.ok) {
                 status.textContent = reasons[result.reason_code] || 'The conversation could not be read. Saved history is still available.';
                 return;
@@ -391,6 +414,7 @@
             else if (!state.userScrolledUp) bottom(state);
         } catch (_) {
             if (valid()) {
+                clearReadMetadata(state.root);
                 restoreTimeline(state.timeline);
                 state.items = null;
                 warning.hidden = true;
@@ -471,9 +495,12 @@
                 clearPlatformAccess(state);
                 return;
             }
-            if (['invalid_continuation', 'expired_continuation', 'continuation_expired', 'continuation_invalid'].includes(result.reason_code)) {
+            if (['invalid_continuation', 'expired_continuation', 'continuation_expired', 'continuation_invalid', 'stale_page'].includes(result.reason_code)) {
+                clearReadMetadata(state.root);
                 state.nativeCursor = '';
-                status.textContent = 'This earlier-history read has expired or is invalid. Reload the latest platform conversation to start a new read.';
+                status.textContent = result.reason_code === 'stale_page' ?
+                    'The platform page changed while reading. Reload the latest platform conversation to start a new read.' :
+                    'This earlier-history read has expired or is invalid. Reload the latest platform conversation to start a new read.';
                 const reload = state.root.querySelector('[data-native-thread-refresh]');
                 reload.textContent = 'Reload latest platform conversation';
                 reload.hidden = false;

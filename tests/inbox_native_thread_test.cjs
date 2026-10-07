@@ -1160,3 +1160,91 @@ test('editing an existing draft is accepted only from its own rendered draft act
     assert.match(fresh.textContent, /Earlier during draft edit/);
     assert.equal(app.requests.length, 2);
 });
+
+test('initial scoped success and unavailable responses expose only whitelisted diagnostic metadata', async () => {
+    for (const [status, reason] of [['observed', 'bounded_snapshot'], ['unavailable', 'invalid_response']]) {
+        const app = setup();
+        await resolve(app, 0, { ...snapshot(), status, reason_code: reason, coverage: {
+            scanned_count: 100, returned_count: status === 'observed' ? 20 : 0, skipped_count: 0,
+            private_body: 'DO NOT COPY', cursor: 'PRIVATE TOKEN'
+        } });
+        assert.equal(app.root.dataset.nativeReadReasonCode, reason);
+        assert.equal(app.root.dataset.nativeReadScannedCount, '100');
+        assert.equal(app.root.dataset.nativeReadReturnedCount, status === 'observed' ? '20' : '0');
+        assert.equal(app.root.dataset.nativeReadSkippedCount, '0');
+        assert.equal(Object.keys(app.root.dataset).filter(key => key.startsWith('nativeRead')).length, 4);
+        assert.doesNotMatch(app.root.outerHTML, /DO NOT COPY|PRIVATE TOKEN/);
+        assert.equal(app.requests.length, 1);
+    }
+});
+
+test('unknown diagnostic reasons and invalid counters never enter DOM attributes', async () => {
+    for (const value of [NaN, Infinity, -Infinity, -1, 101, 1.5, '20', true, null, {}, []]) {
+        const app = setup();
+        await resolve(app, 0, { ...snapshot(), status: 'unavailable', reason_code: '<unsafe PRIVATE_TOKEN>',
+            coverage: { scanned_count: value, returned_count: value, skipped_count: value } });
+        assert.equal(app.root.dataset.nativeReadReasonCode, 'unrecognized_response');
+        for (const key of ['nativeReadScannedCount', 'nativeReadReturnedCount', 'nativeReadSkippedCount']) {
+            assert.equal(Object.hasOwn(app.root.dataset, key), false);
+        }
+        assert.doesNotMatch(app.root.outerHTML, /PRIVATE_TOKEN|<unsafe/);
+    }
+});
+
+test('diagnostic metadata is removed before real HTMX cache writes and failed navigation recovery', async () => {
+    for (const mode of ['cache', 'failed-navigation']) {
+        const app = setup(); const history = bundledHistory(app);
+        await resolve(app, 0, { ...snapshot(), coverage: { scanned_count: 35, returned_count: 20, skipped_count: 0 } });
+        assert.equal(app.root.dataset.nativeReadScannedCount, '35');
+        if (mode === 'cache') {
+            history.save();
+            assert.doesNotMatch(history.storage.get('htmx-history-cache'), /data-native-read-|bounded_snapshot/);
+        } else {
+            const detail = savedAction(app);
+            app.document.emit('htmx:beforeRequest', { detail });
+            app.document.emit('htmx:sendError', { detail });
+        }
+        assert.equal(Object.keys(app.root.dataset).some(key => key.startsWith('nativeRead')), false);
+        assert.equal(app.composer.value, 'My interrupted unsaved reply');
+    }
+});
+
+test('late diagnostic responses cannot attach to a new anchor during rapid navigation', async () => {
+    const app = setup();
+    const element = app.panel.appendChild(new Element('a', { inboxOpenMessage: 'anchor-b' }));
+    app.document.emit('htmx:beforeRequest', { detail: { elt: element, target: app.container } });
+    const replacement = app.panel.cloneNode(true);
+    const root = replacement.querySelector('[data-native-thread]');
+    replacement.dataset.selectedMessageId = root.dataset.anchorId = 'anchor-b';
+    root.dataset.refreshUrl = '/inbox/anchor-b/native-thread/';
+    replacement.querySelector('[data-stored-timeline-events]').dataset.timelineAnchorId = 'anchor-b';
+    app.container.replaceChildren(replacement);
+    app.document.emit('htmx:afterSwap', { detail: { elt: element, target: app.container } });
+    await resolve(app, 0, { ...snapshot(), coverage: { scanned_count: 99, returned_count: 99, skipped_count: 0 } });
+    assert.equal(Object.keys(root.dataset).some(key => key.startsWith('nativeRead')), false);
+    await resolve(app, 1, { ...snapshot(), anchor_message_id: 'anchor-b', coverage: { scanned_count: 1, returned_count: 1, skipped_count: 0 } });
+    assert.equal(root.dataset.nativeReadScannedCount, '1');
+    assert.equal(root.dataset.nativeReadReturnedCount, '1');
+});
+
+test('changed same-page response clears its continuation and explicit reload starts a new read', async () => {
+    const app = setup(); app.timeline.dataset.olderUrl = '';
+    await resolve(app, 0, { ...snapshot(), older_continuation: 'stale-same-page-position' });
+    app.scroll(20);
+    assert.equal(app.requests[1].options.body, 'continuation=stale-same-page-position');
+    await resolve(app, 1, { ...snapshot([]), status: 'unavailable', reason_code: 'stale_page' });
+    assert.match(app.nativeStatus.textContent, /platform page changed.*Reload/);
+    assert.equal(app.nativeRetry.hidden, true);
+    assert.equal(app.button.hidden, false);
+    assert.equal(app.button.textContent, 'Reload latest platform conversation');
+    app.click(app.nativeRetry); app.scroll(0);
+    assert.equal(app.requests.length, 2, 'The stale continuation cannot be retried');
+    assert.equal(app.composer.value, 'My interrupted unsaved reply');
+    app.click(app.button);
+    assert.equal(app.requests.length, 3);
+    assert.equal(app.requests[2].options.body, undefined, 'Explicit reload starts from latest');
+    await resolve(app, 2, { ...snapshot([native('fresh', 'Fresh platform read')]), older_continuation: 'fresh-position' });
+    app.scroller.scrollTop = 200; app.scroller.emit('scroll'); app.scroll(20);
+    assert.equal(app.requests[3].options.body, 'continuation=fresh-position');
+    assert.equal(app.composer.value, 'My interrupted unsaved reply');
+});

@@ -1500,7 +1500,9 @@ register_tool(
         description=(
             "Explicitly read one current Instagram/Facebook conversation using an existing authorized inbox message's "
             "native thread ID. May show native app replies absent from BrightBean's stored replies. Reads a bounded "
-            "page (at most 20 messages); pass its older_continuation only to request an earlier page of the same thread. "
+            "chunk of at most min(limit, 20) messages. A larger provider page is fully validated, then re-read with "
+            "signed offsets until consumed; changed page identities require reloading. Pass its older_continuation "
+            "only to request an earlier chunk of the same thread. "
             "A continuation can make two fixed-thread reads to verify participants and retrieve messages. "
             "Does not poll, follow provider paging URLs, save message content, mark work answered, "
             "change capture, or send. Only verified direct conversations are returned. The snapshot is incomplete and "

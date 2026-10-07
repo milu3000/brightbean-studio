@@ -24,9 +24,15 @@ without restarting a platform request automatically.
 
 REST uses `POST /api/v1/inbox/{message_id}/native-thread/read`; MCP uses
 `read_native_inbox_thread`. Both accept `limit` (1–100, default 50) and an optional
-`continuation` returned as `older_continuation` by an earlier read. Actual pages
-contain at most 20 provider messages. All three surfaces use the same reader.
+`continuation` returned as `older_continuation` by an earlier read. Requests ask
+the provider for at most 20 messages. A returned provider page can contain up to
+100 rows, all of which must validate before any are displayed. Each response
+returns at most `min(limit, 20)` complete message identities. The
+`provider_page_limit` coverage field reports the requested transport hint;
+`scanned_count` reports the full provider page and `returned_count` the displayed
+chunk. All three surfaces use the same reader.
 Existing stored-message API tools still do not initiate a provider read.
+The browser, REST, and MCP keep the default caller limit of 50.
 
 ## Scope and pagination
 
@@ -42,27 +48,40 @@ The first page makes one bounded GET to the fixed Instagram/Facebook API host.
 An earlier page makes at most two: verify the exact conversation and participant
 pair, then read that same conversation's messages edge. It uses the existing
 credential, follows no redirects or provider paging URLs, refreshes no credential,
-and creates no subscription, enrollment, or background task. A continuation is
-issued only when the provider's own next-page metadata confirms the expected
-host, API version, thread, messages edge, and cursor. Unsupported shapes stop
-pagination with an incomplete-history notice. Meta's generic cursor contract is
+and creates no subscription, enrollment, or background task. When a provider
+page exceeds the display chunk, a signed offset re-reads the same fixed page.
+Its full ordered identity/time/direction digest must still match; a changed page
+stops with a reload notice. Only after every chunk has been shown can the reader
+advance to another provider page, and only when the provider's next-page
+metadata confirms the expected host, API version, thread, messages edge, and
+cursor. Unsupported shapes stop pagination with an incomplete-history notice.
+Meta's generic cursor contract is
 implemented in its [official SDK](https://github.com/facebook/facebook-python-business-sdk/blob/main/facebook_business/api.py).
 
 Continuations expire after 15 minutes and are signed and bound to the current
 account, selected message, native thread, actor, credential context, and requested
 limit. They are positions, never access grants. No raw provider URL, access token,
 or message body is included. Each page repeats authorization and identity checks.
-Every accepted provider row retains its identity, time and direction in the
-output; body or attachment fields can be shortened with explicit flags. Invalid
-or omitted row identities cannot be skipped while advancing. This avoids the old
+Every displayed row retains its identity, time and direction; body or attachment
+fields can be shortened with explicit flags. A provider page is exhausted across
+its signed chunks before advancing. Invalid or omitted row identities cannot be
+skipped while advancing. This avoids the old
 gap where 100 fetched rows could be reduced to 50 before advancing a provider
 cursor. Initial valid observations remain displayable if their ordering cannot
 establish a safe continuation; later pages must prove forward progress toward
 older messages.
 
-The browser bounds temporary history to 500 native messages or 25 pages. Saved
-history uses a separate signed keyset position, so newly arriving messages do not
-shift older pages. Loading either source preserves the visible scroll anchor.
+Signed continuations use compression and are withheld if they exceed 6,144
+characters or make the complete response exceed 30 KiB. A chunk that cannot
+retain every displayed row's identity within the response budget fails closed. An
+accepted snapshot without a usable continuation remains explicitly incomplete.
+
+The browser separately bounds native and saved history to 500 events or 25 pages
+per view. Saved history uses a separate signed keyset position. Safe same-thread
+draft/status rerenders retain loaded pages only when the fresh oldest event
+exactly overlaps the cached history; otherwise the fresh page and cursor are
+kept with a reload notice, avoiding an unseen gap. Loading either source
+preserves the visible scroll anchor where its identity remains verifiable.
 Exhaustion, limits, failures, and unsupported provider pagination never claim
 complete lifetime history.
 
