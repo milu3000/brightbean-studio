@@ -38,13 +38,15 @@ class Element {
     }
     getAttribute(name) { return this[name === 'datetime' ? 'dateTime' : name] || null; }
     get firstChild() { return this.children[0] || null; }
+    get parentNode() { return this.parent; }
+    replaceChild(replacement, previous) { this.insertBefore(replacement, previous); previous.remove(); }
     get scrollHeight() {
         const height = element => element.hidden ? 0 : (element.dataset.timelineEvent ? 100 : 0) + element.children.reduce((n, child) => n + height(child), 0);
         return height(this);
     }
     cloneNode(deep) {
         const copy = new Element(this.tagName, { ...this.dataset });
-        for (const key of ['_text', 'value', 'defaultValue', 'hidden', 'disabled', 'id', 'className', 'href', 'scrollTop', 'clientHeight']) copy[key] = this[key];
+        for (const key of ['_text', 'value', 'defaultValue', 'hidden', 'disabled', 'id', 'className', 'href', 'scrollTop', 'clientHeight', 'getBoundingClientRect']) copy[key] = this[key];
         if (deep) this.children.forEach(child => copy.appendChild(child.cloneNode(true)));
         return copy;
     }
@@ -153,6 +155,67 @@ function bundledHistory(app) {
     app.document.body = app.container; app.document.title = 'Inbox';
     vm.runInNewContext(bundled.slice(begin, end), context);
     return { storage, replaced, save() { context.zt(); } };
+}
+
+function savedAction(app, kind = 'status') {
+    const element = app.panel.appendChild(new Element(kind === 'status' ? 'button' : 'form'));
+    const path = '/inbox/anchor-a/' + (kind === 'draft' ? 'reply/draft/' : kind + '/');
+    element['hx-post'] = path;
+    return { elt: element, target: app.container, requestConfig: { verb: 'post', path } };
+}
+function bundledRequest(app, element) {
+    // Execute the actual pinned HTMX issuer through beforeRequest, rather
+    // than inventing its requestConfig shape. DOM/forms/XHR are offline adapters.
+    const bundled = fs.readFileSync(path.join(__dirname, '../static/js/htmx.min.js'), 'utf8');
+    assert.ok(bundled.includes('version:"2.0.4"'));
+    const begin = bundled.indexOf('function de('); const end = bundled.indexOf('function Nn(', begin);
+    assert.ok(begin > 0 && end > begin);
+    const data = new WeakMap(); let sent;
+    const map = value => value instanceof Map ? value : new Map(Object.entries(value || {}));
+    const context = {
+        ne: () => app.document, Dn: () => {}, le: node => node.isConnected, Ee: () => app.container,
+        ue: value => value, ve: {}, ie: node => { if (!data.has(node)) data.set(node, {}); return data.get(node); },
+        ee: (node, name) => node.getAttribute(name), re: () => null, oe: callback => { if (callback) callback(); },
+        fn: () => ({}), pn: () => false, cn: () => ({ errors: [], formData: new Map() }),
+        qn: map, En: () => ({}), ln: (values, extra) => { extra.forEach((value, key) => values.set(key, value)); return values; },
+        hn: value => value, An: values => Object.fromEntries(values), bn: () => ({}), ce: Object.assign, Tn: () => true,
+        Cn: (xhr, name, value) => xhr.setRequestHeader(name, value),
+        Q: { config: { methodsThatUseUrlParams: ['get'], withCredentials: false, timeout: 0 } },
+        XMLHttpRequest: class {
+            open(method, path) { this.method = method; this.path = path; }
+            overrideMimeType() {}
+            setRequestHeader() {}
+        },
+        he(node, name, detail) {
+            // Real he() binds detail.elt before dispatching the browser event.
+            detail.elt = node;
+            app.document.emit(name, { detail });
+            if (name === 'htmx:beforeRequest') { sent = detail; return false; }
+            return true;
+        },
+        fe: (_, name) => { throw new Error(name); }
+    };
+    vm.runInNewContext(bundled.slice(begin, end), context);
+    context.de('post', element.getAttribute('hx-post'), element, null, { targetOverride: app.container }, true);
+    assert.equal(sent.xhr.method, 'POST');
+    assert.equal(sent.requestConfig.path, element.getAttribute('hx-post'));
+    assert.equal(sent.requestConfig.verb, 'post');
+    return sent;
+}
+function measuredTimeline(panel) {
+    const scroller = panel.querySelector('[data-inbox-scroll]');
+    const timeline = panel.querySelector('[data-stored-timeline-events]');
+    scroller.getBoundingClientRect = () => ({ top: 0, bottom: 160 });
+    for (const row of timeline.querySelectorAll('[data-timeline-event]')) {
+        row.getBoundingClientRect = function () {
+            const currentTimeline = this.closest('[data-stored-timeline-events]');
+            const currentScroller = this.closest('[data-inbox-scroll]');
+            const index = currentTimeline.querySelectorAll('[data-timeline-event]').indexOf(this);
+            const top = Number(currentScroller.dataset.headerHeight || 0) + index * 100 - currentScroller.scrollTop;
+            return { top, bottom: top + 100 };
+        };
+    }
+    return { scroller, timeline };
 }
 
 test('opening reads once, scrolls latest, and repeated lifecycle events never duplicate the read', async () => {
@@ -789,4 +852,224 @@ test('same-scope retained observations stay out of HTMX cache during and after a
     assert.equal(app.requests.length, 1);
     history.save(); assert.doesNotMatch(history.storage.get('htmx-history-cache'), /RETAINED PRIVATE|Also observed/);
     assert.equal(replacement.querySelectorAll('[data-native-thread-item]').length, 0);
+});
+
+test('fresh same-scope draft/status panels retain loaded saved rows, viewport and advanced page continuity', async () => {
+    for (const kind of ['draft', 'status']) {
+        const app = setup(); app.root.dataset.nativeViewScope = 'verified-server-scope';
+        const fresh = app.panel.cloneNode(true);
+        fresh.querySelector('[data-inbox-scroll]').dataset.headerHeight = '45';
+        const freshTimeline = fresh.querySelector('[data-stored-timeline-events]');
+        freshTimeline.replaceChildren(
+            stored('in-1', 'inbound', '2026-10-06T08:00:00Z', 'Fresh updated saved message'),
+            stored('note-1', 'internal', '2026-10-06T09:30:00Z', 'Fresh updated note', 'note'),
+            stored('new', 'inbound', '2026-10-06T10:30:00Z', 'New first-page event')
+        );
+        const composer = fresh.querySelector('textarea'); composer.value = 'Server returned saved draft';
+        await resolve(app, 0, snapshot([]));
+        app.scroll(80);
+        await resolve(app, 1, app.page([
+            stored('older-a', 'inbound', '2026-10-04T08:00:00Z', 'Loaded earlier A'),
+            stored('older-b', 'inbound', '2026-10-05T08:00:00Z', 'Loaded earlier B')
+        ], { key: 'saved-second', older: '/inbox/anchor-a/?history_before=cursor-2', complete: 'false' }));
+        measuredTimeline(app.panel); app.scroller.scrollTop = 40;
+        const action = savedAction(app, kind);
+        const detail = bundledRequest(app, action.elt);
+        app.container.replaceChildren(fresh); measuredTimeline(fresh);
+        app.document.emit('htmx:afterSwap', { detail: { ...detail, successful: true, xhr: { status: 200 } } });
+        const rows = freshTimeline.querySelectorAll('[data-timeline-event="stored"]');
+        assert.deepEqual(rows.map(row => row.dataset.eventId), ['incoming:older-a', 'incoming:older-b', 'incoming:in-1', 'note:note-1', 'incoming:new']);
+        assert.doesNotMatch(freshTimeline.textContent, /Stored sent reply|Stored incoming|Stored internal note/);
+        assert.match(freshTimeline.textContent, /Fresh updated saved message/);
+        assert.equal(freshTimeline.dataset.olderUrl, 'https://example.com/inbox/anchor-a/?history_before=cursor-2');
+        assert.equal(composer.value, 'Server returned saved draft');
+        assert.equal(app.requests.length, 2, 'No provider reread on successful rerender');
+        const { scroller } = measuredTimeline(fresh);
+        assert.equal(rows[0].getBoundingClientRect().top, -40, 'The oldest visible saved row keeps its offset');
+        scroller.scrollTop = 20; scroller.emit('scroll');
+        assert.equal(app.requests[2].url, 'https://example.com/inbox/anchor-a/?history_before=cursor-2');
+        await resolve(app, 2, app.page([stored('ignored', 'inbound', '2026-10-03T08:00:00Z', 'Repeated page must not import')], { key: 'saved-second' }));
+        assert.doesNotMatch(freshTimeline.textContent, /Repeated page must not import/);
+        assert.equal(freshTimeline.dataset.olderUrl, '', 'Previous loaded page keys survive the rerender');
+    }
+});
+
+test('saved pages survive an allowed rerender even when the native read failed', async () => {
+    const app = setup(); app.root.dataset.nativeViewScope = 'verified-server-scope';
+    const fresh = app.panel.cloneNode(true);
+    app.requests[0].reject(new Error('Native unavailable')); await flush();
+    app.scroll(80);
+    await resolve(app, 1, app.page([stored('older', 'inbound', '2026-10-05T08:00:00Z', 'Earlier saved despite native failure')],
+        { older: '/inbox/anchor-a/?history_before=cursor-2', complete: 'false' }));
+    const detail = savedAction(app, 'draft'); app.document.emit('htmx:beforeRequest', { detail });
+    app.container.replaceChildren(fresh);
+    app.document.emit('htmx:afterSwap', { detail: { ...detail, xhr: { status: 200 } } });
+    assert.match(fresh.textContent, /Earlier saved despite native failure/);
+    assert.equal(fresh.querySelector('[data-stored-timeline-events]').dataset.olderUrl, 'https://example.com/inbox/anchor-a/?history_before=cursor-2');
+    assert.equal(fresh.querySelectorAll('[data-native-thread-item]').length, 0);
+    assert.equal(app.requests.length, 2);
+});
+
+test('fresh first-page displacement preserves older observed saved events and refreshes selected older status', async () => {
+    const app = setup(); app.root.dataset.nativeViewScope = 'verified-server-scope';
+    const fresh = app.panel.cloneNode(true);
+    const timeline = fresh.querySelector('[data-stored-timeline-events]');
+    timeline.replaceChildren(
+        stored('out-1', 'outbound', '2026-10-06T09:00:00Z', 'Fresh sent reply'),
+        stored('note-1', 'internal', '2026-10-06T09:30:00Z', 'Fresh note', 'note'),
+        stored('new', 'inbound', '2026-10-06T10:30:00Z', 'New event moved first-page boundary')
+    );
+    const selected = fresh.querySelector('[data-inbox-scroll]').appendChild(new Element('article',
+        { incomingMessageId: 'older-selected', storedEventBubble: '' }));
+    selected.textContent = 'Fresh selected status: resolved';
+    await resolve(app, 0, snapshot([])); app.scroll(80);
+    await resolve(app, 1, app.page([stored('older-selected', 'inbound', '2026-10-05T08:00:00Z', 'Stale selected status: open')],
+        { older: '/inbox/anchor-a/?history_before=cursor-2', complete: 'false' }));
+    const detail = savedAction(app); app.document.emit('htmx:beforeRequest', { detail });
+    app.container.replaceChildren(fresh);
+    app.document.emit('htmx:afterSwap', { detail: { ...detail, xhr: { status: 200 } } });
+    assert.deepEqual(timeline.querySelectorAll('[data-timeline-event="stored"]').map(row => row.dataset.eventId),
+        ['incoming:older-selected', 'incoming:in-1', 'reply:out-1', 'note:note-1', 'incoming:new']);
+    assert.match(timeline.textContent, /Stored incoming/);
+    assert.match(timeline.textContent, /Fresh selected status: resolved/);
+    assert.doesNotMatch(timeline.textContent, /Stale selected status: open|Stored sent reply/);
+});
+
+test('retained saved rows contain no native supplements or temporary hidden markers', async () => {
+    const app = setup(); app.root.dataset.nativeViewScope = 'verified-server-scope';
+    const fresh = app.panel.cloneNode(true);
+    await resolve(app, 0, snapshot([native('older', 'ONLY TEMPORARY SUPPLEMENT', '2026-10-05T08:00:00Z', 'inbound')]));
+    app.scroll(80);
+    const earlier = stored('older', 'inbound', '2026-10-05T08:00:00Z', '');
+    earlier.querySelector('[data-timeline-day-label]').hidden = true;
+    await resolve(app, 1, app.page([earlier], { older: '/inbox/anchor-a/?history_before=cursor-2', complete: 'false' }));
+    assert.match(app.timeline.textContent, /ONLY TEMPORARY SUPPLEMENT/);
+    const detail = savedAction(app); app.document.emit('htmx:beforeRequest', { detail });
+    app.container.replaceChildren(fresh);
+    app.document.emit('htmx:afterSwap', { detail: { ...detail, xhr: { status: 200 } } });
+    assert.equal(fresh.textContent.split('ONLY TEMPORARY SUPPLEMENT').length - 1, 1);
+    app.click(fresh.querySelector('[data-native-thread-dismiss]'));
+    const timeline = fresh.querySelector('[data-stored-timeline-events]');
+    assert.doesNotMatch(timeline.textContent, /ONLY TEMPORARY|Also observed/);
+    assert.equal(timeline.querySelectorAll('[data-native-thread-transient]').length, 0);
+    assert.equal(timeline.querySelectorAll('[data-native-original-hidden]').length, 0);
+    const imported = timeline.querySelector('[data-event-id="incoming:older"]');
+    assert.equal(imported.querySelector('[data-timeline-day-label]').hidden, true);
+});
+
+test('saved reuse rejects changed scopes, unsafe actions, unsuccessful or unrelated responses and prior auth loss', async () => {
+    for (const mode of ['missing-scope', 'changed-actor', 'changed-account', 'changed-thread', 'delete', 'reconnect',
+        'unknown-action', 'get', 'missing-proof', 'wrong-anchor-action', 'lookalike-action', 'query-action',
+        'cross-origin', 'response-url', '403', 'prior-403', 'complete-fresh-history', 'history-restore']) {
+        const app = setup(); app.root.dataset.nativeViewScope = 'verified-server-scope';
+        const fresh = app.panel.cloneNode(true);
+        await resolve(app, 0, snapshot([])); app.scroll(80);
+        await resolve(app, 1, app.page([stored('older', 'inbound', '2026-10-05T08:00:00Z', 'MUST NOT RESURRECT')],
+            { older: '/inbox/anchor-a/?history_before=cursor-2', complete: 'false' }));
+        if (mode === 'prior-403') {
+            app.scroll(20); await resolve(app, 2, '', false, 403);
+        }
+        const action = ['delete', 'reconnect', 'unknown-action'].includes(mode) ? mode : 'status';
+        const detail = savedAction(app, action);
+        if (mode === 'get') detail.requestConfig.verb = 'get';
+        if (mode === 'missing-proof') delete detail.requestConfig;
+        if (mode === 'wrong-anchor-action') detail.requestConfig.path = detail.elt['hx-post'] = '/inbox/anchor-b/status/';
+        if (mode === 'lookalike-action') detail.requestConfig.path = detail.elt['hx-post'] = '/inbox/anchor-a/status/delete/';
+        if (mode === 'query-action') detail.requestConfig.path = detail.elt['hx-post'] = '/inbox/anchor-a/status/?delete=1';
+        if (mode === 'cross-origin') detail.requestConfig.path = detail.elt['hx-post'] = 'https://other.example/inbox/anchor-a/status/';
+        if (mode === 'missing-scope') fresh.querySelector('[data-native-thread]').dataset.nativeViewScope = '';
+        if (mode.startsWith('changed-')) fresh.querySelector('[data-native-thread]').dataset.nativeViewScope = mode;
+        if (mode === 'complete-fresh-history') fresh.querySelector('[data-stored-timeline-events]').dataset.historyComplete = 'true';
+        app.document.emit('htmx:beforeRequest', { detail });
+        app.container.replaceChildren(fresh);
+        if (mode === 'history-restore') app.document.emit('htmx:historyRestore');
+        else app.document.emit('htmx:afterSwap', { detail: { ...detail, xhr: {
+            status: mode === '403' ? 403 : 200,
+            ...(mode === 'response-url' ? { responseURL: 'https://example.com/accounts/login/' } : {})
+        } } });
+        assert.doesNotMatch(fresh.textContent, /MUST NOT RESURRECT/, mode);
+        assert.equal(fresh.querySelector('textarea').value, 'My interrupted unsaved reply', mode);
+    }
+});
+
+test('saved pagination stops at exactly 500 rows and does not partly import an overflowing page', async () => {
+    for (const amount of [2, 3]) {
+        const rows = Array.from({ length: 498 }, (_, i) => stored('saved-' + i, 'inbound', '2026-10-06T08:00:00Z', 'Saved ' + i));
+        const app = setup({ rows }); await resolve(app, 0, snapshot([])); app.scroll(80);
+        const before = app.timeline.outerHTML; const top = app.scroller.scrollTop;
+        await resolve(app, 1, app.page(Array.from({ length: amount }, (_, i) => stored('older-' + i, 'inbound',
+            '2026-10-05T08:00:00Z', 'Extra page ' + i)), { older: '/inbox/anchor-a/?history_before=next', complete: 'false' }));
+        if (amount === 3) {
+            assert.equal(app.timeline.outerHTML.replace('data-older-url=""', 'data-older-url="/inbox/anchor-a/?history_before=cursor-1"'), before);
+            assert.equal(app.scroller.scrollTop, top);
+            assert.match(app.pageStatus.textContent, /additional page was not displayed/);
+        } else assert.equal(app.timeline.querySelectorAll('[data-timeline-event="stored"]').length, 500);
+        app.scroll(0);
+        assert.equal(app.requests.length, 2, 'The bound prevents another page request');
+        assert.match(app.pageStatus.textContent, /500 messages/);
+        assert.match(app.pageStatus.textContent, /Earlier|earlier/);
+        assert.equal(app.composer.value, 'My interrupted unsaved reply');
+    }
+});
+
+test('saved pagination stops after 25 pages without dropping already displayed rows', async () => {
+    const app = setup(); await resolve(app, 0, snapshot([]));
+    for (let page = 2; page <= 25; page++) {
+        app.scroller.scrollTop = 200; app.scroller.emit('scroll'); app.scroll(80);
+        await resolve(app, page - 1, app.page([stored('older-' + page, 'inbound', '2026-10-05T08:00:00Z', 'Earlier ' + page)],
+            { key: 'saved-page-' + page, older: '/inbox/anchor-a/?history_before=' + page, complete: 'false' }));
+    }
+    const count = app.timeline.querySelectorAll('[data-timeline-event="stored"]').length;
+    app.scroll(0);
+    assert.equal(app.requests.length, 25);
+    assert.equal(count, 27);
+    assert.equal(app.timeline.querySelectorAll('[data-timeline-event="stored"]').length, count);
+    assert.match(app.pageStatus.textContent, /25 pages.*Earlier saved activity may remain/);
+});
+
+test('unknown fresh timestamps refuse old-row restoration and explain that the fresh page is shown', async () => {
+    const app = setup(); app.root.dataset.nativeViewScope = 'verified-server-scope';
+    const fresh = app.panel.cloneNode(true);
+    fresh.querySelector('[data-event-id="reply:out-1"]').dataset.eventTime = '';
+    await resolve(app, 0, snapshot([])); app.scroll(80);
+    await resolve(app, 1, app.page([stored('older', 'inbound', '2026-10-05T08:00:00Z', 'Unverified outside boundary')],
+        { older: '/inbox/anchor-a/?history_before=next', complete: 'false' }));
+    const detail = savedAction(app); app.document.emit('htmx:beforeRequest', { detail });
+    app.container.replaceChildren(fresh);
+    app.document.emit('htmx:afterSwap', { detail: { ...detail, xhr: { status: 200 } } });
+    assert.doesNotMatch(fresh.textContent, /Unverified outside boundary/);
+    const status = fresh.querySelector('[data-stored-history-status]').textContent;
+    assert.match(status, /fresh saved page is shown; scroll up/);
+    assert.doesNotMatch(status, /preserved|position retained|anchor retained/);
+    assert.equal(fresh.querySelector('textarea').value, 'My interrupted unsaved reply');
+});
+
+test('failed unchanged-panel requests preserve saved page keys and advanced continuation', async () => {
+    const app = setup(); app.root.dataset.nativeViewScope = 'verified-server-scope';
+    await resolve(app, 0, snapshot([])); app.scroll(80);
+    await resolve(app, 1, app.page([stored('older', 'inbound', '2026-10-05T08:00:00Z', 'Loaded older')],
+        { key: 'saved-second', older: '/inbox/anchor-a/?history_before=next', complete: 'false' }));
+    const detail = savedAction(app); app.document.emit('htmx:beforeRequest', { detail });
+    app.document.emit('htmx:sendError', { detail });
+    app.scroll(20);
+    assert.equal(app.requests[2].url, 'https://example.com/inbox/anchor-a/?history_before=next');
+    await resolve(app, 2, app.page([stored('ignored', 'inbound', '2026-10-04T08:00:00Z', 'Repeated key should not import')],
+        { key: 'saved-second' }));
+    assert.doesNotMatch(app.timeline.textContent, /Repeated key should not import/);
+    assert.match(app.timeline.textContent, /Loaded older/);
+});
+
+test('editing an existing draft is accepted only from its own rendered draft action', async () => {
+    const app = setup(); app.root.dataset.nativeViewScope = 'verified-server-scope';
+    const fresh = app.panel.cloneNode(true);
+    await resolve(app, 0, snapshot([])); app.scroll(80);
+    await resolve(app, 1, app.page([stored('older', 'inbound', '2026-10-05T08:00:00Z', 'Earlier during draft edit')],
+        { older: '/inbox/anchor-a/?history_before=next', complete: 'false' }));
+    const draft = app.panel.appendChild(new Element('div', { draftTargetId: 'anchor-a' })); draft.id = 'draft-reply-a';
+    const form = draft.appendChild(new Element('form')); form['hx-post'] = '/inbox/replies/reply-a/edit/';
+    const detail = { elt: form, target: app.container, requestConfig: { verb: 'post', path: form['hx-post'] } };
+    app.document.emit('htmx:beforeRequest', { detail }); app.container.replaceChildren(fresh);
+    app.document.emit('htmx:afterSwap', { detail: { ...detail, xhr: { status: 200 } } });
+    assert.match(fresh.textContent, /Earlier during draft edit/);
+    assert.equal(app.requests.length, 2);
 });

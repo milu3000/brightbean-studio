@@ -6,6 +6,8 @@
     let active = null;
     let suspended = null;
     const opened = new WeakSet();
+    const savedRowLimit = 500;
+    const savedPageLimit = 25;
     const reasons = {
         unsupported_platform: 'This platform does not support this conversation read.',
         account_unavailable: 'This connected account is currently unavailable.',
@@ -388,6 +390,7 @@
         }
     }
     function clearPlatformAccess(state) {
+        state.retentionBlocked = true;
         discardObservation(state);
         state.root.querySelector('[data-native-thread-result]').hidden = false;
         state.root.querySelector('[data-native-thread-status]').textContent = 'Conversation access or identity changed. Temporary platform observations have been cleared.';
@@ -508,6 +511,82 @@
             return url.origin === window.location.origin && !url.username && !url.password ? url.href : '';
         } catch (_) { return ''; }
     }
+    function savedHistoryAction(state, event) {
+        // Only these existing POSTs leave saved history intact. A same-anchor
+        // panel alone is not proof that reconnect/delete/other actions do so.
+        const detail = event.detail;
+        const element = detail.elt;
+        const config = detail.requestConfig;
+        if (!element || !state.panel.contains(element) || !config ||
+            String(config.verb).toLowerCase() !== 'post') return '';
+        const declared = element.getAttribute('hx-post') || element.getAttribute('data-hx-post');
+        const requested = sameOriginUrl(config.path);
+        if (!requested || sameOriginUrl(declared) !== requested) return '';
+        const url = new URL(requested);
+        if (url.search || url.hash) return '';
+        const refreshUrl = sameOriginUrl(state.root.dataset.refreshUrl);
+        if (!refreshUrl) return '';
+        const suffix = '/' + state.anchor + '/native-thread/';
+        const nativePath = new URL(refreshUrl).pathname;
+        if (!nativePath.endsWith(suffix)) return '';
+        const prefix = nativePath.slice(0, -suffix.length) + '/';
+        const target = state.panel.querySelector('[data-reply-target-id]');
+        const targetId = target ? identity(target.dataset.replyTargetId) : state.anchor;
+        const allowed = [prefix + state.anchor + '/status/', prefix + targetId + '/reply/draft/'];
+        const draft = element.closest('[data-draft-target-id]');
+        if (draft && state.panel.contains(draft) && typeof draft.id === 'string' && draft.id.startsWith('draft-')) {
+            const replyId = identity(draft.id.slice(6));
+            if (replyId) allowed.push(prefix + 'replies/' + replyId + '/edit/');
+        }
+        return allowed.includes(url.pathname) ? requested : '';
+    }
+    function savedEventKey(element) {
+        const time = eventTime(element.dataset.eventTime);
+        const id = element.dataset.eventId;
+        const fraction = String(element.dataset.eventTime).match(/\.(\d+)(?:Z|[+-])/);
+        // Date.parse truncates microseconds; saved cursor ordering must not.
+        const subMillisecond = ((fraction && fraction[1]) || '').slice(3).padEnd(9, '0');
+        return time === null || !identity(id) ? null : [time, subMillisecond, id];
+    }
+    function beforeSaved(a, b) {
+        return a[0] < b[0] || (a[0] === b[0] && (a[1] < b[1] || (a[1] === b[1] && a[2] < b[2])));
+    }
+    function retainSavedHistory(state, saved) {
+        const fresh = storedEvents(state.timeline);
+        const keys = fresh.map(savedEventKey);
+        if (!fresh.length || keys.some(key => !key) || state.timeline.dataset.historyComplete === 'true') return false;
+        const boundary = keys.reduce((oldest, key) => beforeSaved(key, oldest) ? key : oldest);
+        const freshIds = new Set(fresh.map(element => element.dataset.eventId));
+        // Only earlier rows lie outside the new response's authoritative
+        // range. Missing IDs inside that range must not be resurrected.
+        const earlier = saved.rows.filter(element => {
+            const key = savedEventKey(element);
+            return key && beforeSaved(key, boundary) && !freshIds.has(element.dataset.eventId);
+        });
+        if (!earlier.length || fresh.length + earlier.length > savedRowLimit) return false;
+        const first = state.timeline.firstChild;
+        earlier.forEach(element => {
+            // A selected older incoming may also have a freshly rendered
+            // detail outside the first page. Its current status/body wins.
+            const incomingId = element.dataset.eventKind === 'incoming' && element.dataset.eventId.slice('incoming:'.length);
+            const bubble = incomingId && Array.from(state.panel.querySelectorAll('[data-incoming-message-id]'))
+                .find(candidate => candidate.dataset.incomingMessageId === incomingId);
+            const oldBubble = bubble && element.querySelector('[data-stored-event-bubble]');
+            if (oldBubble) { oldBubble.parentNode.replaceChild(document.importNode(bubble, true), oldBubble); }
+            state.timeline.insertBefore(element, first);
+            if (window.htmx && window.htmx.process) window.htmx.process(element);
+        });
+        state.pageKeys = new Set(saved.pageKeys);
+        state.pageKeys.delete(saved.firstPageKey);
+        state.pageKeys.add(state.timeline.dataset.timelinePageKey);
+        state.savedPages = saved.pages;
+        state.timeline.dataset.olderUrl = saved.olderUrl;
+        state.timeline.dataset.historyComplete = saved.complete;
+        storedEvents(state.timeline).forEach((element, index) => { element.dataset.storedOrder = String(index); });
+        state.root.querySelector('[data-stored-history-status]').textContent = saved.status;
+        state.root.querySelector('[data-stored-history-retry]').hidden = saved.retryHidden;
+        return true;
+    }
     async function loadOlder(state) {
         if (!current(state) || state.pageController) return;
         const url = sameOriginUrl(state.timeline.dataset.olderUrl);
@@ -516,6 +595,13 @@
         state.pageController = controller;
         const status = state.root.querySelector('[data-stored-history-status]');
         const retry = state.root.querySelector('[data-stored-history-retry]');
+        if (storedEvents(state.timeline).length >= savedRowLimit || state.savedPages >= savedPageLimit) {
+            state.timeline.dataset.olderUrl = '';
+            status.textContent = 'Saved history view limit reached (500 messages or 25 pages). Earlier saved activity may remain.';
+            retry.hidden = true;
+            state.pageController = null;
+            return;
+        }
         status.textContent = 'Loading earlier saved messages…';
         retry.hidden = true;
         const valid = () => current(state) && state.pageController === controller;
@@ -553,6 +639,12 @@
                 return;
             }
             if (earlier.some(element => !element.dataset.eventId)) throw new Error('history_events');
+            const newIds = new Set(earlier.map(element => element.dataset.eventId).filter(id => !knownIds.has(id)));
+            if (storedEvents(state.timeline).length + newIds.size > savedRowLimit) {
+                state.timeline.dataset.olderUrl = '';
+                status.textContent = 'Saved history view limit reached (500 messages). This additional page was not displayed; earlier saved activity may remain.';
+                return;
+            }
             const anchor = scrollAnchor(state);
             const beforeHeight = state.scroller.scrollHeight;
             const beforeTop = state.scroller.scrollTop;
@@ -572,6 +664,7 @@
             state.timeline.dataset.olderUrl = olderUrl;
             state.timeline.dataset.historyComplete = page.dataset.historyComplete;
             state.pageKeys.add(page.dataset.timelinePageKey);
+            state.savedPages += 1;
             localTimes(state.panel);
             if (state.items) merge(state, state.items);
             status.textContent = olderUrl ? 'Earlier saved messages loaded. Scroll up to load more.' : 'Beginning of saved history reached. Platform history may still be incomplete.';
@@ -604,13 +697,25 @@
             (!response || (response.status >= 200 && response.status < 300));
         const retained = rerender && successful && previous.observation && previous.scope &&
             previous.scope === root.dataset.nativeViewScope ? previous.observation : null;
+        const saved = rerender && successful && response && previous.saved && previous.scope &&
+            previous.scope === root.dataset.nativeViewScope &&
+            (!response.responseURL || sameOriginUrl(response.responseURL) === previous.saved.action) ? previous.saved : null;
         cancel();
         restoreTimeline(timeline);
         opened.add(root);
         const state = { root, panel, timeline, scroller, anchor: root.dataset.anchorId, userScrolledUp: false,
-            items: null, pageKeys: new Set([timeline.dataset.timelinePageKey]) };
+            items: null, pageKeys: new Set([timeline.dataset.timelinePageKey]), savedPages: 1 };
         active = state;
         suspended = null;
+        if (failedRecovery && previous && previous.panel === panel) {
+            state.pageKeys = previous.pageKeys;
+            state.savedPages = previous.savedPages;
+            state.retentionBlocked = previous.retentionBlocked;
+        }
+        if (saved && !retainSavedHistory(state, saved)) {
+            root.querySelector('[data-stored-history-status]').textContent =
+                'Saved history changed or exceeds this view’s limit. The fresh saved page is shown; scroll up to load earlier messages again.';
+        }
         localTimes(panel);
         if (recovering) {
             state.userScrolledUp = retained ? previous.userScrolledUp : true;
@@ -682,6 +787,15 @@
     }
     function suspendRequest(event) {
         const visible = active && scrollAnchor(active);
+        const savedAction = active && !active.retentionBlocked && active.root.dataset.nativeViewScope && savedHistoryAction(active, event);
+        const savedState = savedAction && active.savedPages > 1 ? {
+            action: savedAction, timeline: active.timeline, pageKeys: new Set(active.pageKeys), pages: active.savedPages,
+            firstPageKey: active.timeline.dataset.timelinePageKey,
+            olderUrl: active.timeline.dataset.olderUrl, complete: active.timeline.dataset.historyComplete,
+            status: active.pageController ? 'Earlier saved loading was interrupted. Scroll up or retry to continue.' :
+                active.root.querySelector('[data-stored-history-status]').textContent,
+            retryHidden: active.pageController ? false : active.root.querySelector('[data-stored-history-retry]').hidden
+        } : null;
         const observation = active && active.items && {
             items: active.items, cursor: active.nativeCursor, pages: active.nativePages,
             cursors: new Set(active.nativeCursors), pageKeys: new Set(active.nativePageKeys),
@@ -694,10 +808,18 @@
         };
         const previous = active ? { root: active.root, panel: active.panel, anchor: active.anchor, element: event.detail.elt,
             scope: active.root.dataset.nativeViewScope, observation, userScrolledUp: active.userScrolledUp,
+            pageKeys: new Set(active.pageKeys), savedPages: active.savedPages, retentionBlocked: active.retentionBlocked,
             selection: Boolean(event.detail.elt && event.detail.elt.dataset.inboxOpenMessage),
             scrollTop: active.scroller.scrollTop,
             scrollAnchor: visible ? { id: visible.id, platformId: visible.platformId, direction: visible.direction, offset: visible.offset } : null } : suspended;
         clearSnapshots();
+        if (savedState) {
+            // Clone only after transient supplements and hidden-state markers
+            // are removed. These bounded nodes remain in memory, never storage.
+            savedState.rows = storedEvents(savedState.timeline).map(element => element.cloneNode(true));
+            delete savedState.timeline;
+            previous.saved = savedState;
+        }
         suspended = previous;
     }
     function recoverRequest(event) {
