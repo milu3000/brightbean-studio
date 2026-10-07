@@ -119,7 +119,12 @@
         const status = state.panel.querySelector('[data-canonical-history-status]');
         if (!url || !button) return;
         const controller = new AbortController(); state.controllers.add(controller); state.loading.add(lane); button.disabled = true;
+        // The loading line lives inside the scroller. Preserve the current row
+        // before changing its height, then recapture after fetch so any user
+        // scrolling during the request remains authoritative.
+        const loadingAnchor = anchor(state), loadingTop = state.scroller.scrollTop;
         status.textContent = 'Loading earlier messages…';
+        adjust(state, loadingAnchor, loadingTop);
         try {
             const result = await fetchPage(state, url, controller); if (!result || !current(state)) return;
             const page = result.page, selector = lane === 'undated' ? '[data-canonical-undated]' : '[data-canonical-dated]';

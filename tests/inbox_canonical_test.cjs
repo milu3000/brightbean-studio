@@ -85,6 +85,40 @@ function setup(token = '') {
         async resolve(index,body,status=200){if(body instanceof Node)fragments.set(String(index),body);requests[index].resolve({ok:status>=200&&status<300,status,redirected:false,text:async()=>String(index),json:async()=>body});await new Promise(resolve=>setImmediate(resolve));}
     };
 }
+function rowGeometry(app) {
+    const scroller=app.scroller;
+    scroller.getBoundingClientRect=()=>({top:0,bottom:scroller.clientHeight});
+    Object.defineProperty(scroller,'scrollHeight',{get(){return scroller.querySelectorAll('[data-canonical-message]').length*100+(app.status.textContent?24:0);}});
+    function decorate(node) {
+        const rows=[...(node.matches('[data-canonical-message]')?[node]:[]),...node.querySelectorAll('[data-canonical-message]')];
+        rows.forEach(row=>{row.getBoundingClientRect=()=>{
+            const index=scroller.querySelectorAll('[data-canonical-message]').indexOf(row);
+            const top=(app.status.textContent?24:0)+index*100-scroller.scrollTop;
+            return {top,bottom:top+100};
+        };});
+        return node;
+    }
+    decorate(app.history);
+    const importNode=app.document.importNode;
+    app.document.importNode=node=>decorate(importNode(node));
+}
+test('loading status and a fast prepend preserve the visible row',async()=>{
+    const app=setup(); rowGeometry(app); app.frame(); app.scroller.scrollTop=30;
+    const row=app.history.querySelector('[data-canonical-message]'), before=row.getBoundingClientRect().top;
+    app.click(app.older);
+    assert.equal(row.getBoundingClientRect().top,before,'The loading status itself must not move the row');
+    await app.resolve(0,page('a',['old-1','old-2'],'/older/a/next/'));
+    assert.equal(row.getBoundingClientRect().top,before,'Fast response preserves the pre-click row');
+    assert.equal(app.text.value,'Unsent text');
+});
+test('history completion preserves a new position chosen during the request',async()=>{
+    const app=setup(); rowGeometry(app); app.frame(); app.scroller.scrollTop=30;
+    app.click(app.older); app.frame();
+    app.scroller.scrollTop+=70; app.scroller.emit('scroll');
+    const row=app.history.querySelectorAll('[data-canonical-message]')[1], during=row.getBoundingClientRect().top;
+    await app.resolve(0,page('a',['old-1','old-2'],'/older/a/next/'));
+    assert.equal(row.getBoundingClientRect().top,during,'Do not restore the stale pre-request anchor after user scrolling');
+});
 test('opening never loads earlier pages; explicit paging keeps draft and scroll anchor',async()=>{
     const app=setup();app.frame();assert.equal(app.requests.length,0);app.scroller.scrollTop=30;app.click(app.older);app.click(app.older);assert.equal(app.requests.length,1);
     await app.resolve(0,page('a',['old-1','old-2','saved-1']));

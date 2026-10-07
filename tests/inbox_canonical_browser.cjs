@@ -252,7 +252,9 @@ async function draftHistoryScenario(browser, fixture) {
         await page.click(selectors.older);
         await page.wait(`document.querySelectorAll('${selectors.rows}').length>${count}`, 'older rows prepended');
         await page.settle();
-        assert(Math.abs(await page.evaluate(anchorOffset(before))-before.offset)<3, 'Prepend preserves visible row');
+        const prependedOffset = await page.evaluate(anchorOffset(before));
+        assert(Math.abs(prependedOffset-before.offset)<3,
+            `Prepend preserves visible row: ${JSON.stringify({before,after:prependedOffset,geometry:await page.evaluate(geometry)})}`);
         // Loading the lazy image is intentional; otherwise an off-screen lazy
         // image would never exercise late decode and size correction.
         await page.evaluate(`document.querySelectorAll('[data-inbox-preview]').forEach(image=>image.loading='eager')`);
