@@ -1,5 +1,6 @@
 """Transient native observations must not become history, receipts or send grants."""
 
+import base64
 import json
 import time
 from copy import deepcopy
@@ -859,6 +860,216 @@ def test_provider_page_alignment_preserves_public_requested_limit(dm, limit):
     assert request.call_args.args[2] == min(limit, reads.PROVIDER_PAGE_LIMIT)
 
 
+@pytest.mark.parametrize("count", [35, 100])
+def test_provider_page_overshoot_is_consumed_without_skipping_any_identity(dm, count):
+    continuation, observed, page_keys = None, set(), set()
+    for page in (0, 4):
+        data = paged_payload(dm, page=page, count=count, more=page == 0)
+        rows = data["messages"]["data"]
+        for index, row in enumerate(rows):
+            row["id"] = f"page-{page}-message-{index:03}-" + "x" * 180
+            row["message"] = "Synthetic body " * 300
+            if index % 2:
+                row["from"]["id"], row["to"]["data"][0]["id"] = "peer-1", dm.account.account_platform_id
+        assert len(json.dumps(data).encode()) < reads.MAX_RESPONSE_BYTES
+        for offset in range(0, count, reads.PROVIDER_PAGE_LIMIT):
+            result, request = read(dm, data, continuation=continuation)
+            assert result["status"] == "observed"
+            chunk = rows[offset : offset + reads.PROVIDER_PAGE_LIMIT]
+            items = {item["platform_message_id"]: item for item in result["items"]}
+            assert set(items) == {row["id"] for row in chunk}
+            assert not observed & items.keys()
+            observed.update(items)
+            assert result["page_key"] not in page_keys
+            page_keys.add(result["page_key"])
+            assert [item["occurred_at"] for item in result["items"]] == sorted(row["created_time"] for row in chunk)
+            for index, row in enumerate(chunk, start=offset):
+                item = items[row["id"]]
+                assert item["occurred_at"] == row["created_time"]
+                assert item["direction"] == ("inbound" if index % 2 else "outbound")
+                assert row["message"].startswith(item["body"])
+            assert result["coverage"]["scanned_count"] == count
+            assert result["coverage"]["returned_count"] == len(chunk)
+            assert result["coverage"]["output_omitted_count"] == result["coverage"]["skipped_count"] == 0
+            assert len(json.dumps(result).encode()) < reads.MAX_RESULT_BYTES
+            envelope = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {"content": [{"type": "text", "text": json.dumps(result)}]},
+            }
+            assert len(json.dumps(envelope).encode()) < 64 * 1024
+            request.assert_called_once()
+            assert request.call_args.args[2] == reads.PROVIDER_PAGE_LIMIT
+            assert request.call_args.args[3] == (None if page == 0 else "older-page-1")
+            continuation = result["older_continuation"]
+            if offset + len(chunk) < count:
+                assert result["more_available"] and result["older_history_status"] == "available"
+                decoded = signing.loads(continuation, salt=reads.CONTINUATION_SALT)
+                assert decoded["kind"] == "same_page" and decoded["offset"] == offset + len(chunk)
+                assert decoded["page_count"] == count and decoded["after"] == request.call_args.args[3]
+            elif page == 0:
+                decoded = signing.loads(continuation, salt=reads.CONTINUATION_SALT)
+                assert decoded["kind"] == "older_page" and decoded["after"] == "older-page-1"
+                parsed = reads._parse_continuation(continuation, decoded["scope"])
+                assert set(parsed["previous_ids"]) == {reads._message_id_digest(row["id"]) for row in rows}
+            else:
+                assert continuation is None and result["older_history_status"] == "not_indicated"
+                assert result["more_available"] is False
+            if continuation:
+                assert len(continuation) <= reads.MAX_CONTINUATION_LENGTH
+    assert len(observed) == 2 * count
+
+
+@pytest.mark.parametrize("limit", [1, 7, 20, 50, 100])
+def test_public_limit_bounds_each_slice_without_dropping_provider_rows(dm, limit):
+    data = paged_payload(dm, count=35, more=False)
+    chunk_size = min(limit, reads.PROVIDER_PAGE_LIMIT)
+    first, _ = read(dm, data, limit=limit)
+    second, request = read(dm, data, limit=limit, continuation=first["older_continuation"])
+    for offset, result in ((0, first), (chunk_size, second)):
+        assert result["status"] == "observed"
+        assert {item["platform_message_id"] for item in result["items"]} == {
+            row["id"] for row in data["messages"]["data"][offset : offset + chunk_size]
+        }
+        assert len(result["items"]) <= chunk_size
+        assert result["coverage"]["requested_limit"] == limit
+        assert result["coverage"]["scanned_count"] == 35 and result["coverage"]["skipped_count"] == 0
+    assert request.call_args.args[2] == chunk_size and request.call_args.args[3] is None
+
+
+@pytest.mark.parametrize("limit", [1, 20, 50, 100])
+def test_provider_page_above_hard_limit_fails_closed(dm, limit):
+    result, request = read(dm, paged_payload(dm, count=101), limit=limit)
+    assert result["status"] == "unavailable" and result["reason_code"] == "invalid_response"
+    assert result["items"] == [] and result["older_continuation"] is None
+    assert result["coverage"]["scanned_count"] == result["coverage"]["skipped_count"] == 101
+    request.assert_called_once()
+
+
+@pytest.mark.parametrize("change", ["newest", "id", "time", "direction", "order", "count"])
+def test_same_page_refetch_rejects_any_changed_identity_position(dm, change):
+    data = paged_payload(dm, count=35)
+    rows = data["messages"]["data"]
+    if change == "order":
+        for row in rows:
+            row["created_time"] = rows[0]["created_time"]
+    first, _ = read(dm, data)
+    if change == "newest":
+        rows.insert(0, {**deepcopy(rows[0]), "id": "new-arrival", "created_time": timezone.now().isoformat()})
+    elif change == "id":
+        rows[-1]["id"] = "changed-unseen-id"
+    elif change == "time":
+        rows[-1]["created_time"] = (timezone.now() - timedelta(minutes=100)).isoformat()
+    elif change == "direction":
+        rows[-1]["from"]["id"], rows[-1]["to"]["data"][0]["id"] = "peer-1", dm.account.account_platform_id
+    elif change == "order":
+        rows[-1], rows[-2] = rows[-2], rows[-1]
+    else:
+        rows.pop()
+    result, request = read(dm, data, continuation=first["older_continuation"])
+    assert result["status"] == "unavailable" and result["reason_code"] == "stale_page"
+    assert result["items"] == [] and result["older_continuation"] is None and result["page_key"] is None
+    request.assert_called_once()
+    assert request.call_args.args[3] is None
+
+
+def test_unordered_oversized_initial_page_is_bounded_without_a_continuation(dm):
+    data = paged_payload(dm, count=35)
+    newest_ids = {row["id"] for row in data["messages"]["data"][: reads.PROVIDER_PAGE_LIMIT]}
+    data["messages"]["data"].reverse()
+    result, _ = read(dm, data)
+    assert result["status"] == "observed" and len(result["items"]) == reads.PROVIDER_PAGE_LIMIT
+    assert {item["platform_message_id"] for item in result["items"]} == newest_ids
+    assert result["more_available"] and result["older_history_status"] == "unavailable"
+    assert result["older_continuation"] is None and result["coverage"]["skipped_count"] == 0
+
+
+def test_same_page_remainder_does_not_need_a_supported_next_provider_cursor(dm):
+    data = paged_payload(dm, count=35)
+    data["messages"]["paging"] = {"next": "https://must-not-follow.example"}
+    first, _ = read(dm, data)
+    second, request = read(dm, data, continuation=first["older_continuation"])
+    assert first["older_history_status"] == "available" and len(first["items"]) == 20
+    assert second["status"] == "observed" and len(second["items"]) == 15
+    assert second["more_available"] and second["older_history_status"] == "unavailable"
+    assert second["older_continuation"] is None and request.call_args.args[3] is None
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("offset", 0),
+        ("offset", -1),
+        ("offset", True),
+        ("offset", 35),
+        ("offset", "20"),
+        ("page_count", 0),
+        ("page_count", True),
+        ("page_count", 101),
+        ("page_count", "35"),
+        ("after", "https://must-not-follow.example"),
+        ("missing_after", None),
+        ("page_digest", "invalid"),
+        ("kind", "unknown"),
+    ],
+)
+def test_invalid_signed_same_page_positions_fail_before_fetch(dm, field, value):
+    first, _ = read(dm, paged_payload(dm, count=35))
+    decoded = signing.loads(first["older_continuation"], salt=reads.CONTINUATION_SALT)
+    if field == "missing_after":
+        decoded.pop("after")
+    else:
+        decoded[field] = value
+    token = signing.dumps(decoded, salt=reads.CONTINUATION_SALT, compress=True)
+    with patch.object(reads, "_request_native_thread") as request, pytest.raises(reads.NativeThreadReadError) as error:
+        reads.read_native_thread(
+            dm.message, authorization=reads.session_read_authorization(dm.user), continuation=token
+        )
+    assert error.value.code == "invalid_continuation"
+    request.assert_not_called()
+
+
+@pytest.mark.parametrize("fault", ["sender", "time", "id", "body", "duplicate"])
+def test_provider_rows_beyond_transport_hint_are_all_validated(dm, fault):
+    data = paged_payload(dm, count=34)
+    rows = data["messages"]["data"]
+    if fault == "sender":
+        rows[-1]["from"]["id"] = "unrelated-peer"
+    elif fault == "time":
+        rows[-1]["created_time"] = "invalid"
+    elif fault == "id":
+        rows[-1]["id"] = None
+    elif fault == "body":
+        rows[-1]["message"] = {}
+    else:
+        rows[-1]["id"] = rows[0]["id"]
+    result, _ = read(dm, data)
+    assert result["status"] == "unavailable" and result["items"] == []
+    assert result["older_continuation"] is None and result["page_key"] is None
+
+
+def test_oversized_slice_identity_budget_fails_closed_without_cursor(dm):
+    data = paged_payload(dm, count=reads.MAX_ITEMS)
+    for row in data["messages"]["data"]:
+        row["message"] = ""
+    with patch.object(reads, "MAX_RESULT_BYTES", 8192 + 100):
+        result, _ = read(dm, data, limit=reads.MAX_ITEMS)
+    assert result["reason_code"] == "response_too_large" and result["items"] == []
+    assert result["older_continuation"] is None
+    assert result["coverage"]["output_omitted_count"] == reads.PROVIDER_PAGE_LIMIT
+    assert len(json.dumps(result).encode()) < reads.MAX_RESULT_BYTES
+
+
+def test_oversized_continuation_is_withheld_without_losing_observed_rows(dm):
+    data = paged_payload(dm, count=34)
+    with patch.object(reads.signing, "dumps", return_value="x" * (reads.MAX_CONTINUATION_LENGTH + 1)):
+        result, _ = read(dm, data)
+    assert result["status"] == "observed" and len(result["items"]) == reads.PROVIDER_PAGE_LIMIT
+    assert result["older_continuation"] is None and result["older_history_status"] == "unavailable"
+    assert result["more_available"] and not result["history_complete"]
+    assert len(json.dumps(result).encode()) < reads.MAX_RESULT_BYTES
+
+
 @pytest.mark.parametrize("cursor", ["", "https://graph.facebook.com/other", {}, [], 1, True, "x" * 6145])
 def test_arbitrary_continuations_are_rejected_before_provider_read(dm, cursor):
     with patch.object(reads, "_request_native_thread") as request, pytest.raises(reads.NativeThreadReadError) as error:
@@ -869,8 +1080,9 @@ def test_arbitrary_continuations_are_rejected_before_provider_read(dm, cursor):
     request.assert_not_called()
 
 
-def test_expired_and_tampered_continuations_are_rejected_before_provider_read(dm):
-    result, _ = read(dm, paged_payload(dm))
+@pytest.mark.parametrize("count", [20, 35])
+def test_expired_and_tampered_continuations_are_rejected_before_provider_read(dm, count):
+    result, _ = read(dm, paged_payload(dm, count=count))
     token = result["older_continuation"]
     for candidate, timestamp in [(token + "x", time.time()), (token, time.time() + reads.CONTINUATION_MAX_AGE + 2)]:
         with (
@@ -886,10 +1098,11 @@ def test_expired_and_tampered_continuations_are_rejected_before_provider_read(dm
 
 
 @pytest.mark.parametrize("change", ["token", "platform", "thread", "anchor", "limit", "caller_credential"])
-def test_signed_continuations_pin_scope_and_stable_credentials_without_granting_access(dm, change):
+@pytest.mark.parametrize("count", [20, 35])
+def test_signed_continuations_pin_scope_and_stable_credentials_without_granting_access(dm, change, count):
     key = key_for(dm)
     authorization = reads.key_read_authorization(key)
-    first, _ = read(dm, paged_payload(dm), authorization=authorization)
+    first, _ = read(dm, paged_payload(dm, count=count), authorization=authorization)
     message, limit = dm.message, 50
     if change == "token":
         dm.account.oauth_access_token = "rotated-platform-token"
@@ -923,8 +1136,9 @@ def test_signed_continuations_pin_scope_and_stable_credentials_without_granting_
     request.assert_not_called()
 
 
-def test_continuation_never_overrides_revoked_authority(dm):
-    first, _ = read(dm, paged_payload(dm))
+@pytest.mark.parametrize("count", [20, 35])
+def test_continuation_never_overrides_revoked_authority(dm, count):
+    first, _ = read(dm, paged_payload(dm, count=count))
     dm.member.delete()
     with patch.object(reads, "_request_native_thread") as request, pytest.raises(reads.NativeThreadReadError) as error:
         reads.read_native_thread(
@@ -955,7 +1169,7 @@ def test_unsafe_or_nonprogressing_older_pages_release_no_content_or_cursor(dm, f
     elif fault == "invalid_row":
         rows[-1]["id"] = None
     else:
-        rows.append({**deepcopy(rows[-1]), "id": "excess-mid"})
+        rows.extend({**deepcopy(rows[-1]), "id": f"excess-mid-{index}"} for index in range(81))
     result, _ = read(dm, older, continuation=first["older_continuation"])
     assert result["status"] == "unavailable" and result["items"] == []
     assert result["older_continuation"] is None and result["page_key"] is None
@@ -1015,6 +1229,72 @@ def test_older_transport_uses_two_fixed_same_thread_gets_and_no_next_url(dm, pla
     assert "PRIVATE_NEXT_TOKEN" not in caplog.text + str(result)
 
 
+@pytest.mark.parametrize(
+    "platform,host", [("facebook", "graph.facebook.com"), ("instagram_login", "graph.instagram.com")]
+)
+@pytest.mark.parametrize("older", [False, True])
+def test_same_page_refetch_repeats_the_original_bounded_transport(dm, platform, host, older):
+    dm.account.platform = platform
+    dm.account.save(update_fields=["platform"])
+    prior, _ = read(dm, paged_payload(dm))
+    data = paged_payload(dm, page=1 if older else 0, count=35)
+    for row in data["messages"]["data"]:
+        row["message"] = "Synthetic body " * 300
+    assert len(json.dumps(data).encode()) < reads.MAX_RESPONSE_BYTES
+    first, _ = read(dm, data, continuation=prior["older_continuation"] if older else None)
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        assert request.method == "GET" and request.url.host == host
+        assert "access_token" not in request.url.params
+        if not older:
+            assert request.url.path == "/v25.0/conversation-1"
+            assert (
+                request.url.params["fields"] == "id,participants{id},messages.limit(20){" + reads._MESSAGE_FIELDS + "}"
+            )
+            return httpx.Response(200, json=data)
+        if len(requests) == 1:
+            assert request.url.path == "/v25.0/conversation-1"
+            assert dict(request.url.params) == {"fields": "id,participants{id}"}
+            return httpx.Response(200, json={"id": data["id"], "participants": data["participants"]})
+        assert request.url.path == "/v25.0/conversation-1/messages"
+        assert request.url.params["after"] == "older-page-1" and request.url.params["limit"] == "20"
+        return httpx.Response(200, json=data["messages"])
+
+    client = httpx.Client(transport=httpx.MockTransport(handle), follow_redirects=False)
+    with patch.object(reads.httpx, "Client", return_value=client):
+        result = reads.read_native_thread(
+            dm.message,
+            authorization=reads.session_read_authorization(dm.user),
+            continuation=first["older_continuation"],
+        )
+    assert result["status"] == "observed", result["reason_code"]
+    assert len(requests) == (2 if older else 1)
+    assert {item["platform_message_id"] for item in result["items"]} == {
+        row["id"] for row in data["messages"]["data"][20:]
+    }
+
+
+@pytest.mark.parametrize("fault", ["revocation", "account_token", "anchor_thread"])
+def test_same_page_refetch_rechecks_authority_after_http(dm, fault):
+    data = paged_payload(dm, count=35)
+    first, _ = read(dm, data)
+
+    def mutate(*args):
+        if fault == "revocation":
+            dm.member.delete()
+        elif fault == "account_token":
+            SocialAccount.objects.filter(pk=dm.account.pk).update(oauth_access_token="rotated")
+        else:
+            InboxMessage.objects.filter(pk=dm.message.pk).update(extra={"conversation_id": "other-thread"})
+        return data
+
+    with pytest.raises(reads.NativeThreadReadError) as error:
+        read(dm, continuation=first["older_continuation"], side_effect=mutate)
+    assert error.value.code == ("authorization_revoked" if fault == "revocation" else "stale")
+
+
 def test_older_transport_rejects_changed_participants_before_messages_get(dm):
     first, _ = read(dm, paged_payload(dm))
     requests = []
@@ -1036,23 +1316,78 @@ def test_older_transport_rejects_changed_participants_before_messages_get(dm):
     assert result["older_continuation"] is None and len(requests) == 1
 
 
-def test_cursor_contains_no_platform_credential_or_message_content_and_is_bounded(dm):
-    data = paged_payload(dm)
-    data["messages"]["paging"]["cursors"]["after"] = "x" * reads.MAX_PROVIDER_CURSOR_LENGTH
-    data["messages"]["paging"]["next"] = (
-        "https://graph.facebook.com/v25.0/conversation-1/messages?after=" + "x" * reads.MAX_PROVIDER_CURSOR_LENGTH
-    )
-    result, _ = read(dm, data)
-    token = result["older_continuation"]
+@pytest.mark.parametrize("count", [20, 35, 100])
+def test_cursor_contains_no_platform_credential_or_message_content_and_is_bounded(dm, count):
+    dm.account.oauth_access_token = "synthetic-platform-credential-that-must-not-appear"
+    dm.account.save(update_fields=["oauth_access_token"])
+    data = paged_payload(dm, count=count)
+    for row in data["messages"]["data"]:
+        row["message"] = "Synthetic body " * 300
+    cursor = base64.urlsafe_b64encode(
+        b"".join(bytes.fromhex(reads._message_id_digest(f"synthetic-cursor-{index}")) for index in range(24))
+    ).decode("ascii")
+    assert len(cursor) == reads.MAX_PROVIDER_CURSOR_LENGTH
+    data["messages"]["paging"]["cursors"]["after"] = cursor
+    data["messages"]["paging"]["next"] = "https://graph.facebook.com/v25.0/conversation-1/messages?after=" + cursor
+    token = None
+    for offset in range(0, count, reads.PROVIDER_PAGE_LIMIT):
+        result, _ = read(dm, data, continuation=token)
+        token = result["older_continuation"]
+        assert len(token) <= reads.MAX_CONTINUATION_LENGTH
+        decoded = signing.loads(token, salt=reads.CONTINUATION_SALT)
+        assert dm.account.oauth_access_token not in json.dumps(decoded)
+        assert "Synthetic body" not in json.dumps(decoded)
+        assert "page-0-message-0" not in json.dumps(decoded)
+        if offset + reads.PROVIDER_PAGE_LIMIT >= count:
+            assert set(decoded) == {"scope", "kind", "after", "oldest", "previous_ids"}
+            parsed = reads._parse_continuation(token, decoded["scope"])
+            assert parsed["after"] == cursor and len(parsed["previous_ids"]) == count
+        else:
+            assert set(decoded) == {"scope", "kind", "after", "offset", "page_count", "page_digest"}
+        assert len(json.dumps(result).encode()) < reads.MAX_RESULT_BYTES
+        envelope = {"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": json.dumps(result)}]}}
+        assert len(json.dumps(envelope).encode()) < 64 * 1024
+
+
+@pytest.mark.parametrize("count", [34, 100, 101])
+def test_continuation_identity_count_respects_hard_page_limit(dm, count):
+    result, _ = read(dm, paged_payload(dm))
+    decoded = signing.loads(result["older_continuation"], salt=reads.CONTINUATION_SALT)
+    previous_ids = [reads._message_id_digest(f"synthetic-{index}") for index in range(count)]
+    decoded["previous_ids"] = base64.b64encode(b"".join(bytes.fromhex(mid) for mid in previous_ids)).decode("ascii")
+    token = signing.dumps(decoded, salt=reads.CONTINUATION_SALT, compress=True)
     assert len(token) <= reads.MAX_CONTINUATION_LENGTH
-    decoded = signing.loads(token, salt=reads.CONTINUATION_SALT)
-    assert set(decoded) == {"scope", "after", "oldest", "previous_ids"}
-    assert dm.account.oauth_access_token not in json.dumps(decoded)
-    assert "中" not in json.dumps(decoded, ensure_ascii=False)
-    assert "page-0-message-0" not in json.dumps(decoded)
-    assert len(json.dumps(result).encode()) < reads.MAX_RESULT_BYTES
-    envelope = {"jsonrpc": "2.0", "id": 1, "result": {"content": [{"type": "text", "text": json.dumps(result)}]}}
-    assert len(json.dumps(envelope).encode()) < 64 * 1024
+    if count <= reads.MAX_ITEMS:
+        assert reads._parse_continuation(token, decoded["scope"])["previous_ids"] == previous_ids
+    else:
+        with pytest.raises(reads.NativeThreadReadError) as error:
+            reads._parse_continuation(token, decoded["scope"])
+        assert error.value.code == "invalid_continuation"
+
+
+def test_still_valid_legacy_older_page_token_remains_usable(dm):
+    first_data = paged_payload(dm)
+    first, _ = read(dm, first_data)
+    decoded = signing.loads(first["older_continuation"], salt=reads.CONTINUATION_SALT)
+    decoded.pop("kind")
+    decoded["previous_ids"] = [reads._message_id_digest(row["id"]) for row in first_data["messages"]["data"]]
+    token = signing.dumps(decoded, salt=reads.CONTINUATION_SALT)
+    result, request = read(dm, paged_payload(dm, page=1), continuation=token)
+    assert result["status"] == "observed" and request.call_args.args[3] == "older-page-1"
+
+
+@pytest.mark.parametrize("packed", ["", "!", "eA==", base64.b64encode(b"x" * 33).decode("ascii")])
+def test_invalid_packed_identity_hashes_fail_before_fetch(dm, packed):
+    first, _ = read(dm, paged_payload(dm))
+    decoded = signing.loads(first["older_continuation"], salt=reads.CONTINUATION_SALT)
+    decoded["previous_ids"] = packed
+    token = signing.dumps(decoded, salt=reads.CONTINUATION_SALT, compress=True)
+    with patch.object(reads, "_request_native_thread") as request, pytest.raises(reads.NativeThreadReadError) as error:
+        reads.read_native_thread(
+            dm.message, authorization=reads.session_read_authorization(dm.user), continuation=token
+        )
+    assert error.value.code == "invalid_continuation"
+    request.assert_not_called()
 
 
 @pytest.mark.parametrize("fault", ["revocation", "account_token", "anchor_thread"])

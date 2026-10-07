@@ -5,6 +5,7 @@ mark read, or reconcile replies. A platform observation is never a receipt
 or a grant to send. The usual automated reply window remains unchanged.
 """
 
+import base64
 import hashlib
 import json
 import re
@@ -502,20 +503,42 @@ def _parse_continuation(token, scope):
         if not scope or not isinstance(token, str) or not token or len(token) > MAX_CONTINUATION_LENGTH:
             raise ValueError
         value = signing.loads(token, salt=CONTINUATION_SALT, max_age=CONTINUATION_MAX_AGE)
-        if (
-            not isinstance(value, dict)
-            or not isinstance(value.get("scope"), str)
-            or not _valid_provider_cursor(value.get("after"))
-            or _timestamp(value.get("oldest")) is None
-            or not isinstance(value.get("previous_ids"), list)
-            or not 1 <= len(value["previous_ids"]) <= PROVIDER_PAGE_LIMIT
-            or any(
-                not isinstance(mid, str) or re.fullmatch(r"[0-9a-f]{64}", mid) is None for mid in value["previous_ids"]
-            )
-        ):
+        if not isinstance(value, dict) or not isinstance(value.get("scope"), str):
+            raise ValueError
+        kind = value.get("kind", "older_page")  # Accept still-valid legacy older-page tokens.
+        if kind == "same_page":
+            if (
+                (value.get("after") is not None and not _valid_provider_cursor(value["after"]))
+                or "after" not in value
+                or type(value.get("page_count")) is not int
+                or not 1 <= value["page_count"] <= MAX_ITEMS
+                or type(value.get("offset")) is not int
+                or not 0 < value["offset"] < value["page_count"]
+                or not isinstance(value.get("page_digest"), str)
+                or re.fullmatch(r"[0-9a-f]{64}", value["page_digest"]) is None
+            ):
+                raise ValueError
+        elif kind == "older_page":
+            if not _valid_provider_cursor(value.get("after")) or _timestamp(value.get("oldest")) is None:
+                raise ValueError
+            previous_ids = value.get("previous_ids")
+            if isinstance(previous_ids, str):
+                packed = base64.b64decode(previous_ids, validate=True)
+                if not 32 <= len(packed) <= 32 * MAX_ITEMS or len(packed) % 32:
+                    raise ValueError
+                previous_ids = [packed[index : index + 32].hex() for index in range(0, len(packed), 32)]
+            if (
+                not isinstance(previous_ids, list)
+                or not 1 <= len(previous_ids) <= MAX_ITEMS
+                or any(not isinstance(mid, str) or re.fullmatch(r"[0-9a-f]{64}", mid) is None for mid in previous_ids)
+            ):
+                raise ValueError
+            value["previous_ids"] = previous_ids
+        else:
             raise ValueError
         if value["scope"] != scope:
             raise NativeThreadReadError("stale_continuation", "The conversation or credential changed; reload it.")
+        value["kind"] = kind
         return value
     except (signing.BadSignature, TypeError, ValueError, OverflowError):
         raise NativeThreadReadError(
@@ -525,6 +548,11 @@ def _parse_continuation(token, scope):
 
 def _message_id_digest(value):
     return hashlib.sha256(value.encode()).hexdigest()
+
+
+def _page_digest(items):
+    identities = [(item["platform_message_id"], item["occurred_at"], item["direction"]) for item in items]
+    return hashlib.sha256(json.dumps(identities, separators=(",", ":")).encode()).hexdigest()
 
 
 def _encoded_size(value):
@@ -679,9 +707,12 @@ def _project(data, account, message, native_id, peer, limit, *, scope=None, prev
     if not isinstance(page, dict) or not isinstance(page.get("data"), list):
         return result("invalid_response")
     rows = page["data"]
-    page_limit = min(limit, PROVIDER_PAGE_LIMIT)
-    if len(rows) > page_limit:
+    # A provider can exceed the transport hint. Validate the whole bounded page
+    # before exposing a slice; never advance past rows the caller has not seen.
+    if len(rows) > MAX_ITEMS:
         return result("invalid_response", scanned=len(rows), skipped=len(rows), more=True)
+    same_page = previous is not None and previous["kind"] == "same_page"
+    older_page = previous if previous and not same_page else None
     pagination_supported = True
     paging = page.get("paging", {})
     if not isinstance(paging, dict):
@@ -728,10 +759,12 @@ def _project(data, account, message, native_id, peer, limit, *, scope=None, prev
         # must still preserve the expected ordering and direction of progress.
         if previous_stamp is not None and stamp > previous_stamp:
             if previous:
-                return result("pagination_unavailable", scanned=len(rows), more=True)
+                return result("stale_page" if same_page else "pagination_unavailable", scanned=len(rows), more=True)
             pagination_supported = False
         previous_stamp = stamp
-        if previous and (stamp > _timestamp(previous["oldest"]) or _message_id_digest(mid) in previous["previous_ids"]):
+        if older_page and (
+            stamp > _timestamp(older_page["oldest"]) or _message_id_digest(mid) in older_page["previous_ids"]
+        ):
             return result("pagination_unavailable", scanned=len(rows), more=True)
         if is_deleted_content(row):
             body = ""
@@ -749,34 +782,60 @@ def _project(data, account, message, native_id, peer, limit, *, scope=None, prev
         if mid in found:
             return result("message_scope_unverified")
         found[mid] = item
-    items = sorted(found.values(), key=lambda item: (item["occurred_at"], item["platform_message_id"]))
+    page_items = list(found.values())
+    digest = _page_digest(page_items)
+    if same_page and (len(page_items) != previous["page_count"] or digest != previous["page_digest"]):
+        return result("stale_page", scanned=len(rows), more=True)
+    offset = previous["offset"] if same_page else 0
+    page_size = min(limit, PROVIDER_PAGE_LIMIT)
+    end = min(offset + page_size, len(page_items))
+    items = sorted(page_items[offset:end], key=lambda item: (item["occurred_at"], item["platform_message_id"]))
+    if previous is None and not pagination_supported:
+        # An unordered first page can still show the newest validated rows,
+        # but its provider positions are never safe continuation offsets.
+        items = sorted(page_items, key=lambda item: (item["occurred_at"], item["platform_message_id"]))[-page_size:]
+    unread = end < len(page_items)
     after = cursors.get("after")
-    if previous and paging.get("next") and after == previous["after"]:
+    if previous and previous["after"] is not None and paging.get("next") and after == previous["after"]:
         return result("pagination_unavailable", scanned=len(rows), more=True)
     output = result(
         "bounded_snapshot" if items else "no_messages_observed",
         items=items,
         scanned=len(rows),
-        more=more,
+        more=more or unread,
     )
     if output["status"] != "observed":
         return output
-    output["page_key"] = hashlib.sha256(
-        json.dumps([scope, [(item["platform_message_id"], item["occurred_at"]) for item in items]]).encode()
-    ).hexdigest()
-    output["older_history_status"] = "unavailable" if more or not pagination_supported else "not_indicated"
+    output["page_key"] = hashlib.sha256(json.dumps([scope, digest, offset, end]).encode()).hexdigest()
+    output["older_history_status"] = "unavailable" if more or unread or not pagination_supported else "not_indicated"
     after = _supported_older_cursor(paging, account, native_id) if pagination_supported else None
-    if items and scope and after:
-        output["older_continuation"] = signing.dumps(
-            {
+    position = None
+    if items and scope and pagination_supported:
+        if unread:
+            position = {
                 "scope": scope,
+                "kind": "same_page",
+                "after": previous["after"] if previous else None,
+                "offset": end,
+                "page_count": len(page_items),
+                "page_digest": digest,
+            }
+        elif after:
+            # Pack full SHA-256 digests so even 100 IDs and a maximal provider
+            # cursor fit a bounded signed token without including raw IDs.
+            packed = b"".join(bytes.fromhex(_message_id_digest(item["platform_message_id"])) for item in page_items)
+            position = {
+                "scope": scope,
+                "kind": "older_page",
                 "after": after,
-                "oldest": items[0]["occurred_at"],
-                "previous_ids": [_message_id_digest(item["platform_message_id"]) for item in items],
-            },
-            salt=CONTINUATION_SALT,
-        )
-        output["older_history_status"] = "available"
+                "oldest": page_items[-1]["occurred_at"],
+                "previous_ids": base64.b64encode(packed).decode("ascii"),
+            }
+    if position:
+        continuation = signing.dumps(position, salt=CONTINUATION_SALT, compress=True)
+        candidate = {**output, "older_continuation": continuation, "older_history_status": "available"}
+        if len(continuation) <= MAX_CONTINUATION_LENGTH and len(json.dumps(candidate)) <= MAX_RESULT_BYTES:
+            output = candidate
     return output
 
 
