@@ -28,9 +28,9 @@ class Browser {
         this.process.once('error',stopped);this.process.once('exit',(code,signal)=>stopped(new Error(`Chrome exited (${code}, ${signal})`)));
     }
     on(name,callback){if(!this.handlers.has(name))this.handlers.set(name,[]);this.handlers.get(name).push(callback);}
-    command(method,params={},sessionId){
+    command(method,params={},sessionId,timeout=8000){
         if(this.closed)return Promise.reject(new Error('Chrome is closed'));const id=++this.sequence;
-        return new Promise((resolve,reject)=>{const timer=setTimeout(()=>{this.pending.delete(id);reject(new Error('CDP timeout: '+method));},8000);
+        return new Promise((resolve,reject)=>{const timer=setTimeout(()=>{this.pending.delete(id);reject(new Error('CDP timeout: '+method));},timeout);
             this.pending.set(id,{resolve,reject,timer});this.process.stdio[3].write(JSON.stringify({id,method,params,...(sessionId?{sessionId}:{})})+'\0');});
     }
     async close(){if(this.closed)return;const exited=new Promise(resolve=>this.process.once('exit',resolve));this.process.kill('SIGKILL');await exited;}

@@ -457,7 +457,9 @@ async function main() {
     const profile=fs.mkdtempSync(path.join(os.tmpdir(),'brightbean-chromium-'));
     const browser=new Browser(binary,profile);
     try {
-        const version=await browser.command('Browser.getVersion');
+        // Cold browser startup is separate from the 8-second command/DOM budget.
+        // A real handshake must still succeed; this never retries or skips it.
+        const version=await browser.command('Browser.getVersion',{},undefined,30000);
         assert(/Chrome|Chromium/.test(version.product),`Expected real Chromium, received ${version.product}`);
         process.stdout.write(`Browser ${version.product}, actual bundled HTMX/Alpine, synthetic CDP-only fixtures\n`);
         await layoutScenario(browser,fixture,1365,900);

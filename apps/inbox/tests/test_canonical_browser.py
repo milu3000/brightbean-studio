@@ -389,6 +389,19 @@ def test_canonical_browser_fixture_export(browser_export):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_cdp_pipe_transport_unit_contract():
+    node = shutil.which("node")
+    assert node, "Node.js is required to validate the CDP pipe contract"
+    result = subprocess.run(
+        [node, "--test", str(ROOT / "tests" / "browser" / "cdp_test.cjs")],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 @pytest.mark.django_db(transaction=True)
 def test_canonical_real_chromium(request):
     node, binary = require_browser()
