@@ -1,19 +1,22 @@
-"""One explicit, transient read of an already-scoped native conversation.
+"""Bounded, transient pages of an already-scoped native conversation.
 
-This module does not send, refresh credentials, paginate, cache, capture,
+Each call reads one provider page. This module does not send, refresh credentials, cache, capture,
 mark read, or reconcile replies. A platform observation is never a receipt
 or a grant to send. The usual automated reply window remains unchanged.
 """
 
 import hashlib
 import json
+import re
 from copy import deepcopy
 from datetime import UTC, datetime
-from urllib.parse import quote
+from urllib.parse import parse_qsl, quote, urlsplit
 
 import httpx
+from django.core import signing
 from django.db import transaction
 from django.utils import timezone
+from django.utils.crypto import salted_hmac
 from django.utils.dateparse import parse_datetime
 
 from apps.members.models import WorkspaceMembership
@@ -35,7 +38,12 @@ MAX_RESPONSE_BYTES = 1024 * 1024
 MAX_RESULT_BYTES = 30 * 1024  # Also leaves room for MCP's JSON-in-text envelope.
 MAX_BODY_CHARACTERS = 10000
 MAX_ITEMS = 100
-_FIELDS = "id,participants{id},messages.limit(100){" + CONTENT_MESSAGE_FIELDS + ",to{id}}"
+PROVIDER_PAGE_LIMIT = 20
+MAX_PROVIDER_CURSOR_LENGTH = 1024
+MAX_CONTINUATION_LENGTH = 6144
+CONTINUATION_MAX_AGE = 900
+CONTINUATION_SALT = "inbox.native-history.older.v1"
+_MESSAGE_FIELDS = CONTENT_MESSAGE_FIELDS + ",to{id}"
 _CONFLICT_REASONS = {
     "identity_conflict",
     "participants_invalid",
@@ -74,6 +82,7 @@ def session_read_authorization(user):
         ):
             raise _denied()
 
+    authorize.native_read_context = ("session", str(user_id))
     return authorize
 
 
@@ -117,6 +126,13 @@ def key_read_authorization(api_key, request=None):
             raise _denied()
         user_authorization(account)
 
+    authorize.native_read_context = (
+        "oauth" if oauth else "api_key",
+        str(workspace_id),
+        str(actor_id),
+        str(key_id),
+        salted_hmac(CONTINUATION_SALT, header if oauth else repr(credential_identity)).hexdigest(),
+    )
     return authorize
 
 
@@ -361,23 +377,14 @@ def _unique_object(pairs):
     return result
 
 
-def _request_native_thread(account, native_id):
-    """One bounded GET. Do not use BaseProvider._request: its 429 path logs bodies."""
-    from providers.facebook import BASE_URL
-    from providers.instagram_login import API_BASE
-
-    base = BASE_URL if account.platform == "facebook" else API_BASE
-    # Fresh default transports have no retries. Redirects and pagination are
-    # deliberately disabled, and no response URL is ever followed.
-    with (
-        httpx.Client(timeout=20.0, follow_redirects=False) as client,
-        client.stream(
-            "GET",
-            f"{base}/{quote(native_id, safe='')}",
-            headers={"Authorization": f"Bearer {account.oauth_access_token}"},
-            params={"fields": _FIELDS},
-        ) as response,
-    ):
+def _provider_json(client, account, path, params):
+    """A bounded GET without provider diagnostics, redirects or retries."""
+    with client.stream(
+        "GET",
+        path,
+        headers={"Authorization": f"Bearer {account.oauth_access_token}"},
+        params=params,
+    ) as response:
         if response.status_code == 429:
             raise _ProviderReadError("rate_limited")
         if response.status_code in {401, 403}:
@@ -395,15 +402,159 @@ def _request_native_thread(account, native_id):
             raise _ProviderReadError("invalid_response") from None
 
 
+def _verified_participants(data, account, native_id, peer):
+    if not isinstance(data, dict):
+        raise _ProviderReadError("invalid_response")
+    if data.get("id") != native_id:
+        raise _ProviderReadError("thread_scope_mismatch")
+    own = {account.account_platform_id, account.webhook_target_id} - {""}
+    kind, _reason, returned_peer = classify_conversation_identity(
+        {"participants": data.get("participants")}, own_ids=own, sender_id=peer
+    )
+    if kind != "direct" or returned_peer != peer:
+        raise _ProviderReadError("participants_unverified")
+    return set(_identity_ids(data["participants"]))
+
+
+def _native_api_base(account):
+    from providers.facebook import BASE_URL
+    from providers.instagram_login import API_BASE
+
+    return BASE_URL if account.platform == "facebook" else API_BASE
+
+
+def _request_native_thread(account, native_id, page_limit, after, peer):
+    """One initial GET; at most two exact-thread GETs for an older page.
+
+    Do not use BaseProvider._request: its 429 path logs bodies. The messages
+    edge's cursor contract follows Meta's official SDK Cursor.load_next_page:
+    github.com/facebook/facebook-python-business-sdk/blob/main/facebook_business/api.py
+    Only `paging.cursors.after` is used, never the provider's `next` URL.
+    """
+    path = f"{_native_api_base(account)}/{quote(native_id, safe='')}"
+    # Fresh default transports have no retries. No response URL is followed.
+    with httpx.Client(timeout=20.0, follow_redirects=False) as client:
+        if after is None:
+            fields = "id,participants{id},messages.limit(" + str(page_limit) + "){" + _MESSAGE_FIELDS + "}"
+            return _provider_json(client, account, path, {"fields": fields})
+        data = _provider_json(client, account, path, {"fields": "id,participants{id}"})
+        _verified_participants(data, account, native_id, peer)
+        data["messages"] = _provider_json(
+            client, account, path + "/messages", {"fields": _MESSAGE_FIELDS, "limit": page_limit, "after": after}
+        )
+        return data
+
+
+def _valid_provider_cursor(value):
+    return (
+        isinstance(value, str)
+        and 0 < len(value) <= MAX_PROVIDER_CURSOR_LENGTH
+        and re.fullmatch(r"[A-Za-z0-9_+/=-]+", value) is not None
+    )
+
+
+def _supported_older_cursor(paging, account, native_id):
+    """Validate the provider's route evidence without following/storing its URL.
+
+    In particular, do not assume that Instagram Login supports the Facebook
+    messages edge merely because it returned generic Graph pagination data.
+    Any URL credential is discarded; only the matching opaque cursor survives.
+    """
+    after = paging.get("cursors", {}).get("after")
+    next_url = paging.get("next")
+    if not _valid_provider_cursor(after) or not isinstance(next_url, str) or not 0 < len(next_url) <= 8192:
+        return None
+    try:
+        expected = urlsplit(f"{_native_api_base(account)}/{quote(native_id, safe='')}/messages")
+        candidate = urlsplit(next_url)
+        if (
+            candidate.scheme != "https"
+            or candidate.netloc != expected.netloc
+            or candidate.path != expected.path
+            or candidate.username is not None
+            or candidate.password is not None
+            or candidate.fragment
+            or any(ord(char) <= 32 or ord(char) == 127 for char in next_url)
+        ):
+            return None
+        query = parse_qsl(candidate.query, keep_blank_values=True, strict_parsing=True, max_num_fields=50)
+        if [value for key, value in query if key == "after"] != [after]:
+            return None
+        if any(key in {"before", "offset", "since", "until"} for key, _value in query):
+            return None
+        return after
+    except (ValueError, UnicodeError):
+        return None
+
+
+def _continuation_scope(identity, authorization, limit):
+    context = getattr(authorization, "native_read_context", None)
+    if context is None:
+        return None
+    # No platform/access credential or private anchor data enters the token.
+    return salted_hmac(
+        CONTINUATION_SALT, json.dumps([identity, context, limit], sort_keys=True, default=str)
+    ).hexdigest()
+
+
+def _parse_continuation(token, scope):
+    try:
+        if not scope or not isinstance(token, str) or not token or len(token) > MAX_CONTINUATION_LENGTH:
+            raise ValueError
+        value = signing.loads(token, salt=CONTINUATION_SALT, max_age=CONTINUATION_MAX_AGE)
+        if (
+            not isinstance(value, dict)
+            or not isinstance(value.get("scope"), str)
+            or not _valid_provider_cursor(value.get("after"))
+            or _timestamp(value.get("oldest")) is None
+            or not isinstance(value.get("previous_ids"), list)
+            or not 1 <= len(value["previous_ids"]) <= PROVIDER_PAGE_LIMIT
+            or any(
+                not isinstance(mid, str) or re.fullmatch(r"[0-9a-f]{64}", mid) is None for mid in value["previous_ids"]
+            )
+        ):
+            raise ValueError
+        if value["scope"] != scope:
+            raise NativeThreadReadError("stale_continuation", "The conversation or credential changed; reload it.")
+        return value
+    except (signing.BadSignature, TypeError, ValueError, OverflowError):
+        raise NativeThreadReadError(
+            "invalid_continuation", "The older-history position expired or changed; reload it."
+        ) from None
+
+
+def _message_id_digest(value):
+    return hashlib.sha256(value.encode()).hexdigest()
+
+
 def _encoded_size(value):
     # ASCII escapes bound both UTF-8 output and the nested JSON string used by MCP.
     return len(json.dumps(value, ensure_ascii=True, separators=(",", ":")))
 
 
 def _fit_items(items):
-    """Keep newest observations within a response budget; never cut a media URL."""
-    remaining, kept = MAX_RESULT_BYTES - 4096, []
-    for original in reversed(items):
+    """Reserve every row's identity before distributing text/media space.
+
+    Dropping even one valid row would make advancing a provider cursor lose
+    that row forever. Reserve envelope/token space and truncate content only.
+    """
+    budget, kept = MAX_RESULT_BYTES - 8192, []
+    bases = []
+    for original in items:
+        bare = {**original, "body": "", "attachments": [], "body_truncated": True, "attachments_truncated": True}
+        bases.append(_encoded_size(bare) + 1)
+    if sum(bases) > budget:
+        raise _ProviderReadError("response_too_large")
+    demands = [_encoded_size(original) + 1 - base for original, base in zip(items, bases, strict=True)]
+    allowances = bases.copy()
+    surplus = budget - sum(bases)
+    # Satisfy short rows first so their unused shares reach longer rows. Rows
+    # that still need truncation receive equal shares of the remaining space.
+    for position, index in enumerate(sorted(range(len(items)), key=lambda index: demands[index])):
+        allowance = min(demands[index], surplus // (len(items) - position))
+        allowances[index] += allowance
+        surplus -= allowance
+    for original, remaining in zip(items, allowances, strict=True):
         item = deepcopy(original)
         while item["attachments"] and _encoded_size(item) + 1 > remaining:
             item["attachments"].pop()
@@ -422,15 +573,18 @@ def _fit_items(items):
             item["body"] = body[:left]
         size = _encoded_size(item) + 1
         if size > remaining:
-            break
+            raise _ProviderReadError("response_too_large")
         kept.append(item)
-        remaining -= size
-    return list(reversed(kept))
+    return kept
 
 
 def _result(message, account, limit, reason_code, *, items=None, scanned=0, skipped=0, more=False):
     original_items = items or []
-    items = _fit_items(original_items)
+    try:
+        items = _fit_items(original_items)
+    except _ProviderReadError:
+        # No partially emitted page may acquire a continuation.
+        reason_code, items = "response_too_large", []
     output_omitted = len(original_items) - len(items)
     output_truncated = items != original_items
     more = more or bool(output_omitted)
@@ -448,7 +602,7 @@ def _result(message, account, limit, reason_code, *, items=None, scanned=0, skip
         "coverage": {
             "kind": "one_time_native_thread",
             "requested_limit": limit,
-            "provider_page_limit": MAX_ITEMS,
+            "provider_page_limit": min(limit, PROVIDER_PAGE_LIMIT),
             "scanned_count": scanned,
             "returned_count": len(items),
             "skipped_count": skipped,
@@ -460,6 +614,9 @@ def _result(message, account, limit, reason_code, *, items=None, scanned=0, skip
             "output_omitted_count": output_omitted,
         },
         "more_available": more,
+        "older_continuation": None,
+        "older_history_status": "unavailable",
+        "page_key": None,
         "newer_outbound_observed": any(
             item["direction"] == "outbound" and parse_datetime(item["occurred_at"]) > message.received_at
             for item in original_items
@@ -509,45 +666,51 @@ def _attachments_truncated(row):
     return count > MAX_ATTACHMENTS
 
 
-def _project(data, account, message, native_id, peer, limit):
+def _project(data, account, message, native_id, peer, limit, *, scope=None, previous=None):
     def result(code, **kwargs):
         return _result(message, account, limit, code, **kwargs)
 
-    if not isinstance(data, dict):
-        return result("invalid_response")
-    if data.get("id") != native_id:
-        return result("thread_scope_mismatch")
+    try:
+        participants = _verified_participants(data, account, native_id, peer)
+    except _ProviderReadError as exc:
+        return result(exc.code)
     own = {account.account_platform_id, account.webhook_target_id} - {""}
-    kind, _reason, returned_peer = classify_conversation_identity(
-        {"participants": data.get("participants")}, own_ids=own, sender_id=peer
-    )
-    if kind != "direct" or returned_peer != peer:
-        return result("participants_unverified")
-    participants = set(_identity_ids(data["participants"]))
     page = data.get("messages")
     if not isinstance(page, dict) or not isinstance(page.get("data"), list):
         return result("invalid_response")
     rows = page["data"]
+    page_limit = min(limit, PROVIDER_PAGE_LIMIT)
+    if len(rows) > page_limit:
+        return result("invalid_response", scanned=len(rows), skipped=len(rows), more=True)
+    pagination_supported = True
     paging = page.get("paging", {})
     if not isinstance(paging, dict):
-        return result("invalid_response")
-    more = bool(
-        len(rows) > MAX_ITEMS
-        or paging.get("next")
-        or paging.get("previous")
-        or page.get("has_more")
-        or page.get("truncated")
-        or page.get("is_truncated")
-    )
+        pagination_supported, paging = False, {}
+    if any(key in paging and not isinstance(paging[key], str) for key in ("next", "previous")):
+        pagination_supported = False
+    cursors = paging.get("cursors", {})
+    if not isinstance(cursors, dict):
+        pagination_supported, cursors = False, {}
+    more = bool(paging.get("next") or page.get("has_more") or page.get("truncated") or page.get("is_truncated"))
     summary = page.get("summary", {})
-    total = summary.get("total_count") if isinstance(summary, dict) else None
+    if not isinstance(summary, dict):
+        pagination_supported, summary = False, {}
+    total = summary.get("total_count")
     if total is not None:
-        more = more or type(total) is not int or total != len(rows)
-    found, skipped = {}, 0
-    for row in rows[:MAX_ITEMS]:
+        if type(total) is not int or total < len(rows):
+            pagination_supported = False
+        more = more or total != len(rows)
+    if previous and not pagination_supported:
+        return result("invalid_response")
+    if page.get("truncated") or page.get("is_truncated"):
+        # A provider-reported omission cannot be repaired by advancing past it.
+        if previous:
+            return result("pagination_unavailable", scanned=len(rows), more=True)
+        pagination_supported = False
+    found, previous_stamp = {}, None
+    for row in rows:
         if not isinstance(row, dict):
-            skipped += 1
-            continue
+            return result("invalid_response", scanned=len(rows), skipped=1, more=more)
         sender = row.get("from")
         sender = native_thread_id(sender.get("id")) if isinstance(sender, dict) else ""
         recipients = _identity_ids(row.get("to"))
@@ -559,8 +722,17 @@ def _project(data, account, message, native_id, peer, limit):
         mid, stamp = native_thread_id(row.get("id")), _timestamp(row.get("created_time"))
         body = row.get("message", "")
         if not mid or stamp is None or not isinstance(body, str):
-            skipped += 1
-            continue
+            return result("invalid_response", scanned=len(rows), skipped=1, more=more)
+        # Valid first-page observations remain useful even if the provider's
+        # ordering cannot establish a safe older-page boundary. Older pages
+        # must still preserve the expected ordering and direction of progress.
+        if previous_stamp is not None and stamp > previous_stamp:
+            if previous:
+                return result("pagination_unavailable", scanned=len(rows), more=True)
+            pagination_supported = False
+        previous_stamp = stamp
+        if previous and (stamp > _timestamp(previous["oldest"]) or _message_id_digest(mid) in previous["previous_ids"]):
+            return result("pagination_unavailable", scanned=len(rows), more=True)
         if is_deleted_content(row):
             body = ""
         item = {
@@ -574,23 +746,41 @@ def _project(data, account, message, native_id, peer, limit):
             "body_truncated": len(body) > MAX_BODY_CHARACTERS,
             "attachments_truncated": _attachments_truncated(row),
         }
-        if mid in found and found[mid] != item:
+        if mid in found:
             return result("message_scope_unverified")
         found[mid] = item
-    items = sorted(found.values(), key=lambda item: (item["occurred_at"], item["platform_message_id"]), reverse=True)
-    more = more or len(items) > limit
-    if rows and not items:
-        return result("invalid_response", scanned=min(len(rows), MAX_ITEMS), skipped=skipped, more=more)
-    return result(
+    items = sorted(found.values(), key=lambda item: (item["occurred_at"], item["platform_message_id"]))
+    after = cursors.get("after")
+    if previous and paging.get("next") and after == previous["after"]:
+        return result("pagination_unavailable", scanned=len(rows), more=True)
+    output = result(
         "bounded_snapshot" if items else "no_messages_observed",
-        items=list(reversed(items[:limit])),
-        scanned=min(len(rows), MAX_ITEMS),
-        skipped=skipped,
+        items=items,
+        scanned=len(rows),
         more=more,
     )
+    if output["status"] != "observed":
+        return output
+    output["page_key"] = hashlib.sha256(
+        json.dumps([scope, [(item["platform_message_id"], item["occurred_at"]) for item in items]]).encode()
+    ).hexdigest()
+    output["older_history_status"] = "unavailable" if more or not pagination_supported else "not_indicated"
+    after = _supported_older_cursor(paging, account, native_id) if pagination_supported else None
+    if items and scope and after:
+        output["older_continuation"] = signing.dumps(
+            {
+                "scope": scope,
+                "after": after,
+                "oldest": items[0]["occurred_at"],
+                "previous_ids": [_message_id_digest(item["platform_message_id"]) for item in items],
+            },
+            salt=CONTINUATION_SALT,
+        )
+        output["older_history_status"] = "available"
+    return output
 
 
-def read_native_thread(message, *, authorization, limit=50):
+def read_native_thread(message, *, authorization, limit=50, continuation=None):
     """Read only this stored anchor's known native thread; never grant sending."""
     if type(limit) is not int or not 1 <= limit <= MAX_ITEMS:
         raise NativeThreadReadError("invalid_limit", "The snapshot limit must be an integer between 1 and 100.")
@@ -615,9 +805,13 @@ def read_native_thread(message, *, authorization, limit=50):
         sibling_identity, sibling_conflict = _sibling_evidence(account, current, peer)
         if sibling_conflict:
             return _result(current, account, limit, "unverified_thread")
+        scope = _continuation_scope(before, authorization, limit)
+        previous = _parse_continuation(continuation, scope) if continuation is not None else None
     data, failure = None, None
     try:
-        data = _request_native_thread(account, native_id)
+        data = _request_native_thread(
+            account, native_id, min(limit, PROVIDER_PAGE_LIMIT), previous["after"] if previous else None, peer
+        )
     except _ProviderReadError as exc:
         failure = exc.code
     except Exception:
@@ -635,4 +829,4 @@ def read_native_thread(message, *, authorization, limit=50):
             return _result(current, account, limit, "account_unavailable")
         if failure:
             return _result(current, account, limit, failure)
-        return _project(data, account, current, native_id, peer, limit)
+        return _project(data, account, current, native_id, peer, limit, scope=scope, previous=previous)

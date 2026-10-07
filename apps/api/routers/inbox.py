@@ -186,10 +186,19 @@ def read_native_conversation(request, message_id: uuid.UUID, payload: NativeInbo
     message = _get_message(request, message_id)
     try:
         result = read_native_thread(
-            message, authorization=key_read_authorization(request.api_key, request), limit=payload.limit
+            message,
+            authorization=key_read_authorization(request.api_key, request),
+            limit=payload.limit,
+            continuation=payload.continuation,
         )
     except NativeThreadReadError as exc:
-        status = 422 if exc.code == "invalid_limit" else 409 if exc.code == "stale" else 404
+        status = (
+            422
+            if exc.code in {"invalid_limit", "invalid_continuation"}
+            else 409
+            if exc.code in {"stale", "stale_continuation"}
+            else 404
+        )
         raise HttpError(status, str(exc)) from exc
     except Exception:
         # Unexpected projection/auth failures must not log or reflect a

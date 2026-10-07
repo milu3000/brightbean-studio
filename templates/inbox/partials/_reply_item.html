@@ -4,13 +4,14 @@
         {{ reply.author.email|make_list|first|upper }}
     </div>
     <div class="flex-1 min-w-0">
-        <div class="bg-white border border-stone-200 rounded-xl rounded-tl-sm px-3.5 py-2.5" style="box-shadow: var(--shadow-xs);">
+        <div data-stored-event-bubble class="bg-white border border-stone-200 rounded-xl rounded-tl-sm px-3.5 py-2.5" style="box-shadow: var(--shadow-xs);">
             <div class="flex items-center gap-2 mb-1">
                 <span class="text-[12px] font-semibold text-stone-800">{% if reply.author %}{{ reply.author.get_short_name|default:reply.author.email }}{% else %}Your team{% endif %}</span>
-                <span class="badge-pill" style="background: var(--primary-soft); color: var(--brand-700);">Sent{% if reply.is_follow_up or reply.follow_up_of_id %} · Additional reply{% endif %}</span>
-                {% with sent_time=reply.sent_at|default:reply.created_at %}<time class="text-[11px] text-stone-400 ml-auto" datetime="{{ sent_time|date:'c' }}" title="{{ sent_time|date:'N j, Y g:i A' }}">{{ sent_time|timesince }} ago</time>{% endwith %}
+                <span class="badge-pill" style="background: var(--primary-soft); color: var(--brand-700);">BrightBean · Sent{% if reply.is_follow_up or reply.follow_up_of_id %} · Additional reply{% endif %}</span>
+                {% if reply.sent_at %}<time class="text-[11px] text-stone-400 ml-auto" datetime="{{ reply.sent_at|date:'c' }}" title="{{ reply.sent_at|date:'N j, Y g:i A' }}">{{ reply.sent_at|timesince }} ago</time>{% else %}<span class="text-[11px] text-stone-400 ml-auto">Delivery time unavailable</span>{% endif %}
             </div>
-            <p class="text-[13px] text-stone-700 leading-relaxed whitespace-pre-wrap">{{ reply.body }}</p>
+            <p data-stored-event-body class="text-[13px] text-stone-700 leading-relaxed whitespace-pre-wrap">{{ reply.body }}</p>
+            <div data-stored-event-attachments></div>
             {% if conversation_view %}<p class="text-[10px] text-stone-400 mt-1">In reply to the message from {{ reply.inbox_message.received_at|date:"N j, Y g:i A" }}</p>{% endif %}
             {% if reply.status == 'sent' and reply.inbox_message.message_type == 'dm' %}
             <a href="{% url 'inbox:message_detail' workspace_id=workspace.id message_id=reply.inbox_message_id %}?follow_up_reply_id={{ reply.id }}"

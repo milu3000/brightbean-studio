@@ -54,17 +54,19 @@ def native_read():
         yield read
 
 
-def test_detail_and_feed_never_autoload_native_content(owner_client, inbox_account, native_read):
+def test_rendering_requires_a_separate_scoped_browser_read(owner_client, inbox_account, native_read):
     message = incoming(inbox_account, "selected")
     for url in (detail_url(message), reverse("inbox:feed", kwargs={"workspace_id": message.workspace_id})):
         response = owner_client.get(url)
         assert response.status_code == 200
         assert b"inbox-native-thread.js" in response.content
     html = owner_client.get(detail_url(message), HTTP_HX_REQUEST="true").content.decode()
-    assert "Read latest platform conversation" in html
+    assert "Retry platform read" in html
     assert f'data-anchor-id="{message.pk}"' in html
     assert "data-native-thread-result hidden" in html
-    assert "Reads once when clicked" in html
+    assert "data-inbox-scroll" in html
+    assert "Read latest platform conversation" not in html
+    assert "Temporary platform snapshot" not in html
     assert "data-native-thread-refresh hx-" not in html
     native_read.assert_not_called()
 
@@ -204,3 +206,25 @@ def test_unavailable_snapshot_is_explicit_and_content_free(owner_client, inbox_a
     assert response.json()["reason_code"] == reason
     assert response.json()["items"] == []
     assert response.json()["history_complete"] is False
+
+
+def test_scrolling_posts_only_the_selected_threads_continuation(owner_client, inbox_account, native_read):
+    message = incoming(inbox_account, "selected")
+    native_read.return_value["anchor_message_id"] = str(message.pk)
+    response = owner_client.post(refresh_url(message), {"continuation": "synthetic-signed-position"})
+    assert response.status_code == 200
+    assert native_read.call_args.args[0].pk == message.pk
+    assert native_read.call_args.kwargs["continuation"] == "synthetic-signed-position"
+    assert native_read.call_args.kwargs["limit"] == 50
+    assert "no-store" in response["Cache-Control"]
+
+
+@pytest.mark.parametrize("code", ["invalid_continuation", "stale_continuation"])
+def test_continuation_failure_carries_no_private_diagnostics(owner_client, inbox_account, native_read, code):
+    message = incoming(inbox_account, "selected")
+    native_read.side_effect = NativeThreadReadError(code, "private-provider-diagnostic")
+    response = owner_client.post(refresh_url(message), {"continuation": "synthetic-position"})
+    assert response.status_code == (400 if code == "invalid_continuation" else 409)
+    assert response.json() == {"status": "unavailable", "reason_code": code, "anchor_message_id": str(message.pk)}
+    assert "private-provider-diagnostic" not in response.content.decode()
+    assert "no-store" in response["Cache-Control"]

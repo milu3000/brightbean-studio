@@ -33,7 +33,7 @@
                             {% include "partials/_platform_icon.html" with platform=message.social_account.platform size="sm" %}
                             <span class="text-[11px] text-stone-500">{{ message.social_account.account_name|default:message.social_account.account_handle }}</span>
                         </div>
-                        <span class="text-[11px] text-stone-400">{{ message.received_at|date:"N j, Y g:i A" }}</span>
+                        <time datetime="{{ message.received_at|date:'c' }}" class="text-[11px] text-stone-400">{{ message.received_at|date:"N j, Y g:i A" }}</time>
                     </div>
                 </div>
             </div>
@@ -66,32 +66,30 @@
             </div>
         </div>
         {% if conversation_view %}
-        <p class="text-[11px] text-stone-500 mt-2">{{ stored_message_count }} stored incoming message{{ stored_message_count|pluralize }}. Status and assignment above apply only to the selected message from {{ message.received_at|date:"N j, Y g:i A" }}.</p>
+        <p class="text-[11px] text-stone-500 mt-2">{{ stored_message_count }} stored incoming message{{ stored_message_count|pluralize }}. Status and assignment above apply only to the selected message from <time datetime="{{ message.received_at|date:'c' }}">{{ message.received_at|date:"N j, Y g:i A" }}</time>.</p>
         {% if not has_native_thread %}<p class="text-[11px] text-stone-500 mt-1">The conversation could not be matched reliably, so this message is shown on its own.</p>{% endif %}
         {% endif %}
     </div>
 
     <!-- Message body + thread -->
-    <div class="flex-1 overflow-y-auto px-5 py-4">
-        {% if message.message_type == 'dm' %}
-        <section class="mb-4 rounded-xl border border-stone-200 p-3" data-native-thread
-                 data-anchor-id="{{ message.id }}"
-                 data-refresh-url="{% url 'inbox:native_thread_refresh' workspace_id=workspace.id message_id=message.id %}"
-                 aria-label="Temporary platform conversation">
-            <button type="button" data-native-thread-refresh class="text-[12px] font-semibold text-orange-700 underline">Read latest platform conversation</button>
-            <p class="text-[11px] text-stone-500 mt-1">Reads once when clicked. The result is temporary and may be incomplete.</p>
-            <div data-native-thread-result hidden class="mt-3">
-                <div class="flex items-start justify-between gap-3">
-                    <p class="text-[12px] font-semibold text-stone-700">Temporary platform snapshot</p>
-                    <button type="button" data-native-thread-dismiss class="text-[12px] text-stone-600 underline">Dismiss / cancel</button>
-                </div>
-                <p data-native-thread-status role="status" aria-live="polite" class="text-[12px] text-stone-600 mt-2"></p>
-                <p data-native-thread-warning hidden class="text-[12px] text-amber-800 mt-2"></p>
-                <div data-native-thread-items class="space-y-2 mt-3 max-h-80 overflow-y-auto"></div>
+    <div class="flex-1 overflow-y-auto px-5 py-4" data-inbox-scroll>
+        {% if message.message_type == 'dm' and conversation_view %}
+        <div class="mb-3 text-[11px] text-stone-500" data-native-thread
+             data-anchor-id="{{ message.id }}"
+             data-native-view-scope="{{ native_view_scope }}"
+             data-refresh-url="{% url 'inbox:native_thread_refresh' workspace_id=workspace.id message_id=message.id %}"
+             aria-label="Conversation read status">
+            <div data-native-thread-result hidden>
+                <p data-native-thread-status role="status" aria-live="polite"></p>
+                <p data-native-thread-warning hidden class="text-amber-800 mt-1"></p>
+                <button type="button" data-native-thread-refresh hidden class="text-orange-700 underline mt-1">Retry platform read</button>
             </div>
-            <noscript><p class="text-[12px] text-stone-500 mt-2">JavaScript is required to read a temporary snapshot without replacing your draft.</p></noscript>
-        </section>
-        <p class="text-[11px] font-semibold text-stone-600 mb-2">Stored BrightBean history</p>
+            <p data-native-history-status role="status" aria-live="polite"></p>
+            <button type="button" data-native-history-retry hidden class="text-orange-700 underline">Retry earlier platform messages</button>
+            <p data-stored-history-status role="status" aria-live="polite"></p>
+            <button type="button" data-stored-history-retry hidden class="text-orange-700 underline">Retry earlier messages</button>
+            <noscript><p>JavaScript is required to read the latest platform conversation and load earlier messages while scrolling.</p></noscript>
+        </div>
         {% endif %}
         {% if conversation_view %}
         <div id="inbox-thread" class="space-y-3" aria-label="Conversation history" aria-live="polite">

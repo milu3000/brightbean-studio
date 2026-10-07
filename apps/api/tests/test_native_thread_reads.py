@@ -205,3 +205,45 @@ def test_message_tool_description_does_not_claim_complete_native_history():
     description = get_tool("get_inbox_message").description
     assert "empty replies array does not mean unanswered" in description
     assert "full reply thread" not in description
+
+
+def test_scoped_native_continuation_is_shared_by_rest_and_mcp_without_saving(context):
+    anchor = message(context)
+    first = payload(context)
+    first["messages"]["paging"] = {
+        "next": "https://graph.instagram.com/v25.0/synthetic-thread/messages?after=synthetic-after",
+        "cursors": {"after": "synthetic-after"},
+    }
+    before = {model: list(model.objects.values()) for model in (InboxMessage, InboxReply, ConversationMessage)}
+    with patch("apps.inbox.native_thread_reads._request_native_thread", return_value=first):
+        response = read_rest(context, anchor)
+    token = response.json()["older_continuation"]
+    assert token
+    older = payload(context)
+    older["messages"]["data"][0].update(
+        id="older-outbound", created_time=(timezone.now() - timedelta(minutes=5)).isoformat()
+    )
+    with patch("apps.inbox.native_thread_reads._request_native_thread", return_value=older) as request:
+        rest = read_rest(context, anchor, continuation=token)
+        mcp = read_mcp(context, anchor, continuation=token)
+    assert rest.status_code == 200
+    assert rest.json()["items"] == decoded(mcp)["items"]
+    assert rest.json()["items"][0]["platform_message_id"] == "older-outbound"
+    assert rest.json()["older_continuation"] is None
+    assert rest.json()["history_complete"] is False
+    assert all(call.args[3] == "synthetic-after" for call in request.call_args_list)
+    assert before == {model: list(model.objects.values()) for model in before}
+    audit_text = json.dumps(list(ApiKeyAuditLog.objects.values()), default=str)
+    assert token not in audit_text and "Native-only body" not in audit_text
+    assert "no-store" in rest["Cache-Control"] and "no-store" in mcp["Cache-Control"]
+
+
+@pytest.mark.parametrize("continuation", ["", "not-signed", "x" * 6145, 7, True, {"after": "unsafe"}])
+def test_bad_continuation_never_reaches_provider_on_either_surface(context, continuation):
+    anchor = message(context)
+    with patch("apps.inbox.native_thread_reads._request_native_thread") as request:
+        rest = read_rest(context, anchor, continuation=continuation)
+        mcp = read_mcp(context, anchor, continuation=continuation)
+    assert rest.status_code == 422
+    assert "error" in mcp.json()
+    request.assert_not_called()

@@ -1469,8 +1469,10 @@ def _read_native_inbox_thread(args: dict, context: dict[str, Any]) -> dict:
     )
 
     _require_perm(context, "use_inbox")
-    if "message_id" not in args or set(args) - {"message_id", "limit"}:
-        raise JsonRpcError(INVALID_PARAMS, "message_id and optional limit are the only supported arguments")
+    if "message_id" not in args or set(args) - {"message_id", "limit", "continuation"}:
+        raise JsonRpcError(
+            INVALID_PARAMS, "message_id, optional limit and continuation are the only supported arguments"
+        )
     key = context["api_key"]
     message = _get_inbox_message_for_key(key, args["message_id"])
     request = context.get("request")
@@ -1478,7 +1480,10 @@ def _read_native_inbox_thread(args: dict, context: dict[str, Any]) -> dict:
         request._native_inbox_snapshot = True
     try:
         result = read_native_thread(
-            message, authorization=key_read_authorization(key, request), limit=args.get("limit", 50)
+            message,
+            authorization=key_read_authorization(key, request),
+            limit=args.get("limit", 50),
+            continuation=args.get("continuation"),
         )
     except NativeThreadReadError as exc:
         raise JsonRpcError(INVALID_PARAMS, str(exc)) from exc
@@ -1494,8 +1499,10 @@ register_tool(
         name="read_native_inbox_thread",
         description=(
             "Explicitly read one current Instagram/Facebook conversation using an existing authorized inbox message's "
-            "native thread ID. May show native app replies absent from BrightBean's stored replies. Makes one bounded "
-            "platform read per invocation; does not poll, follow pagination, save message content, mark work answered, "
+            "native thread ID. May show native app replies absent from BrightBean's stored replies. Reads a bounded "
+            "page (at most 20 messages); pass its older_continuation only to request an earlier page of the same thread. "
+            "A continuation can make two fixed-thread reads to verify participants and retrieve messages. "
+            "Does not poll, follow provider paging URLs, save message content, mark work answered, "
             "change capture, or send. Only verified direct conversations are returned. The snapshot is incomplete and "
             "transient; empty/unavailable results never prove no reply. It never grants permission to send or extends "
             "the automated reply window. Requires the current use_inbox permission and account allowlist."
@@ -1505,6 +1512,7 @@ register_tool(
             "properties": {
                 "message_id": {"type": "string", "format": "uuid"},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 100, "default": 50},
+                "continuation": {"type": "string", "minLength": 1, "maxLength": 6144},
             },
             "required": ["message_id"],
             "additionalProperties": False,

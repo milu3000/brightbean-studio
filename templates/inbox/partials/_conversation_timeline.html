@@ -5,6 +5,7 @@
 </aside>
 {% endif %}
 {% if history_page.paginator.num_pages > 1 %}
+<noscript>
 <nav class="flex items-center justify-between gap-3 text-[12px] mb-3" aria-label="Conversation history pages">
     {% if history_page.has_next %}
     <a href="{% url 'inbox:message_detail' workspace_id=workspace.id message_id=message.id %}?history_page={{ history_page.next_page_number }}"
@@ -18,15 +19,28 @@
        hx-target="#inbox-thread" hx-sync="#inbox-detail-panel:queue last" class="underline">Newer messages</a>
     {% endif %}
 </nav>
+</noscript>
 {% endif %}
-{% for item_type, item, timestamp in thread %}
-{% ifchanged timestamp.date %}<p class="text-[11px] text-stone-500 text-center py-2">{{ timestamp|date:"l, N j, Y" }}</p>{% endifchanged %}
-{% if item_type == "incoming" %}
-{% include "inbox/partials/_incoming_item.html" with incoming=item %}
-{% elif item_type == "reply" %}
-{% include "inbox/partials/_reply_item.html" with reply=item %}
-{% elif item_type == "note" %}
-{% include "inbox/partials/_note_item.html" with note=item %}
+<div data-stored-timeline-events data-timeline-anchor-id="{{ message.id }}"
+     data-timeline-page-key="{{ history_page_key|default:'initial' }}"
+     data-older-url="{{ history_older_url }}"
+     data-history-complete="{% if history_older_url %}false{% else %}true{% endif %}"
+     class="space-y-3">
+{% for event in timeline_events %}
+<div data-timeline-event="stored" data-event-kind="{{ event.kind }}"
+     data-event-id="{{ event.event_id }}" data-platform-message-id="{{ event.platform_id }}"
+     data-event-direction="{{ event.direction }}" data-event-time="{{ event.occurred_at }}"
+     data-stored-order="{{ forloop.counter0 }}"
+     class="{% if event.direction == 'outbound' %}ml-auto w-[90%] md:w-[85%]{% elif event.direction == 'inbound' %}mr-auto w-[90%] md:w-[85%]{% else %}mx-auto w-full{% endif %}">
+{% ifchanged event.timestamp.date %}<p data-timeline-day-label class="text-[11px] text-stone-500 text-center py-2">{{ event.timestamp|date:"l, N j, Y" }}</p>{% endifchanged %}
+{% if event.kind == "incoming" %}
+{% include "inbox/partials/_incoming_item.html" with incoming=event.item %}
+{% elif event.kind == "reply" %}
+{% include "inbox/partials/_reply_item.html" with reply=event.item %}
+{% elif event.kind == "note" %}
+{% include "inbox/partials/_note_item.html" with note=event.item %}
 {% endif %}
+</div>
 {% endfor %}
-<p class="text-[10px] text-stone-400 pt-3">This history contains messages already saved in BrightBean. Earlier or external activity may be missing.</p>
+</div>
+<p class="text-[10px] text-stone-400 pt-3">Saved BrightBean history stays here. Platform observations in this view are temporary; earlier or external activity may still be missing.</p>

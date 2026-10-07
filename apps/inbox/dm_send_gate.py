@@ -402,13 +402,15 @@ def _known_refusal(exc, platform):
     )
 
 
-def _settle_not_sent(reply, attempt, code):
+def _settle_not_sent(reply, attempt, code, *, reason=""):
     attempt.outcome, attempt.reason_code = DMSendAttempt.Outcome.NOT_SENT, code
     attempt.completed_at = timezone.now()
     attempt.save(update_fields=["outcome", "reason_code", "completed_at"])
     reply.status = InboxReply.Status.FAILED
     reply.not_sent_verified = True
     reply.send_error = f"DM send stopped ({code}); no provider acceptance was recorded for this attempt."
+    if reason:
+        reply.send_error = f"DM send stopped ({code}): {reason}"
     reply.save(update_fields=["status", "send_error", "not_sent_verified", "updated_at"])
 
 
@@ -464,13 +466,18 @@ def send_enrolled_dm(reply, *, actor, authorization, automated, snapshot, dispat
                     if not isinstance(mid, str) or not mid.strip() or len(mid) > 255:
                         raise DMSendUnknownError()
                 except Exception as exc:
+                    from .provider_failures import log_dm_provider_failure, provider_failure_reason
+
+                    if not isinstance(exc, _PreDispatchRefusedError):
+                        log_dm_provider_failure(reply.pk, exc)
                     if isinstance(exc, _PreDispatchRefusedError) or _known_refusal(exc, account.platform):
                         code = (
                             getattr(exc.reason, "code", "preflight_refused")
                             if isinstance(exc, _PreDispatchRefusedError)
                             else "provider_refused"
                         )
-                        _settle_not_sent(reply, attempt, code)
+                        reason = "" if isinstance(exc, _PreDispatchRefusedError) else provider_failure_reason(exc)
+                        _settle_not_sent(reply, attempt, code, reason=reason)
                         settle_dispatch_attempt(dispatch_binding, attempt, reply, sent=False)
                         failure = (
                             exc.reason
@@ -478,7 +485,8 @@ def send_enrolled_dm(reply, *, actor, authorization, automated, snapshot, dispat
                             else DMSendGateError(code, reply.send_error)
                         )
                     else:
-                        # No provider response, exception text or secret logs.
+                        # Numeric diagnostics above are not acceptance/refusal
+                        # evidence. Keep the existing conservative unknown gate.
                         failure = DMSendUnknownError()
                 else:
                     reply.status, reply.platform_reply_id, reply.send_error = InboxReply.Status.SENT, mid, ""
