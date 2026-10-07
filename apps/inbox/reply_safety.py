@@ -207,6 +207,24 @@ def validate_dm_target(message):
 
 def check_dm_receipts(message, reply=None, *, include_drafts=False, follow_up_of=None):
     """Account lock serializes this predicate with draft creation and sends."""
+    from .conversation_composer import enabled as composer_enabled
+    from .conversation_composer import validate_conversation_reply
+    from .conversation_policy import read_allowed
+    from .models import ConversationMessage
+    from .sync_identity import canonical_owns_account
+
+    if reply is not None and reply.conversation_id:
+        validate_conversation_reply(message, reply)
+        return
+    linked = ConversationMessage.objects.filter(legacy_message=message).first()
+    if (
+        (composer_enabled() and read_allowed(message.social_account))
+        or canonical_owns_account(message.social_account)
+        or (linked and linked.conversation_id and linked.conversation.composer_replies.exists())
+    ):
+        raise _error(
+            "conversation_composer_required", "Open the canonical conversation composer for this outgoing action."
+        )
     replies = InboxReply.objects.filter(inbox_message=message)
     if reply is not None and (
         (reply.follow_up_of_id and not reply.is_follow_up)
@@ -310,6 +328,9 @@ def reply_send_availability(message, *, reply=None, follow_up_of=None):
                     "old_target", "This incoming message or draft predates the current send window; sending is held."
                 )
         check_conversation_send(message.social_account, message, reply or InboxReply(inbox_message=message))
+        from .services import validate_meta_reply_window
+
+        validate_meta_reply_window(message, automated=False)
     except ValueError as exc:
         result.update(allowed=False, code=getattr(exc, "code", "held"), reason=str(exc))
     return result
@@ -334,15 +355,15 @@ def _lock_current(reply, snapshot):
 def _check_current(reply, account, message, snapshot, authorization, automated):
     from .dm_send_gate import _authorize, _fingerprint
     from .reply_dispatch import check_conversation_send
-    from .services import validate_automated_reply_window
 
     if DMSendControl.objects.filter(social_account=account).exists():
         raise _error("gate_changed", "The account send controls changed; review this reply before sending.")
     check_conversation_send(account, message, reply)
     if reply.dm_send_attempts.exists():
         raise _error("legacy_attempt", "This reply requires its existing durable DM send gate.")
-    if automated:
-        validate_automated_reply_window(message)
+    from .services import validate_meta_reply_window
+
+    validate_meta_reply_window(message, automated=automated)
     validate_dm_target(message)
     check_dm_receipts(message, reply, include_drafts=True)
     if _fingerprint(reply, message) != snapshot.fingerprint or not reply.body.strip():
@@ -406,7 +427,13 @@ def send_unenrolled_dm(reply, *, snapshot, actor, authorization, automated, disp
                     _check_current(reply, account, message, snapshot, authorization, automated)
                     entered_provider = True
 
-                mid = _dispatch_to_platform(message, reply.body, automated=automated, before_provider=before_provider)
+                mid = _dispatch_to_platform(
+                    message,
+                    reply.body,
+                    automated=automated,
+                    before_provider=before_provider,
+                    **({"reply": reply} if reply.quote_target_id else {}),
+                )
                 if not isinstance(mid, str) or not mid.strip() or len(mid) > 255:
                     # A successful adapter return without its receipt is ambiguous.
                     entered_provider = True

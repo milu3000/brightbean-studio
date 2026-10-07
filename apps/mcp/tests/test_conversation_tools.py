@@ -191,12 +191,8 @@ def test_pinned_enrollment_survives_scope_to_query_reassignment(
             ),
         }[tool]
         _, result = _call(full_client, name, args)
-    if tool == "list":
-        data = _result_json(result)
-        assert data["items"] == []
-        assert data["unassigned_message_count"] == 0
-    else:
-        assert "error" in result
+    # A final fresh-scope check now refuses the entire stale response.
+    assert "error" in result
     assert "Unenrolled namespace content" not in json.dumps(result)
     assert "unenrolled-sync-detail" not in json.dumps(result)
 
@@ -236,17 +232,12 @@ def test_each_ledger_query_revalidates_identity_inside_sql(
     )
     protected_model = ConversationSyncState if query == "sync" else ConversationMessage
     with reassign_before_select(protected_model, account, **changes):
-        result = call(
+        _, result = _call(
             full_client,
             "list_conversations" if query == "unassigned_count" else "get_conversation_messages",
             {} if query == "unassigned_count" else {"conversation_id": str(conversation.pk)},
         )
-    if query == "unassigned_count":
-        assert result["unassigned_message_count"] == 0
-    else:
-        assert result["items"] == []
-        assert result["sync"]["status"] == "unknown"
-        assert result["sync"]["last_error_code"] == ""
+    assert "error" in result
     assert "Late namespace content" not in json.dumps(result)
     assert "late-private-sync" not in json.dumps(result)
 

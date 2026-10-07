@@ -21,18 +21,20 @@ function controller(search, entries) {
     return context.inboxController();
 }
 
-function setup(fields = [], approved = false) {
+function setup(fields = [], approved = false, quote = null) {
     const listeners = new Map();
     const dispatched = [];
     let confirmations = 0;
     const context = {
         document: {
+            querySelectorAll() { return []; },
             addEventListener(name, callback) {
                 listeners.set(name, [...(listeners.get(name) || []), callback]);
             },
-            querySelector() { return { querySelectorAll: () => fields }; }
+            querySelector() { return { querySelectorAll: () => fields, querySelector: selector => selector === '[data-inbox-quote-id]' ? quote : null }; }
         },
         window: {
+            addEventListener(name, callback) { listeners.set(name, [...(listeners.get(name) || []), callback]); },
             confirm() { confirmations++; return approved; },
             dispatchEvent(event) { dispatched.push(event); }
         },
@@ -118,4 +120,15 @@ test('a read-state refresh preserves the active page when filters are unchanged'
 test('a newer filter takes precedence over stale URL state and resets pagination', () => {
     const app = controller('?q=old&page=3', [['view', 'mine'], ['q', 'new'], ['status', 'open']]);
     assert.equal(app.listParams(), 'q=new&status=open&view=mine');
+});
+
+
+test('quote-only changes guard navigation even when hidden defaultValue changes with value', () => {
+    for (const [value, initial] of [['new-target', ''], ['', 'saved-target']]) {
+        const app = setup([], false, {value, defaultValue:value, dataset:{inboxQuoteInitial:initial}});
+        const event = confirmationEvent(); app.emit('htmx:confirm', event);
+        assert.equal(event.prevented, true); assert.equal(event.requested, false);
+    }
+    const app = setup([], false, {value:'saved-target',dataset:{inboxQuoteInitial:'saved-target'}});
+    const event = confirmationEvent(); app.emit('htmx:confirm', event); assert.equal(event.prevented, false);
 });

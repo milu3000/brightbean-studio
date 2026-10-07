@@ -31,7 +31,9 @@ def resolve_recipient_id(extra: dict | None) -> str:
     return ""
 
 
-def build_send_payload(recipient_id: str, text: str, *, human_agent: bool = False) -> dict:
+def build_send_payload(
+    recipient_id: str, text: str, *, human_agent: bool = False, reply_to_message_id: str | None = None
+) -> dict:
     """Build a Send API request body.
 
     Past 24 hours Meta only accepts a tagged message, and HUMAN_AGENT is the tag
@@ -44,4 +46,13 @@ def build_send_payload(recipient_id: str, text: str, *, human_agent: bool = Fals
     }
     if human_agent:
         payload["tag"] = "HUMAN_AGENT"
+    if reply_to_message_id is not None:
+        if (
+            not isinstance(reply_to_message_id, str)
+            or not reply_to_message_id
+            or len(reply_to_message_id) > 255
+            or any(c.isspace() or ord(c) < 32 for c in reply_to_message_id)
+        ):
+            raise ValueError("A valid native message ID is required for a quote.")
+        payload["reply_to"] = {"mid": reply_to_message_id}
     return payload

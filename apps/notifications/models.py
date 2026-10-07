@@ -2,6 +2,7 @@ import uuid
 
 from django.conf import settings
 from django.db import models
+from django.utils import timezone
 
 
 class EventType(models.TextChoices):
@@ -52,7 +53,50 @@ class Notification(models.Model):
     read_at = models.DateTimeField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True, db_index=True)
 
+    workspace = models.ForeignKey("workspaces.Workspace", on_delete=models.SET_NULL, null=True, blank=True)
+    inbox_message = models.ForeignKey("inbox.InboxMessage", on_delete=models.SET_NULL, null=True, blank=True)
+    conversation = models.ForeignKey("inbox.InboxConversation", on_delete=models.SET_NULL, null=True, blank=True)
+    subject_key = models.CharField(max_length=64, null=True, blank=True)
+    revision = models.PositiveBigIntegerField(default=1)
+    read_revision = models.PositiveBigIntegerField(default=0)
+    source_revision = models.PositiveBigIntegerField(default=0)
+    event_count = models.PositiveBigIntegerField(default=1)
+    last_event_at = models.DateTimeField(default=timezone.now, db_index=True)
+    latest_message_at = models.DateTimeField(null=True, blank=True)
+    dismissed_at = models.DateTimeField(null=True, blank=True)
+    superseded_by = models.ForeignKey("self", on_delete=models.SET_NULL, null=True, blank=True)
+
+    @property
+    def display_title(self):
+        from .inbox import notification_title
+
+        return notification_title(self) if self.event_type == EventType.NEW_INBOX_MESSAGE else self.title
+
+    @property
+    def display_body(self):
+        from .content import notification_body
+
+        return notification_body(self)
+
+    @property
+    def action_url(self):
+        from django.urls import reverse
+
+        if self.conversation_id and getattr(settings, "INBOX_CANONICAL_READ_ENABLED", False) is True:
+            return reverse(
+                "inbox:conversation_detail",
+                kwargs={"workspace_id": self.workspace_id, "conversation_id": self.conversation_id},
+            )
+        if self.inbox_message_id and self.workspace_id:
+            return reverse(
+                "inbox:message_detail", kwargs={"workspace_id": self.workspace_id, "message_id": self.inbox_message_id}
+            )
+        return (self.data or {}).get("action_url", "")
+
     class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["user", "event_type", "subject_key"], name="notification_subject_unique")
+        ]
         db_table = "notifications_notification"
         ordering = ["-created_at"]
         indexes = [
@@ -151,3 +195,14 @@ class QuietHours(models.Model):
         if self.is_enabled:
             return f"{self.user} quiet {self.start_time}–{self.end_time} ({self.timezone})"
         return f"{self.user} quiet hours disabled"
+
+
+class InboxNotificationEvent(models.Model):
+    """Content-free, recipient/account/domain-scoped replay receipt."""
+
+    notification = models.ForeignKey(Notification, on_delete=models.CASCADE, related_name="inbox_events")
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE)
+    event_key = models.CharField(max_length=64)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["user", "event_key"], name="notification_event_unique")]

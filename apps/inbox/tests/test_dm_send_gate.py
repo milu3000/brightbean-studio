@@ -532,7 +532,7 @@ def test_status_view_requires_current_session_membership_and_is_readonly(enrolle
     assert client.get(url).status_code == 403
 
 
-def test_disconnect_is_blocked_before_any_external_or_delete_effect(enrolled, client):
+def test_disconnect_stops_enrolled_account_and_preserves_control(enrolled, client):
     client.force_login(enrolled.user)
     with (
         patch("apps.social_accounts.views.unsubscribe_account_webhooks") as unsubscribe,
@@ -545,10 +545,12 @@ def test_disconnect_is_blocked_before_any_external_or_delete_effect(enrolled, cl
                 kwargs={"workspace_id": enrolled.account.workspace_id, "account_id": enrolled.account.pk},
             )
         )
-    assert response.status_code == 409, response.content
-    unsubscribe.assert_not_called()
-    provider.assert_not_called()
+    assert response.status_code == 302, response.content
+    unsubscribe.assert_called_once()
+    provider.assert_called_once()
     delete.assert_not_called()
+    assert DMSendControl.objects.get(social_account=enrolled.account).paused
+    assert SocialAccount.objects.get(pk=enrolled.account.pk).connection_status == "disconnected"
 
 
 @pytest.mark.parametrize("enroll_second", [False, True])

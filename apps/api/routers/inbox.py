@@ -30,6 +30,8 @@ from apps.api.middleware import (
     release_idempotent_claim,
 )
 from apps.api.pagination import decode_offset_cursor, encode_offset_cursor
+from apps.api.routers.canonical_inbox import invoke as canonical_invoke
+from apps.api.routers.canonical_inbox import read_scope, respond
 from apps.api.schemas import (
     CreateReplyRequest,
     InboxMessageResponse,
@@ -39,6 +41,7 @@ from apps.api.schemas import (
     NativeInboxThreadReadRequest,
     UpdateReplyRequest,
 )
+from apps.inbox import canonical_reads as canonical_reader
 from apps.inbox.dm_send_gate import key_send_authorization
 from apps.inbox.models import InboxMessage, InboxReply
 from apps.inbox.services import (
@@ -50,6 +53,10 @@ from apps.inbox.services import (
 )
 
 router = Router(tags=["inbox"])
+
+from .conversation_composer import router as composer_router  # noqa: E402
+
+router.add_router("/conversations", composer_router)
 
 _LIMIT_DEFAULT = 50
 _LIMIT_MAX = 100
@@ -95,6 +102,16 @@ def _get_reply(request: HttpRequest, reply_id: uuid.UUID) -> InboxReply:
     return reply
 
 
+def _require_legacy_write(request, message_id):
+    from apps.inbox.composer_surfaces import legacy_write_upgrade
+
+    value = legacy_write_upgrade(request.api_key, message_id, request)
+    if value is not None:
+        error = HttpError(409, value["detail"])
+        error.canonical_data = value
+        raise error
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
@@ -117,16 +134,32 @@ def list_messages(
     if message_type is not None and message_type not in InboxMessage.MessageType.values:
         raise HttpError(422, f"message_type must be one of {', '.join(InboxMessage.MessageType.values)}")
 
+    canonical_invoke(
+        canonical_reader.list_legacy_dm_adapter,
+        read_scope(request),
+        message_type=message_type,
+        status=status,
+        social_account_id=social_account_id,
+        cursor=cursor,
+        limit=limit,
+    )
+
     try:
         offset = decode_offset_cursor(cursor)
     except ValueError as exc:
         raise HttpError(422, "cursor is not a valid pagination cursor") from exc
 
-    qs = _visible_messages_qs(request).prefetch_related("replies__author")
+    qs = (
+        _visible_messages_qs(request)
+        .exclude(pk__in=InboxMessage.objects.filter(extra__transport_projection=True).values("pk"))
+        .prefetch_related("replies__author")
+    )
     if status:
         qs = qs.filter(status=status)
     if message_type:
-        qs = qs.filter(message_type=message_type)
+        from apps.inbox.public_threads import public_type_filter
+
+        qs = qs.filter(public_type_filter(message_type))
     if social_account_id is not None:
         if social_account_id not in _allowlisted_account_ids(request):
             raise HttpError(403, "social_account_id is not in this key's allowlist.")
@@ -148,7 +181,14 @@ def list_messages(
 def retrieve_message(request, message_id: uuid.UUID):
     enforce_http_rate_limits(request, is_write=False)
     _require_perm(request, "use_inbox")
-    message = _get_message(request, message_id)
+    try:
+        message = _get_message(request, message_id)
+    except Http404:
+        result = canonical_invoke(canonical_reader.read_canonical_incoming_message, read_scope(request), message_id)
+        return respond(request, result, "inbox.read", message_id)
+    result = canonical_invoke(canonical_reader.read_legacy_message, read_scope(request), message)
+    if result is not None:
+        return respond(request, result, "inbox.read", message_id)
     log_audit_entry(request, action="inbox.read", target_id=message.id, status_code=200)
     return InboxMessageResponse.from_message(message, include_replies=True, include_eligibility=True)
 
@@ -165,6 +205,7 @@ def retrieve_thread(
     enforce_http_rate_limits(request, is_write=False)
     _require_perm(request, "use_inbox")
     message = _get_message(request, message_id)
+    canonical_invoke(canonical_reader.read_legacy_thread, read_scope(request), message, cursor=cursor, limit=limit)
     try:
         result = read_stored_thread(message, actor_id=request.api_key.id, cursor=cursor, limit=limit)
     except ValueError as exc:
@@ -184,6 +225,13 @@ def read_native_conversation(request, message_id: uuid.UUID, payload: NativeInbo
     enforce_http_rate_limits(request, is_write=False)
     _require_perm(request, "use_inbox")
     message = _get_message(request, message_id)
+    canonical_invoke(
+        canonical_reader.read_legacy_thread,
+        read_scope(request),
+        message,
+        cursor=payload.continuation,
+        limit=payload.limit,
+    )
     try:
         result = read_native_thread(
             message,
@@ -221,6 +269,7 @@ def create_reply(request, message_id: uuid.UUID, payload: CreateReplyRequest):
     if payload.send:
         _require_perm(request, "reply_from_inbox")
 
+    _require_legacy_write(request, message_id)
     message = _get_message(request, message_id)
     follow_up_of = _get_reply(request, payload.follow_up_reply_id) if payload.follow_up_reply_id else None
     idempotency_key = payload.idempotency_key or request.headers.get("Idempotency-Key") or None
@@ -295,6 +344,7 @@ def update_reply(request, reply_id: uuid.UUID, payload: UpdateReplyRequest):
     enforce_http_rate_limits(request, is_write=True)
     _require_perm(request, "use_inbox")
     reply = _get_reply(request, reply_id)
+    _require_legacy_write(request, reply.inbox_message_id)
     try:
         update_reply_draft(reply, body=payload.body)
     except ReplyStateError as exc:
@@ -310,6 +360,7 @@ def send_reply(request, reply_id: uuid.UUID):
     enforce_http_rate_limits(request, is_write=True)
     _require_perm(request, "reply_from_inbox")
     reply = _get_reply(request, reply_id)
+    _require_legacy_write(request, reply.inbox_message_id)
     try:
         send_reply_now(
             reply,
@@ -330,6 +381,7 @@ def delete_reply(request, reply_id: uuid.UUID):
     enforce_http_rate_limits(request, is_write=True)
     _require_perm(request, "use_inbox")
     reply = _get_reply(request, reply_id)
+    _require_legacy_write(request, reply.inbox_message_id)
     try:
         discard_reply_draft(reply)
     except ReplyStateError as exc:

@@ -1,0 +1,7 @@
+<article><p>{{ record.sender_name }} · {{ record.account_name }} · {{ record.platform }}</p>
+<p>{% if record.linked %}Linked record{% else %}Unlinked record{% endif %}</p>
+<p>Recorded received time: {{ record.recorded_received_at }}</p>
+{% if record.is_expired %}<p>Content expired</p>{% elif record.is_deleted %}<p>Message withdrawn</p>{% elif not record.content_available %}<p>Content unavailable</p>{% else %}
+<p>{{ record.body|linebreaksbr }}</p>{% for attachment in record.attachments %}<p>{% if attachment.url %}<a href="{{ attachment.url }}" target="_blank" rel="noopener noreferrer">{{ attachment.title|default:"Attachment" }}</a>{% else %}Attachment unavailable{% endif %}</p>{% endfor %}
+{% endif %}
+{% if record.body_truncated or record.attachments_truncated %}<p>Preview shortened{% if record.body_url %} · <a href="{{ record.body_url }}">Read full text</a>{% endif %}{% if record.attachments_url %} · <a href="{{ record.attachments_url }}">All attachments</a>{% endif %}</p>{% endif %}</article>

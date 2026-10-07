@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import ipaddress
 import re
-from typing import Literal
+from typing import Any, Literal
 from urllib.parse import parse_qsl, urlencode, urlsplit
 
 MAX_ATTACHMENTS = 30
@@ -71,6 +71,32 @@ def safe_attachment_url(value: object, *, preview: bool = False) -> str:
         return ""
 
 
+def shared_content_url(value: object) -> str:
+    """Recognize an actually supplied post URL; never construct one from an ID."""
+    url = safe_attachment_url(value)
+    if not url:
+        return ""
+    parts = urlsplit(url)
+    host, path = (parts.hostname or "").lower(), parts.path
+    if host in {"instagram.com", "www.instagram.com"}:
+        return url if re.match(r"^/(?:p|reel|reels|tv|stories)/[^/]+", path) else ""
+    if host in {"facebook.com", "www.facebook.com", "m.facebook.com", "mbasic.facebook.com"}:
+        return (
+            url
+            if (
+                re.search(r"/(?:posts|photos|videos|reel|share)/[^/]+", path)
+                or path in {"/permalink.php", "/story.php", "/photo.php", "/watch/"}
+                and bool(parts.query)
+            )
+            else ""
+        )
+    if host in {"threads.net", "www.threads.net", "threads.com", "www.threads.com"}:
+        return url if re.match(r"^/@[^/]+/post/[^/]+", path) else ""
+    if host == "fb.watch":
+        return url if path.strip("/") else ""
+    return ""
+
+
 def _dict(value: object) -> dict:
     return value if isinstance(value, dict) else {}
 
@@ -115,30 +141,43 @@ def _normalize(item: object, *, share: bool = False) -> dict | None:
             kind = "file"
         else:
             kind = "unknown"
-    raw_url = (
-        item.get("link")
-        or item.get("url")
-        or payload.get("url")
-        or video.get("url")
-        or (item.get("video_data") if isinstance(item.get("video_data"), str) else "")
-        or image.get("url")
-        or image.get("animated_gif_url")
-        or cta.get("url")
-        or item.get("file_url")
+    candidates: tuple[Any, ...] = (
+        item.get("link"),
+        item.get("url"),
+        payload.get("url"),
+        video.get("url"),
+        item.get("video_data") if isinstance(item.get("video_data"), str) else "",
+        image.get("url"),
+        image.get("animated_gif_url"),
+        cta.get("url"),
+        item.get("file_url"),
     )
-    url = safe_attachment_url(raw_url)
-    preview = safe_attachment_url(
-        item.get("preview_url")
-        or item.get("thumbnail_url")
-        or payload.get("preview_url")
-        or payload.get("thumbnail_url")
-        or image.get("preview_url")
-        or image.get("animated_gif_preview_url")
-        or image.get("url")
-        or video.get("preview_url")
-        or (url if kind == "image" else ""),
-        preview=True,
+    if kind == "share":
+        candidates = (
+            item.get("permalink"),
+            item.get("permalink_url"),
+            payload.get("permalink"),
+            payload.get("permalink_url"),
+            item.get("link"),
+            cta.get("url"),
+            *candidates,
+        )
+    urls = [safe for value in candidates if (safe := safe_attachment_url(value))]
+    url = next((post for value in urls if (post := shared_content_url(value))), "") if kind == "share" else ""
+    url = url or next(iter(urls), "")
+    preview_candidates = (
+        item.get("preview_url"),
+        item.get("thumbnail_url"),
+        payload.get("preview_url"),
+        payload.get("thumbnail_url"),
+        image.get("preview_url"),
+        image.get("animated_gif_preview_url"),
+        image.get("url"),
+        template.get("image_url"),
+        video.get("preview_url"),
+        url if kind == "image" else "",
     )
+    preview = next((safe for value in preview_candidates if (safe := safe_attachment_url(value, preview=True))), "")
     result = {
         "type": kind,
         "url": url,
@@ -154,7 +193,7 @@ def _normalize(item: object, *, share: bool = False) -> dict | None:
             if isinstance(item.get("availability_reason"), str)
             and item.get("availability_reason") in _AVAILABILITY_REASONS
             else "unsafe_url"
-            if raw_url
+            if any(candidates)
             else "missing_url"
         ),
     }
@@ -221,6 +260,12 @@ def _combine(*groups: list[dict]) -> list[dict]:
                 continue
             previous = result[match]
             combined = {**previous, **{k: v for k, v in item.items() if v or k not in previous}}
+            if (
+                item["type"] == "share"
+                and shared_content_url(previous.get("url"))
+                and not shared_content_url(item.get("url"))
+            ):
+                combined["url"] = previous["url"]
             combined["availability"] = "available" if combined.get("url") else "unavailable"
             if combined.get("url"):
                 combined["availability_reason"] = "link_provided"

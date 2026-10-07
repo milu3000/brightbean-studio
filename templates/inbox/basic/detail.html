@@ -1,0 +1,6 @@
+{% extends "inbox/basic/base.html" %}{% block content %}
+<h2>{{ page.conversation.peer_name|default:"Conversation" }}</h2><p>{{ page.conversation.account_name }} · {{ page.conversation.platform }}</p>
+{% for message in page.messages %}{% include "inbox/basic/message.html" %}{% empty %}<p>No dated messages on this page</p>{% endfor %}
+{% if page.undated_messages %}<h3>Time unavailable</h3>{% for message in page.undated_messages %}{% include "inbox/basic/message.html" %}{% endfor %}{% endif %}
+<nav><a href="{{ newest_url }}">Newest</a>{% if older_url %} · <a href="{{ older_url }}">Older</a>{% endif %}{% if undated_url %} · <a href="{{ undated_url }}">More without time</a>{% endif %}</nav>
+{% endblock %}

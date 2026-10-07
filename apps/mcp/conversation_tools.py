@@ -10,19 +10,23 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import datetime
+from functools import wraps
 from typing import Any
 
 from django.core import signing
 from django.db.models import F, Q
 from django.utils import timezone
 
+from apps.inbox.canonical_access import enabled as canonical_enabled
+from apps.inbox.canonical_content import visible_content
 from apps.inbox.conversation_capabilities import conversation_capabilities
 from apps.inbox.conversation_policy import enrollment_identity, read_allowed, read_available
 from apps.inbox.models import ConversationMessage, ConversationSyncState, InboxConversation, InboxMessage
+from apps.mcp import canonical_reads as canonical
 from apps.mcp.handlers import _parse_uuid, _require_perm, _wrap_text
 from apps.mcp.protocol import INVALID_PARAMS, JsonRpcError
 from apps.mcp.tools import Tool, register_tool
-from providers.meta_inbox_content import message_content_status, normalize_attachments
+from providers.meta_inbox_content import normalize_attachments
 
 _FLAG = "INBOX_CONVERSATION_V2_ENABLED"
 _CURSOR_SALT = "brightbean.conversation.read.v1"
@@ -193,24 +197,13 @@ def _safe_attachments(attachments, *, deleted=False, limit=3):
 
 
 def _row_content_status(row):
-    if row.is_deleted:
-        return "removed"
-    if row.content_status in {
-        "partial",
-        "unsupported",
-        "fields_unavailable",
-        "link_provided",
-        "unavailable",
-        "text",
-        "no_metadata",
-    }:
-        return row.content_status
-    return message_content_status({"inbox_attachments": row.attachments}, row.body or "")
+    return visible_content(row)["content_status"]
 
 
 def _message(row):
-    body = "" if row.is_deleted else row.body or ""
-    attachments = _safe_attachments(row.attachments, deleted=row.is_deleted, limit=None)
+    content = visible_content(row)
+    body = content["body"]
+    attachments = _safe_attachments(content["attachments"], limit=None)
     result: dict[str, Any] = {
         "id": str(row.pk),
         "conversation_id": str(row.conversation_id) if row.conversation_id else None,
@@ -231,9 +224,10 @@ def _message(row):
         "attachment_metadata_count": len(attachments),
         "attachments_tool": "get_conversation_attachments",
         "attachments_truncated": len(attachments) > 3,
-        "content_available": bool(body or any(item.get("url") for item in attachments)) and not row.is_deleted,
-        "is_deleted": row.is_deleted,
-        "content_status": _row_content_status(row),
+        "content_available": content["available"] and bool(body or any(item.get("url") for item in attachments)),
+        "is_deleted": content["is_deleted"],
+        "is_expired": content["is_expired"],
+        "content_status": content["content_status"],
         "occurred_at": _iso(row.occurred_at),
         "first_seen_at": _iso(row.first_seen_at),
         "updated_at": _iso(row.updated_at),
@@ -275,7 +269,29 @@ def _bounded_page(rows, limit, scope, snapshot, date_field, serialize, metadata)
     }
 
 
+def _fresh_observed_read(function):
+    @wraps(function)
+    def read(args, context):
+        _require_perm(context, "use_inbox")
+        if not canonical_enabled() and not read_available():
+            raise JsonRpcError(INVALID_PARAMS, "Conversation history is not enabled")
+        if canonical_enabled():
+            return function(args, context)
+        actor = canonical.scope(context)
+        _accounts, stamp = canonical.invoke(canonical.reader._snapshot, actor, require_enabled=False)
+        result = function(args, context)
+        canonical.invoke(canonical.reader._recheck, actor, stamp, require_enabled=False)
+        return result
+
+    return read
+
+
+@_fresh_observed_read
 def _list_conversations(args: dict, context: dict[str, Any]) -> dict:
+    if canonical_enabled():
+        return _wrap_text(canonical.list_conversations(args, context))
+    canonical.invoke(canonical.reader.hold_legacy_fallback, canonical.scope(context))
+
     key, accounts, scoped = _scope(context)
     limit = _limit(args)
     qs = InboxConversation.objects.filter(**scoped)
@@ -306,7 +322,12 @@ def _list_conversations(args: dict, context: dict[str, Any]) -> dict:
     return _wrap_text(result)
 
 
+@_fresh_observed_read
 def _get_conversation_messages(args: dict, context: dict[str, Any]) -> dict:
+    if canonical_enabled():
+        return _wrap_text(canonical.messages(args, context))
+    canonical.invoke(canonical.reader.hold_legacy_fallback, canonical.scope(context))
+
     key, accounts, scoped = _scope(context)
     conversation = None
     if args.get("conversation_id") is not None:
@@ -364,7 +385,12 @@ def _get_conversation_messages(args: dict, context: dict[str, Any]) -> dict:
     return _wrap_text(result)
 
 
+@_fresh_observed_read
 def _get_reply_context(args: dict, context: dict[str, Any]) -> dict:
+    if canonical_enabled():
+        return _wrap_text(canonical.reply_context(args, context))
+    canonical.invoke(canonical.reader.hold_legacy_fallback, canonical.scope(context))
+
     _key, _accounts, scoped = _scope(context)
     target_id = _parse_uuid(args.get("message_id"), "message_id")
     limit = _limit(args, default=20)
@@ -442,7 +468,12 @@ def _get_reply_context(args: dict, context: dict[str, Any]) -> dict:
     return _wrap_text(result)
 
 
+@_fresh_observed_read
 def _get_conversation_attachments(args: dict, context: dict[str, Any]) -> dict:
+    if canonical_enabled():
+        return _wrap_text(canonical.attachments(args, context))
+    canonical.invoke(canonical.reader.hold_legacy_fallback, canonical.scope(context))
+
     """Page stored, sanitized metadata only; never fetch or cache media bytes."""
     key, accounts, scoped = _scope(context)
     message_id = _parse_uuid(args.get("message_id"), "message_id")
@@ -452,7 +483,8 @@ def _get_conversation_attachments(args: dict, context: dict[str, Any]) -> dict:
     row = ConversationMessage.objects.filter(**scoped, pk=message_id).first()
     if row is None:
         raise JsonRpcError(INVALID_PARAMS, "Conversation message not found")
-    items = _safe_attachments(row.attachments, deleted=row.is_deleted, limit=None)
+    content = visible_content(row)
+    items = _safe_attachments(content["attachments"], limit=None)
     scope = _cursor_scope(key, accounts, "attachments", {"message_id": str(message_id)})
     version = hashlib.sha256(json.dumps([_iso(row.updated_at), items], sort_keys=True).encode()).hexdigest()
     salt = _CURSOR_SALT + ".attachments"
@@ -491,8 +523,10 @@ def _get_conversation_attachments(args: dict, context: dict[str, Any]) -> dict:
             if more
             else None,
             "observed_at": _iso(timezone.now()),
-            "is_deleted": row.is_deleted,
-            "content_status": _row_content_status(row),
+            "is_deleted": content["is_deleted"],
+            "is_expired": content["is_expired"],
+            "content_available": content["available"],
+            "content_status": content["content_status"],
             "media_fetched": False,
             "platform_media_complete": False,
             "note": "Stored metadata only. Links may expire or require sign-in; unavailable content is not reconstructed.",
@@ -508,14 +542,20 @@ _PAGING = {
 for _name, _description, _properties, _required, _handler in (
     (
         "list_conversations",
-        "Read observed DM conversation identities for authorized accounts. Bounded and read-only; does not refresh or mark work read. History may be incomplete.",
-        {"social_account_id": {"type": "string", "format": "uuid"}, **_PAGING},
+        "Read saved DM conversations for currently authorized accounts. Canonical mode searches both directions and filters by account, platform or workflow state. No refresh or read acknowledgement; history may be incomplete.",
+        {
+            "social_account_id": {"type": "string", "format": "uuid"},
+            "platform": {"type": "string"},
+            "workflow_state": {"type": "string"},
+            "search": {"type": "string"},
+            **_PAGING,
+        },
         [],
         _list_conversations,
     ),
     (
         "get_conversation_messages",
-        "Read bounded bidirectional observed DM history, including native outgoing, with provenance and sync coverage. Ordered by first observation, not necessarily send time. Does not authorize a reply.",
+        "Read saved bidirectional DM history including native outgoing. Canonical mode orders known occurrence times with undated rows separate; compatibility observed mode uses first observation order. Coverage stays explicit. Does not authorize a reply.",
         {
             "conversation_id": {"type": "string", "format": "uuid"},
             "social_account_id": {"type": "string", "format": "uuid"},
@@ -561,6 +601,30 @@ for _name, _description, _properties, _required, _handler in (
             },
             handler=_handler,
             enabled_setting=_FLAG,
-            enabled_predicate=read_available,
+            enabled_predicate=lambda: canonical_enabled() or read_available(),
         )
     )
+
+
+def _unassigned_read(args, context):
+    _require_perm(context, "use_inbox")
+    return _wrap_text(
+        canonical.invoke(canonical.reader.read_unassigned_message, canonical.scope(context), args.get("message_id"))
+    )
+
+
+register_tool(
+    Tool(
+        name="get_unassigned_message",
+        description="Read a verified saved message by its actual canonical UUID when native conversation identity is unavailable. Group/unknown context remains read-only; no send permission, inferred thread or read acknowledgement is created.",
+        input_schema={
+            "type": "object",
+            "properties": {"message_id": {"type": "string", "format": "uuid"}},
+            "required": ["message_id"],
+            "additionalProperties": False,
+        },
+        handler=_unassigned_read,
+        enabled_setting=_FLAG,
+        enabled_predicate=canonical_enabled,
+    )
+)

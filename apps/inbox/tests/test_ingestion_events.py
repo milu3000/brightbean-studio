@@ -197,7 +197,8 @@ def test_new_dm_enqueues_once_and_duplicate_is_silent(inbox_account, subscriptio
     enqueue.assert_called_once()
     delivery = EventOutbox.objects.get()
     payload = json.loads(delivery.payload)
-    assert payload["eventId"] == "evt_" + InboxMessage.objects.get().pk.hex
+    assert payload["eventId"] == EventOutbox.objects.get().event_id
+    assert payload["data"]["message_id"] == str(InboxMessage.objects.get().pk)
     assert payload["data"]["message_id"] == str(InboxMessage.objects.get().pk)
 
 

@@ -1,8 +1,8 @@
 """Reply routing: comments go to the comment edge, DMs to the messaging one.
 
 Also covers the two behaviours that decide whether Meta accepts a reply at all:
-tagging a late reply as written by a human, and never recording a reply the
-platform refused.
+holding an extended reply without verified Human Agent approval, and never
+recording a reply the platform refused.
 
 The platform-dispatch logic lives in ``apps.inbox.services`` now; the view is a
 thin wrapper over it.
@@ -189,14 +189,17 @@ def test_recent_dm_replies_without_the_human_agent_tag(fb_account):
     assert provider.reply_to_message.call_args.kwargs["human_agent"] is False
 
 
-def test_dm_older_than_24_hours_is_tagged_human_agent(fb_account):
+def test_dm_older_than_24_hours_requires_verified_human_agent_approval(fb_account):
     message = _message(fb_account, message_type=InboxMessage.MessageType.DM, hours_ago=30)
     provider = _provider()
 
-    with patch("apps.inbox.services.get_provider", return_value=provider):
+    from apps.inbox.dm_send_gate import DMSendGateError
+
+    with patch("apps.inbox.services.get_provider", return_value=provider), pytest.raises(DMSendGateError) as held:
         _dispatch_to_platform(message, "Sorry for the delay")
 
-    assert provider.reply_to_message.call_args.kwargs["human_agent"] is True
+    assert held.value.code == "human_agent_permission_unverified"
+    provider.reply_to_message.assert_not_called()
 
 
 def test_sender_handle_is_passed_as_the_recipient(fb_account):

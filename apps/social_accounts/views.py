@@ -844,18 +844,13 @@ def _render_account_card(request, account, workspace_id):
 def disconnect(request, workspace_id, account_id):
     """Disconnect a social account."""
     account = get_object_or_404(SocialAccount.objects.for_workspace(workspace_id).select_for_update(), id=account_id)
-    from apps.inbox.models import DMSendControl
+    from apps.inbox.account_disconnect import has_retained_inbox, preserve_inbox_disconnect
 
-    if DMSendControl.objects.filter(social_account=account).exists():
-        return HttpResponse(
-            "This account has a persisted DM send control. Disconnect requires a controlled process "
-            "that preserves its send history and unresolved attempts.",
-            status=409,
-        )
+    preserve_inbox = has_retained_inbox(account)
 
     from apps.inbox.receipt_retention import UNRESOLVED_HISTORY, has_unresolved_replies
 
-    if has_unresolved_replies(account.pk):
+    if not preserve_inbox and has_unresolved_replies(account.pk):
         return HttpResponse(UNRESOLVED_HISTORY, status=409)
 
     # Stop the platform pushing us this account's activity before we drop the
@@ -878,6 +873,13 @@ def disconnect(request, workspace_id, account_id):
             "Failed to revoke token for %s, proceeding with disconnect",
             account,
         )
+
+    if preserve_inbox:
+        preserve_inbox_disconnect(account)
+        messages.success(request, "Disconnected. Saved inbox history and delivery receipts are preserved.")
+        if request.headers.get("HX-Request"):
+            return render(request, "social_accounts/partials/_empty.html")
+        return redirect("social_accounts:list", workspace_id=workspace_id)
 
     # Delete posts that ONLY target this account (will be fully orphaned).
     # Multi-platform posts keep their other PlatformPost targets via cascade.

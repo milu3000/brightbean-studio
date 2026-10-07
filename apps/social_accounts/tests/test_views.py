@@ -979,7 +979,7 @@ class TestDisconnectConfirmation:
     def test_facebook_says_the_grant_is_kept(self, authenticated_client, workspace):
         text = self._card_text(authenticated_client, workspace, "facebook")
 
-        assert "This removes the account from BrightBean only." in text
+        assert "This removes BrightBean's saved credentials." in text
         assert "Facebook &rsaquo; Settings &rsaquo; Apps and Websites" in text
         assert "deleted from BrightBean" in text
         assert "revokes BrightBean's access" not in text

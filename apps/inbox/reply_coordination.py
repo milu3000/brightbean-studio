@@ -18,7 +18,7 @@ from datetime import timedelta
 
 from django.conf import settings
 from django.db import transaction
-from django.db.models import Q
+from django.db.models import F, Q
 from django.utils import timezone
 
 from .conversation_policy import capture_allowed
@@ -314,27 +314,32 @@ def observe_message(
         # A clearly older outgoing is context, not proof the current question
         # was answered. Unknown/equal/later timestamps still pause conservatively.
         outgoing = False
-    own_confirmed_outgoing = bool(
-        outgoing
-        and source == "app_send"
-        and row.legacy_reply_id
-        and SendOperation.objects.filter(
+    confirmed_operation = None
+    if outgoing and source == "app_send" and row.legacy_reply_id:
+        confirmed_operation = SendOperation.objects.filter(
             **_scope(account),
             conversation=conversation,
             reply_id=row.legacy_reply_id,
             ownership__isnull=False,
             status="confirmed",
             attempt__outcome="sent",
-        ).exists()
-    )
-    if valid_identity and own_confirmed_outgoing:
-        # The dispatch transaction already settled and consumed this operation.
-        # Record its observation without treating our own accepted send as a new
-        # native takeover. Never clear an existing hold or reinstate due work.
-        _invalidate(state, "outgoing_observed")
-        state.generation += 1
-        state.burst_started_at = None
-        state.due_at = None
+        ).first()
+    if valid_identity and confirmed_operation is not None:
+        # Consume only the snapshot that this action actually answered. An
+        # incoming observed during HTTP owns its newer target, debounce and
+        # generation even though our older action later settles successfully.
+        consumed = state.generation == confirmed_operation.expected_generation and (
+            state.latest_incoming_id == confirmed_operation.target_id
+            or (
+                confirmed_operation.conversation_action_nonce is not None
+                and confirmed_operation.human_observed_at is not None
+            )
+        )
+        if consumed:
+            _invalidate(state, "outgoing_observed")
+            state.generation += 1
+            state.burst_started_at = None
+            state.due_at = None
     elif not valid_identity or outgoing:
         _invalidate(state, "identity_uncertain" if not valid_identity else "outgoing_observed")
         state.generation += 1
@@ -384,7 +389,19 @@ def _target(account, conversation, target_id):
     return target
 
 
-def _validate(account, conversation, state, *, expected_revision, expected_generation, target_id, due, now):
+def _validate(
+    account,
+    conversation,
+    state,
+    *,
+    expected_revision,
+    expected_generation,
+    target_id,
+    due,
+    now,
+    composer_reply=None,
+    human_observed_at=None,
+):
     if state.identity_quarantined:
         raise ReplyCoordinationError("identity_reconciliation_required")
     if state.history_gap or state.conversation_revision != conversation.revision:
@@ -395,13 +412,15 @@ def _validate(account, conversation, state, *, expected_revision, expected_gener
         raise ReplyCoordinationError("unverified_conversation")
     if conversation.revision != expected_revision or state.generation != expected_generation:
         raise ReplyCoordinationError("stale_revision")
-    if state.latest_incoming_id is None or str(state.latest_incoming_id) != str(target_id):
+    if str(state.latest_incoming_id) != str(target_id) and not (
+        composer_reply is not None and human_observed_at is not None
+    ):
         raise ReplyCoordinationError("stale_target")
     if state.owner_paused:
         raise ReplyCoordinationError("owner_paused")
-    if state.due_at is None:
+    if state.due_at is None and composer_reply is None:
         raise ReplyCoordinationError("no_pending_work")
-    if due and now < state.due_at:
+    if composer_reply is None and due and now < state.due_at:
         raise ReplyCoordinationError("not_due")
     target = _target(account, conversation, target_id)
     if target.occurred_at is None:
@@ -418,24 +437,99 @@ def _validate(account, conversation, state, *, expected_revision, expected_gener
         .exists()
     ):
         raise ReplyCoordinationError("newer_or_uncertain_incoming")
-    if observations.filter(direction="outbound").filter(ordering_conflict).exists():
+    outgoing = observations.filter(direction="outbound").filter(ordering_conflict)
+    if composer_reply is not None:
+        from .conversation_composer import validate_conversation_reply
+        from .models import DMConversationOwnership
+
+        validate_conversation_reply(composer_reply.inbox_message, composer_reply)
+        owner = DMConversationOwnership.objects.filter(conversation=conversation).first()
+        if owner is None:
+            raise ReplyCoordinationError("ownership_required")
+        # Explicit new conversation actions may follow a proven own completed
+        # action. Native/external responders and uncertain chronology still hold.
+        outgoing = outgoing.exclude(
+            occurred_at__isnull=False,
+            sender_id=account.account_platform_id,
+            recipient_id=conversation.peer_id,
+            delivery_status__in=["observed", "provider_accepted"],
+            legacy_reply__status="sent",
+            legacy_reply__sent_at__isnull=False,
+            legacy_reply__send_generation__gt=0,
+            legacy_reply__inbox_message__social_account_id=account.pk,
+            legacy_reply__inbox_message__workspace_id=account.workspace_id,
+            legacy_reply__account_platform_id=account.account_platform_id,
+            legacy_reply__recipient_id=conversation.peer_id,
+            legacy_reply__platform_conversation_id=conversation.platform_conversation_id,
+            legacy_reply__connection_generation=composer_reply.connection_generation,
+            legacy_reply__conversation=conversation,
+            legacy_reply__action_nonce__isnull=False,
+            legacy_reply__platform_reply_id=F("platform_message_id"),
+            legacy_reply__send_operation__status="confirmed",
+            legacy_reply__send_operation__conversation=conversation,
+            legacy_reply__send_operation__social_account_id=account.pk,
+            legacy_reply__send_operation__workspace_id=account.workspace_id,
+            legacy_reply__send_operation__platform=account.platform,
+            legacy_reply__send_operation__ownership=owner,
+            legacy_reply__send_operation__conversation_action_nonce=F("legacy_reply__action_nonce"),
+            legacy_reply__send_operation__attempt__outcome="sent",
+            legacy_reply__send_operation__attempt__completed_at__isnull=False,
+            legacy_reply__send_operation__attempt__control=owner.control,
+            legacy_reply__send_operation__attempt__reply=F("legacy_reply"),
+            legacy_reply__send_operation__attempt__operation=F("legacy_reply__send_operation"),
+        )
+    if outgoing.exists():
         raise ReplyCoordinationError("newer_or_uncertain_outgoing")
     return target
 
 
-def _payload(body, target_id, revision, generation):
+def _payload(body, target_id, revision, generation, composer_reply=None, human_observed_at=None):
+    value = {"body": body, "target": str(target_id), "revision": revision, "generation": generation}
+    if composer_reply is not None:
+        from .reply_quotes import pinned_quote
+
+        value["conversation_action"] = [
+            str(composer_reply.pk),
+            str(composer_reply.action_nonce),
+            composer_reply.account_platform_id,
+            composer_reply.recipient_id,
+            composer_reply.platform_conversation_id,
+            str(composer_reply.connection_generation),
+            composer_reply.conversation_incoming_generation,
+            human_observed_at.isoformat() if human_observed_at else None,
+            *[str(item) for item in pinned_quote(composer_reply)],
+        ]
     return hashlib.sha256(
         json.dumps(
-            {"body": body, "target": str(target_id), "revision": revision, "generation": generation},
+            value,
             sort_keys=True,
             separators=(",", ":"),
         ).encode()
     ).hexdigest()
 
 
+def _composer_intent(operation):
+    if operation.conversation_action_nonce is None:
+        return None
+    reply = operation.reply
+    if (
+        reply is None
+        or reply.conversation_id != operation.conversation_id
+        or reply.action_nonce != operation.conversation_action_nonce
+        or reply.body != operation.body
+    ):
+        raise ReplyCoordinationError("invalid_conversation_action")
+    return reply
+
+
 def _validate_payload(operation):
     if operation.payload_fingerprint != _payload(
-        operation.body, operation.target_id, operation.expected_revision, operation.expected_generation
+        operation.body,
+        operation.target_id,
+        operation.expected_revision,
+        operation.expected_generation,
+        composer_reply=_composer_intent(operation),
+        human_observed_at=operation.human_observed_at,
     ):
         raise ReplyCoordinationError("invalid_payload_fingerprint")
 
@@ -453,6 +547,8 @@ def prepare_reply(
     body,
     idempotency_key,
     now=None,
+    composer_reply=None,
+    human_observed_at=None,
 ):
     """Persist a local intent; exact-key replays return its original outcome."""
     account = _account(scope, social_account_id, platform)
@@ -474,7 +570,25 @@ def prepare_reply(
     from .reply_dispatch import check_coordinator_owner
 
     owner = check_coordinator_owner(scope, account, conversation)
-    fingerprint = _payload(body, target_message_id, expected_revision, expected_generation)
+    if composer_reply is not None:
+        from .conversation_composer import validate_conversation_reply
+        from .models import InboxReply
+
+        composer_reply = InboxReply.objects.select_for_update().get(pk=composer_reply.pk)
+        validate_conversation_reply(composer_reply.inbox_message, composer_reply)
+        if (
+            owner is None
+            or composer_reply.conversation_id != conversation.pk
+            or composer_reply.body != body
+            or idempotency_key != f"composer:{composer_reply.action_nonce}"
+            or composer_reply.send_generation
+        ):
+            raise ReplyCoordinationError("invalid_conversation_action")
+    if human_observed_at is not None and (composer_reply is None or not scope.actor_id.startswith("user:")):
+        raise ReplyCoordinationError("invalid_human_observation")
+    fingerprint = _payload(
+        body, target_message_id, expected_revision, expected_generation, composer_reply, human_observed_at
+    )
     existing = SendOperation.objects.filter(
         **_scope(account), conversation=conversation, actor_scope=scope.actor_id, idempotency_key=idempotency_key
     ).first()
@@ -498,8 +612,10 @@ def prepare_reply(
         target_id=target_message_id,
         due=False,
         now=_now(now),
+        composer_reply=composer_reply,
+        human_observed_at=human_observed_at,
     )
-    if (
+    if composer_reply is None and (
         SendOperation.objects.filter(conversation=conversation, status="confirmed")
         .filter(Q(target_id=target.pk) | Q(target_platform_message_id=target.platform_message_id))
         .exists()
@@ -508,7 +624,7 @@ def prepare_reply(
     if target.legacy_message_id:
         from .reply_safety import check_dm_receipts
 
-        check_dm_receipts(target.legacy_message, include_drafts=True)
+        check_dm_receipts(target.legacy_message, composer_reply, include_drafts=True)
     operation = SendOperation.objects.create(
         ownership=owner,
         owner_epoch=owner.epoch if owner else 0,
@@ -517,6 +633,9 @@ def prepare_reply(
         conversation=conversation,
         actor_scope=scope.actor_id,
         idempotency_key=idempotency_key,
+        conversation_action_nonce=composer_reply.action_nonce if composer_reply else None,
+        human_observed_at=human_observed_at,
+        reply=composer_reply,
         payload_fingerprint=fingerprint,
         body=body,
         target=target,
@@ -579,6 +698,8 @@ def claim_reply(scope, *, operation_id, now=None):
         target_id=operation.target_id,
         due=True,
         now=now,
+        composer_reply=_composer_intent(operation),
+        human_observed_at=operation.human_observed_at,
     )
     state.fencing_counter += 1
     operation.status = "claimed"

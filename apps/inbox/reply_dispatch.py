@@ -10,6 +10,7 @@ No enrollment, resume, transfer, reconciliation or retry runs automatically.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import timedelta
 from uuid import UUID
 
 from django.conf import settings
@@ -44,6 +45,7 @@ class DispatchBinding:
     fencing_token: int
     owner_epoch: int
     authorization: object
+    automated: bool = True
 
 
 def dispatch_enabled():
@@ -385,6 +387,36 @@ def _recipient(message):
     return resolve_recipient_id(extra)
 
 
+def human_observed_action_allowed(binding, reply, *, cutoff, now):
+    """Server session-only, new action after resume; never revive old queued work.
+
+    Called only alongside the full owner/claim/current-state validation. The
+    signed newest-page proof was checked before this immutable operation formed.
+    """
+    if binding is None or binding.automated or cutoff is None:
+        return False
+    user_id = getattr(binding.authorization, "human_session_user_id", None)
+    if user_id is None or binding.scope.actor_id != f"user:{user_id}":
+        return False
+    operation = SendOperation.objects.filter(pk=binding.operation_id, reply=reply).select_related("ownership").first()
+    if (
+        operation is None
+        or operation.conversation_action_nonce != reply.action_nonce
+        or not reply.action_nonce
+        or operation.owner_epoch != binding.owner_epoch
+        or operation.ownership is None
+        or operation.ownership.epoch != operation.owner_epoch
+        or operation.actor_scope != binding.scope.actor_id
+        or operation.human_observed_at is None
+    ):
+        return False
+    coordinator._validate_payload(operation)
+    return bool(
+        cutoff < reply.created_at <= operation.human_observed_at <= operation.created_at <= now
+        and timedelta(0) <= now - reply.inbox_message.received_at < timedelta(days=7)
+    )
+
+
 def check_conversation_send(account, message, reply, binding=None):
     """Persistent fail-closed ownership check shared by every existing send path.
 
@@ -451,6 +483,8 @@ def check_conversation_send(account, message, reply, binding=None):
         target_id=operation.target_id,
         due=True,
         now=now,
+        composer_reply=coordinator._composer_intent(operation),
+        human_observed_at=operation.human_observed_at,
     )
     if (
         operation.reply_id != reply.pk
@@ -464,12 +498,13 @@ def check_conversation_send(account, message, reply, binding=None):
         or target.occurred_at > now
     ):
         raise coordinator.ReplyCoordinationError("target_changed")
-    if owner.resume_cutoff is None or any(
-        value <= owner.resume_cutoff or value > now
-        for value in (target.occurred_at, target.first_seen_at, operation.created_at, reply.created_at)
+    timestamps = (target.occurred_at, target.first_seen_at, operation.created_at, reply.created_at)
+    if any(value is None or value > now for value in timestamps) or (
+        (owner.resume_cutoff is None or any(value <= owner.resume_cutoff for value in timestamps))
+        and not human_observed_action_allowed(binding, reply, cutoff=owner.resume_cutoff, now=now)
     ):
         raise coordinator.ReplyCoordinationError("old_target")
-    if (
+    if operation.conversation_action_nonce is None and (
         SendOperation.objects.filter(
             conversation=conversation, target_platform_message_id=target.platform_message_id, status="confirmed"
         )
@@ -535,6 +570,7 @@ def dispatch_reply(
     authorization,
     actor=None,
     acknowledge_observed_state=False,
+    automated=True,
 ):
     """Dispatch one current actor's claimed intent with explicit known limits.
 
@@ -544,9 +580,16 @@ def dispatch_reply(
     """
     _outermost_required()
     _enabled()
+    if not automated and (
+        getattr(authorization, "human_session_user_id", None) is None
+        or getattr(authorization, "human_session_user_id", None) != getattr(actor, "pk", None)
+    ):
+        raise coordinator.ReplyCoordinationError("human_sender_required")
     if acknowledge_observed_state is not True:
         raise coordinator.ReplyCoordinationError("observed_state_acknowledgement_required")
-    binding = DispatchBinding(scope, operation_id, claim_token, fencing_token, expected_owner_epoch, authorization)
+    binding = DispatchBinding(
+        scope, operation_id, claim_token, fencing_token, expected_owner_epoch, authorization, automated
+    )
     with transaction.atomic(durable=True):
         account, conversation, state, operation = coordinator._load_operation(scope, operation_id)
         check_coordinator_owner(scope, account, conversation, operation=operation, required=True)
@@ -572,5 +615,5 @@ def dispatch_reply(
         check_conversation_send(account, message, reply, binding)
     from .services import send_reply_now
 
-    send_reply_now(reply, actor=actor, automated=True, authorization=authorization, dispatch_binding=binding)
+    send_reply_now(reply, actor=actor, automated=automated, authorization=authorization, dispatch_binding=binding)
     return SendOperation.objects.get(pk=operation.pk)

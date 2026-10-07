@@ -10,9 +10,9 @@
                 <span class="badge-pill" style="background: var(--primary-soft); color: var(--brand-700);">BrightBean · Sent{% if reply.is_follow_up or reply.follow_up_of_id %} · Additional reply{% endif %}</span>
                 {% if reply.sent_at %}<time class="text-[11px] text-stone-400 ml-auto" datetime="{{ reply.sent_at|date:'c' }}" title="{{ reply.sent_at|date:'N j, Y g:i A' }}">{{ reply.sent_at|timesince }} ago</time>{% else %}<span class="text-[11px] text-stone-400 ml-auto">Delivery time unavailable</span>{% endif %}
             </div>
-            <p data-stored-event-body class="text-[13px] text-stone-700 leading-relaxed whitespace-pre-wrap">{{ reply.body }}</p>
+            <p data-stored-event-body class="text-[13px] text-stone-700 leading-relaxed whitespace-pre-wrap">{% if reply.content_expired %}Message content expired{% elif not reply.content_available %}Message unavailable{% else %}{{ reply.display_body }}{% endif %}</p>
             <div data-stored-event-attachments></div>
-            {% if conversation_view %}<p class="text-[10px] text-stone-400 mt-1">In reply to the message from {{ reply.inbox_message.received_at|date:"N j, Y g:i A" }}</p>{% endif %}
+            {% if conversation_view %}<p class="text-[10px] text-stone-400 mt-1">In reply to the message from <time datetime="{{ reply.inbox_message.received_at|date:'c' }}">{{ reply.inbox_message.received_at|date:"N j, Y g:i A" }}</time></p>{% endif %}
             {% if reply.status == 'sent' and reply.inbox_message.message_type == 'dm' %}
             <a href="{% url 'inbox:message_detail' workspace_id=workspace.id message_id=reply.inbox_message_id %}?follow_up_reply_id={{ reply.id }}"
                hx-get="{% url 'inbox:message_detail' workspace_id=workspace.id message_id=reply.inbox_message_id %}?follow_up_reply_id={{ reply.id }}"

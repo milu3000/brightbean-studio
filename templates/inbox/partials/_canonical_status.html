@@ -1,0 +1,2 @@
+{% if conversation.workflow_tracking_available and conversation.conversation_type == 'direct' %}{% if conversation.workflow_state == 'needs_action' %}<span class="text-[11px] text-orange-700">待處理</span>{% elif conversation.workflow_state == 'waiting' %}<span class="text-[11px] text-stone-500">等對方</span>{% elif conversation.workflow_state == 'done' %}<span class="text-[11px] text-green-700">已完成</span>{% endif %}
+{% endif %}

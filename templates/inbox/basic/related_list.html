@@ -1,0 +1,3 @@
+{% for item in page.records %}<article><p>{{ item.author }} · {{ item.status }} · {{ item.created_at }}</p>
+{% if item.is_expired %}<p>Content expired</p>{% elif item.is_deleted %}<p>Message withdrawn</p>{% elif not item.available %}<p>Content unavailable</p>{% else %}<p>{{ item.body|linebreaksbr }}</p>{% if item.body_url %}<a href="{{ item.body_url }}">Read full text</a>{% endif %}{% endif %}</article>{% empty %}<p>No saved items on this page</p>{% endfor %}
+{% if page.older_url %}<a href="{{ page.older_url }}">Older saved items</a>{% endif %}

@@ -1,50 +1,28 @@
+{% load inbox_media %}
 {% with attachments=message.attachments %}
-{% if message.content_status == "partial" %}
-<p class="text-[12px] text-stone-500 mb-2">Some content is unsupported by the platform; the items below may be incomplete.</p>
-{% elif message.content_status == "unsupported" %}
-<p class="text-[12px] text-stone-500 mb-2">The platform marked this content unsupported and supplied no usable media.</p>
-{% elif message.content_status == "fields_unavailable" %}
-<p class="text-[12px] text-stone-500 mb-2">Some content fields are unavailable from the platform. This view may be incomplete.</p>
-{% elif message.content_status == "removed" %}
-<p class="text-[12px] text-stone-500 mb-2">This content was removed or withdrawn.</p>
-{% endif %}
+{% if message.content_status == "partial" or message.content_status == "fields_unavailable" %}<p class="text-[12px] text-stone-500 mb-2">Some content unavailable.</p>
+{% elif message.content_status == "unsupported" %}<p class="text-[12px] text-stone-500 mb-2">Content unavailable.</p>
+{% elif message.content_status == "removed" %}<p class="text-[12px] text-stone-500 mb-2">Message withdrawn.</p>{% endif %}
 {% if attachments %}
 <div class="inbox-attachments space-y-2 {% if message.body %}mt-3{% endif %}">
-    {% for attachment in attachments %}
+    {% for attachment in attachments %}{% attachment_card attachment as card %}
     <div class="inbox-attachment rounded-lg border border-stone-200 bg-white p-3">
-        <p class="text-[11px] font-semibold text-stone-500">
-            {% if attachment.availability_reason == "fields_unavailable" %}Message content{% elif attachment.type == "image" %}Photo{% elif attachment.type == "video" %}Video{% elif attachment.type == "audio" %}Audio{% elif attachment.type == "file" %}File{% elif attachment.type == "share" %}Shared content{% else %}Attachment{% endif %}
-        </p>
-        {% if attachment.title %}
-        <p class="text-[13px] text-stone-800 leading-relaxed break-words mt-1">{{ attachment.title }}</p>
+        <p class="text-[11px] font-semibold text-stone-500">{% if card.type == "image" %}Photo{% elif card.type == "share" %}Shared content{% elif card.type == "video" %}Video{% elif card.type == "audio" %}Audio{% elif card.type == "file" %}File{% else %}Attachment{% endif %}</p>
+        {% if card.title %}<p class="text-[13px] text-stone-800 break-words mt-1">{{ card.title }}</p>{% endif %}
+        {% if card.preview_url %}
+        <a href="{{ card.preview_target }}" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer" aria-label="{% if card.post_url %}Open original post{% else %}View image{% endif %}">
+            <img src="{{ card.preview_url }}" alt="Attachment preview" loading="lazy" referrerpolicy="no-referrer" data-inbox-preview class="max-w-full max-h-64 rounded-md object-contain mt-2">
+        </a>
+        <p data-inbox-preview-fallback hidden class="text-[12px] text-stone-500 mt-2">Preview unavailable.</p>
         {% endif %}
-        {% if attachment.preview_url %}
-        <img src="{{ attachment.preview_url }}" alt="Attachment preview" loading="lazy" referrerpolicy="no-referrer" data-inbox-preview
-             class="max-w-full max-h-64 rounded-md object-contain mt-2">
-        <p data-inbox-preview-fallback hidden class="text-[12px] text-stone-500 mt-2">Preview unavailable. The platform link may have expired or require sign-in.</p>
-        {% endif %}
-        {% if attachment.url and attachment.availability == "available" %}
-        <a href="{{ attachment.url }}" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer"
-           class="inline-flex text-[12px] font-medium text-orange-600 hover:text-orange-700 underline mt-2">Open {% if attachment.type == "share" %}shared content{% else %}attachment{% endif %}</a>
-        {% else %}
-        {% if attachment.availability_reason == "unsupported" %}
-        <p class="text-[12px] text-stone-500 mt-2">The platform marked this content unsupported and supplied no usable media.</p>
-        {% elif attachment.availability_reason == "fields_unavailable" %}
-        <p class="text-[12px] text-stone-500 mt-2">Some content fields are unavailable from the platform. This view may be incomplete.</p>
-        {% elif attachment.availability_reason == "removed" %}
-        <p class="text-[12px] text-stone-500 mt-2">This content was removed or withdrawn.</p>
-        {% elif attachment.availability_reason == "unsafe_url" %}
-        <p class="text-[12px] text-stone-500 mt-2">The provided attachment link could not be safely displayed.</p>
-        {% else %}
-        <p class="text-[12px] text-stone-500 mt-2">Original content unavailable. No usable link is available for this message.</p>
-        {% endif %}
-        {% endif %}
+        {% if card.url %}<a href="{{ card.url }}" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer" class="inline-flex text-[12px] text-orange-600 underline mt-2">{{ card.link_label }}</a>{% endif %}
+        {% if card.image_url and card.image_url != card.url %}<a href="{{ card.image_url }}" target="_blank" rel="noopener noreferrer" referrerpolicy="no-referrer" class="inline-flex text-[12px] text-orange-600 underline ml-3">View image</a>{% endif %}
+        {% if card.post_link_missing %}<p class="text-[12px] text-stone-500 mt-2">Post link unavailable.</p>{% endif %}
+        {% if not card.url and not card.preview_url %}<p class="text-[12px] text-stone-500 mt-2">Content unavailable.</p>{% endif %}
     </div>
     {% endfor %}
 </div>
-{% elif not message.body %}
-{% if message.content_status != "unsupported" and message.content_status != "fields_unavailable" and message.content_status != "removed" %}
-<p class="text-[13px] text-stone-500">{{ message.content_preview }}. No displayable text or attachment metadata was provided for this message; its original content has not been verified.</p>
-{% endif %}
+{% elif not message.body and message.content_status != "unsupported" and message.content_status != "fields_unavailable" and message.content_status != "removed" %}
+<p class="text-[13px] text-stone-500">Content unavailable.</p>
 {% endif %}
 {% endwith %}

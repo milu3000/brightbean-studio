@@ -1,8 +1,8 @@
 {% load humanize %}
 <!-- Filter bar -->
 <form id="inbox-filters" @submit.prevent class="px-4 py-2.5 border-b border-stone-100 flex items-center gap-2 flex-wrap flex-shrink-0" style="background: var(--surface-1);">
+    {% if inbox_domain %}<input type="hidden" name="domain" value="{{ inbox_domain }}">{% endif %}
     <input type="hidden" name="view" value="{{ current_view|default:'all' }}">
-    {% for account_id in active_filters.account %}<input type="hidden" name="account" value="{{ account_id }}">{% endfor %}
     {% if active_filters.assigned %}<input type="hidden" name="assigned" value="{{ active_filters.assigned }}">{% endif %}
     {% if active_filters.date_from %}<input type="hidden" name="date_from" value="{{ active_filters.date_from }}">{% endif %}
     {% if active_filters.date_to %}<input type="hidden" name="date_to" value="{{ active_filters.date_to }}">{% endif %}
@@ -10,29 +10,39 @@
     <div class="relative flex-1 min-w-[160px]">
         <svg class="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-stone-400 pointer-events-none" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
         <input type="text"
-               name="q" aria-label="Search messages"
+               name="q" data-inbox-search aria-label="Search messages"
                value="{{ active_filters.q|default:'' }}"
                placeholder="Search messages..."
-               class="w-full pl-8 pr-3 py-1.5 text-[12px] bg-white border border-stone-200 rounded-md focus:outline-none focus:border-orange-400 focus:ring-2 focus:ring-orange-100 transition-all"
+               class="w-full pl-8 pr-9 py-1.5 text-[12px] bg-white border border-stone-200 rounded-md focus:outline-none focus:border-orange-400 focus:ring-2 focus:ring-orange-100 transition-all"
                hx-get="{% url 'inbox:feed' workspace_id=workspace.id %}"
                hx-target="#inbox-message-list"
                hx-swap="innerHTML"
-               hx-trigger="keyup changed delay:400ms"
+               hx-trigger="input changed delay:400ms, inbox:clear-search"
                hx-include="#inbox-filters" hx-push-url="true" hx-sync="#inbox-message-list:queue last">
+        <button type="button" data-inbox-clear-search aria-label="Clear search" title="Clear search" {% if not active_filters.q %}hidden{% endif %} class="absolute right-1 top-1/2 -translate-y-1/2 w-7 h-7 text-stone-500 rounded focus:ring-2 focus:ring-orange-400"><span aria-hidden="true">×</span></button>
     </div>
 
     <!-- Platform filter -->
-    <select name="platform" aria-label="Filter by platform" class="filter-select"
+    <select name="platform" data-inbox-platform aria-label="Filter by platform" {% if active_filters.platform|length > 1 %}multiple{% endif %} class="filter-select"
             hx-get="{% url 'inbox:feed' workspace_id=workspace.id %}"
             hx-target="#inbox-message-list"
             hx-swap="innerHTML"
             hx-include="#inbox-filters" hx-push-url="true" hx-sync="#inbox-message-list:queue last">
         <option value="">All platforms</option>
-        {% for account in social_accounts %}
-        <option value="{{ account.platform }}" {% if account.platform in active_filters.platform %}selected{% endif %}>{{ account.get_platform_display|default:account.platform|title }}</option>
+        {% for code, label in platform_choices %}
+        <option value="{{ code }}" {% if code in active_filters.platform %}selected{% endif %}>{{ label }}</option>
         {% endfor %}
     </select>
 
+    <select name="account" data-inbox-account aria-label="Filter by account" class="filter-select" {% if active_filters.account|length > 1 %}multiple{% endif %}
+            hx-get="{% url 'inbox:feed' workspace_id=workspace.id %}" hx-target="#inbox-message-list"
+            hx-include="#inbox-filters" hx-push-url="true" hx-sync="#inbox-message-list:queue last">
+        <option value="">All accounts</option>
+        {% for account in social_accounts %}<option value="{{ account.id }}" data-platform="{{ account.platform }}" {% if account.id|stringformat:'s' in active_filters.account %}selected{% endif %}>{{ account.account_name }}{% if account.account_handle %} · @{{ account.account_handle }}{% endif %}</option>{% endfor %}
+        {% for identifier in unavailable_account_filters %}<option value="{{ identifier }}" selected>Unavailable account</option>{% endfor %}
+    </select>
+
+    {% if not inbox_domain %}
     <!-- Type filter -->
     <select name="type" aria-label="Filter by type" class="filter-select"
             hx-get="{% url 'inbox:feed' workspace_id=workspace.id %}"
@@ -46,6 +56,7 @@
         <option value="review" {% if 'review' in active_filters.type %}selected{% endif %}>Reviews</option>
     </select>
 
+    {% endif %}
     <!-- Status filter -->
     <select name="status" aria-label="Filter by status" class="filter-select"
             hx-get="{% url 'inbox:feed' workspace_id=workspace.id %}"
@@ -59,15 +70,4 @@
         <option value="archived" {% if 'archived' in active_filters.status %}selected{% endif %}>Archived</option>
     </select>
 
-    <!-- Sentiment filter -->
-    <select name="sentiment" aria-label="Filter by sentiment" class="filter-select"
-            hx-get="{% url 'inbox:feed' workspace_id=workspace.id %}"
-            hx-target="#inbox-message-list"
-            hx-swap="innerHTML"
-            hx-include="#inbox-filters" hx-push-url="true" hx-sync="#inbox-message-list:queue last">
-        <option value="">All sentiment</option>
-        <option value="positive" {% if 'positive' in active_filters.sentiment %}selected{% endif %}>Positive</option>
-        <option value="neutral" {% if 'neutral' in active_filters.sentiment %}selected{% endif %}>Neutral</option>
-        <option value="negative" {% if 'negative' in active_filters.sentiment %}selected{% endif %}>Negative</option>
-    </select>
 </form>

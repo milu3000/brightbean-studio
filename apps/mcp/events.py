@@ -392,7 +392,13 @@ def subscription_authorized(sub):
         )
         .first()
     )
-    if not membership or not membership.effective_permissions.get("use_inbox", False):
+    if (
+        not membership
+        or not membership.effective_permissions.get("use_inbox", False)
+        or (
+            membership.custom_role_id and membership.custom_role.organization_id != membership.workspace.organization_id
+        )
+    ):
         return False
     if not SocialAccount.objects.filter(
         pk=sub.social_account_id, workspace_id=sub.workspace_id, connection_status="connected"
@@ -403,6 +409,7 @@ def subscription_authorized(sub):
         return bool(
             key
             and key.is_active
+            and isinstance(key.permissions, list)
             and "use_inbox" in (key.permissions or [])
             and key.social_accounts.filter(pk=sub.social_account_id).exists()
         )
@@ -424,56 +431,165 @@ def _iso(value):
     return value.isoformat().replace("+00:00", "Z")
 
 
-def enqueue_inbox_event(message):
-    """Create outbox rows in the inbox write's transaction; never send on commit.
+def _event_id(message, subscription):
+    # Stable across poll/webhook duplicates and canonical/legacy projections.
+    # A resumed subscription starts a new lifetime; retries within it do not.
+    identity = canonical_json(
+        [EVENT_NAME, str(message.social_account_id), message.platform_message_id, str(subscription.generation)]
+    )
+    return "evt_" + hashlib.sha256(identity).hexdigest()
 
-    Ingestion calls only for newly inserted inbound messages, before leaving its
-    atomic block. This function adds deduplication and a conservative echo guard.
-    """
-    if not events_enabled() or message.message_type != InboxMessage.MessageType.DM:
-        return
-    extra = message.extra if isinstance(message.extra, dict) else {}
-    if extra.get("is_echo") or extra.get("is_self") or extra.get("direction") == "outbound":
-        return
+
+def _enqueue_reference(message, *, occurred_at, canonical=None, canonical_generation=None, event_revision=None):
+    from django.db.models import Q
+
     now = timezone.now()
-    if timezone.is_naive(message.received_at) or message.received_at > now + timedelta(minutes=5):
-        # Never guess the original event timezone; ingestion must normalize it.
-        return
-    payload = canonical_json(
-        {
-            "eventId": "evt_" + message.pk.hex,
-            "name": EVENT_NAME,
-            "timestamp": _iso(message.received_at),
-            "data": {
-                "message_id": str(message.pk),
-                "workspace_id": str(message.workspace_id),
-                "social_account_id": str(message.social_account_id),
-            },
-            "cursor": None,
-        }
-    ).decode()
     ids = []
-    with transaction.atomic():
-        subscriptions = EventSubscription.objects.filter(
+    subscriptions = (
+        EventSubscription.objects.select_for_update()
+        .filter(
             active=True,
             expires_at__gt=now,
             workspace_id=message.workspace_id,
             social_account_id=message.social_account_id,
             name=EVENT_NAME,
-            started_at__lte=message.received_at,
+            started_at__lte=occurred_at,
         )
-        for subscription in subscriptions.iterator():
-            if not subscription_authorized(subscription):
-                continue
-            delivery, created = EventOutbox.objects.get_or_create(
-                subscription=subscription,
-                event_id="evt_" + message.pk.hex,
-                defaults={"message": message, "generation": subscription.generation, "payload": payload},
-            )
-            if created:
-                ids.append(str(delivery.pk))
-        if ids:
-            transaction.on_commit(lambda: _queue_outbox(ids), robust=True)
+        .order_by("pk")
+    )
+    for subscription in subscriptions:
+        if not subscription_authorized(subscription):
+            continue
+        legacy_id = canonical.legacy_message_id if canonical is not None else message.pk
+        # Do not replay a queued/delivered legacy event created by older code
+        # whose event ID predates the account/provider/generation digest.
+        previous = Q(
+            message__social_account_id=message.social_account_id,
+            message__workspace_id=message.workspace_id,
+            message__platform_message_id=message.platform_message_id,
+        )
+        if legacy_id:
+            previous |= Q(message_id=legacy_id)
+        if canonical is not None:
+            previous |= Q(canonical_message_id=canonical.pk)
+        if EventOutbox.objects.filter(previous, subscription=subscription, generation=subscription.generation).exists():
+            continue
+        event_id = _event_id(message, subscription)
+        payload = canonical_json(
+            {
+                "eventId": event_id,
+                "name": EVENT_NAME,
+                "timestamp": _iso(occurred_at),
+                "data": {
+                    "message_id": str(legacy_id or canonical.pk),
+                    "workspace_id": str(message.workspace_id),
+                    "social_account_id": str(message.social_account_id),
+                    **({"conversation_id": str(canonical.conversation_id)} if canonical is not None else {}),
+                },
+                "cursor": None,
+            }
+        ).decode()
+        delivery, created = EventOutbox.objects.get_or_create(
+            subscription=subscription,
+            event_id=event_id,
+            defaults={
+                "message_id": legacy_id,
+                "canonical_message": canonical,
+                "canonical_generation": canonical_generation,
+                "canonical_event_revision": event_revision,
+                "generation": subscription.generation,
+                "payload": payload,
+            },
+        )
+        if created:
+            ids.append(str(delivery.pk))
+    if ids:
+        transaction.on_commit(lambda: _queue_outbox(ids), robust=True)
+
+
+@transaction.atomic
+def enqueue_canonical_event(message, *, source, event_revision):
+    """Only the workflow's actionable signal produces canonical automation."""
+    if (
+        not events_enabled()
+        or source not in {"poll", "webhook"}
+        or isinstance(event_revision, bool)
+        or not isinstance(event_revision, int)
+        or event_revision < 1
+    ):
+        return
+    from apps.inbox.locking import lock_dm_account
+    from apps.mcp.events_canonical import canonical_source
+
+    if lock_dm_account(message.social_account_id, message.workspace_id) is None:
+        return
+    row, generation, error = canonical_source(message.pk, expected_revision=event_revision)
+    if error or (row.workspace_id, row.social_account_id, row.platform_message_id) != (
+        message.workspace_id,
+        message.social_account_id,
+        message.platform_message_id,
+    ):
+        return
+    _enqueue_reference(
+        row,
+        occurred_at=row.occurred_at,
+        canonical=row,
+        canonical_generation=generation,
+        event_revision=event_revision,
+    )
+
+
+@transaction.atomic
+def enqueue_inbox_event(message):
+    """Keep legacy ingestion atomic; a mapped row obeys fresh canonical policy."""
+    if not events_enabled():
+        return
+    from apps.inbox.locking import lock_dm_account
+    from apps.inbox.sync_identity import canonical_owns_account
+    from apps.mcp.events_canonical import canonical_for_legacy, canonical_source
+    from providers.meta_inbox_content import is_deleted_content
+
+    account = lock_dm_account(message.social_account_id, message.workspace_id)
+    message = (
+        InboxMessage.objects.defer("body")
+        .filter(pk=message.pk, social_account_id=message.social_account_id, workspace_id=message.workspace_id)
+        .first()
+    )
+    if (
+        account is None
+        or message is None
+        or message.message_type != InboxMessage.MessageType.DM
+        or not message.platform_message_id
+    ):
+        return
+    extra = message.extra if isinstance(message.extra, dict) else {}
+    if (
+        extra.get("is_echo")
+        or extra.get("is_self")
+        or extra.get("direction") == "outbound"
+        or is_deleted_content(extra)
+        or extra.get("canonical_content_restriction") in {"withdrawn", "expired"}
+    ):
+        return
+    now = timezone.now()
+    if timezone.is_naive(message.received_at) or message.received_at > now + timedelta(minutes=5):
+        return
+    # Once this account belongs to canonical sync, only the explicit actionable
+    # signal may fan out; legacy fallback must not turn backfill into automation.
+    if canonical_owns_account(account):
+        return
+    mapped = canonical_for_legacy(message)
+    canonical, generation = None, None
+    if mapped is not None:
+        canonical, generation, error = canonical_source(mapped.pk, require_live=False)
+        if error or (
+            canonical.workspace_id != message.workspace_id
+            or canonical.social_account_id != message.social_account_id
+            or canonical.platform_message_id != message.platform_message_id
+            or canonical.legacy_message_id != message.pk
+        ):
+            return
+    _enqueue_reference(message, occurred_at=message.received_at, canonical=canonical, canonical_generation=generation)
 
 
 def _queue_outbox(ids):

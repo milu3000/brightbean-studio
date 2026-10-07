@@ -11,6 +11,7 @@ urlpatterns = [
     path("unread-count/", views.unread_count, name="unread_count"),
     path("mark-all-read/", views.mark_all_read, name="mark_all_read"),
     path("<uuid:notification_id>/read/", views.mark_as_read, name="mark_as_read"),
+    path("<uuid:notification_id>/dismiss/", views.dismiss_notification, name="dismiss"),
     path("preferences/", views.preferences, name="preferences"),
     path("unsubscribe/<str:token>/", unsubscribe_views.unsubscribe, name="unsubscribe"),
 ]

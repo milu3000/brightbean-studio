@@ -67,16 +67,20 @@ Usage: {% include "social_accounts/partials/_account_card.html" with account=acc
                     {% if account.revokes_platform_grant_on_disconnect %}
                     This revokes BrightBean's access to the account.
                     {% elif account.keeps_platform_grant_on_disconnect %}
-                    This removes the account from BrightBean only. To revoke our access entirely,
+                    This removes BrightBean's saved credentials. To revoke our access entirely,
                     remove BrightBean in Facebook &rsaquo; Settings &rsaquo; Apps and Websites.
                     {% else %}
-                    This removes the account from BrightBean only. To revoke our access entirely,
+                    This removes BrightBean's saved credentials. To revoke our access entirely,
                     remove BrightBean in your {{ account.get_platform_display }} settings.
                     {% endif %}
                 </p>
                 <p class="text-xs text-stone-500 mb-3">
+                    {% if account.preserves_inbox_history_on_disconnect %}
+                    Sync and sending stop; saved posts, inbox history and delivery receipts remain.
+                    {% else %}
                     Its analytics, inbox messages and posts made only for it are deleted from BrightBean.
                     Posts shared with other channels stay.
+                    {% endif %}
                 </p>
                 <div class="flex gap-2 justify-end">
                     <button @click="confirmDisconnect = false" class="px-3 py-1.5 text-xs font-semibold text-stone-600 bg-stone-100 rounded-full hover:bg-stone-200 transition-colors cursor-pointer">Cancel</button>

@@ -760,6 +760,7 @@ class InboxReplyResponse(Schema):
     follow_up_reply_id: uuid.UUID | None = None
     is_follow_up: bool = False
     not_sent_verified: bool = False
+    quote_target_id: uuid.UUID | None = None
     platform_reply_id: str = ""
     send_error: str = ""
     created_at: dt.datetime
@@ -772,18 +773,22 @@ class InboxReplyResponse(Schema):
 
     @classmethod
     def from_reply(cls, reply) -> InboxReplyResponse:
+        from apps.inbox.receipt_compaction import reply_display_content
+
+        content = reply_display_content(reply)
         author = getattr(reply, "author", None)
         return cls(
             id=reply.id,
             inbox_message_id=reply.inbox_message_id,
             status=reply.status,
-            body=reply.body,
+            body=content["body"],
             follow_up_reply_id=getattr(reply, "follow_up_of_id", None),
             is_follow_up=getattr(reply, "is_follow_up", False),
             not_sent_verified=getattr(reply, "not_sent_verified", False),
+            quote_target_id=reply.quote_target_id,
             author_email=(getattr(author, "email", "") or ""),
             platform_reply_id=reply.platform_reply_id or "",
-            send_error=reply.send_error or "",
+            send_error=content["send_error"],
             created_at=reply.created_at,
             updated_at=reply.updated_at,
             sent_at=reply.sent_at,
@@ -836,14 +841,26 @@ class InboxMessageResponse(Schema):
     classification_reason: str = ""
     type_display: str = ""
     status: str
-    sentiment: str
+    sentiment: str = Field(
+        ...,
+        deprecated=True,
+        description="Retired feature: historical value only; no classification or editing is performed.",
+    )
     sender_name: str
     sender_handle: str = ""
     body: str
     content_type: Literal["text", "attachment", "mixed", "unknown"] = "unknown"
     content_preview: str = Field("", description="Message text or a truthful label for non-text content.")
     content_status: Literal[
-        "removed", "partial", "unsupported", "fields_unavailable", "link_provided", "unavailable", "text", "no_metadata"
+        "removed",
+        "partial",
+        "unsupported",
+        "fields_unavailable",
+        "link_provided",
+        "unavailable",
+        "text",
+        "no_metadata",
+        "expired",
     ] = "no_metadata"
     attachments: list[AttachmentResponse] = Field(default_factory=list)
     related_post_id: uuid.UUID | None = None
@@ -869,9 +886,12 @@ class InboxMessageResponse(Schema):
     def from_message(
         cls, message, *, include_replies: bool = False, include_eligibility: bool = False
     ) -> InboxMessageResponse:
+        from apps.inbox.canonical_send_target import canonical_projection_view
         from apps.inbox.services import reply_send_availability
         from providers.meta_inbox_content import message_content_status
 
+        original = message
+        message = canonical_projection_view(message)
         replies: list[InboxReplyResponse] = []
         if include_replies:
             if "replies" in getattr(message, "_prefetched_objects_cache", {}):
@@ -895,13 +915,15 @@ class InboxMessageResponse(Schema):
             body=message.body or "",
             content_type=message.content_type,
             content_preview=message.content_preview,
-            content_status=message_content_status(message.extra, message.body or ""),
+            content_status=getattr(
+                message, "canonical_content_status", message_content_status(message.extra, message.body or "")
+            ),
             attachments=message.attachments,
             related_post_id=message.related_post_id,
             received_at=message.received_at,
             created_at=message.created_at,
             replies=replies,
-            reply_eligibility=reply_send_availability(message) if include_eligibility else None,
+            reply_eligibility=reply_send_availability(original) if include_eligibility else None,
         )
 
 

@@ -126,6 +126,7 @@ def session_send_authorization(user) -> Authorization:
             raise DMSendGateError("authorization_revoked", "Current permission to send this DM is unavailable.")
 
     authorize.actor_scope = f"user:{user_id}"  # type: ignore[attr-defined]
+    authorize.human_session_user_id = user_id  # type: ignore[attr-defined]
     return authorize
 
 
@@ -299,6 +300,17 @@ def _fingerprint(reply, message):
         str(reply.follow_up_of_id) if reply.follow_up_of_id else None,
         parent.platform_reply_id if parent else None,
         parent.sent_at.isoformat() if parent and parent.sent_at else None,
+        str(reply.conversation_id) if reply.conversation_id else None,
+        str(reply.action_nonce) if reply.action_nonce else None,
+        reply.account_platform_id,
+        reply.recipient_id,
+        reply.platform_conversation_id,
+        str(reply.connection_generation) if reply.connection_generation else None,
+        reply.conversation_incoming_generation,
+        str(reply.quote_target_id) if reply.quote_target_id else None,
+        reply.quote_platform_message_id,
+        reply.quote_platform_conversation_id,
+        str(reply.quote_connection_generation) if reply.quote_connection_generation else None,
     ]
     return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
@@ -306,7 +318,6 @@ def _fingerprint(reply, message):
 def _check_send(control, account, reply, message, authorization, automated, dispatch_binding=None):
     from .reply_dispatch import check_conversation_send
     from .reply_safety import check_dm_receipts, validate_dm_target
-    from .services import validate_automated_reply_window
 
     _check_identity(control, account)
     check_conversation_send(account, message, reply, dispatch_binding)
@@ -320,8 +331,13 @@ def _check_send(control, account, reply, message, authorization, automated, disp
         raise DMSendGateError("target_changed", "The DM target identity changed; sending is held.")
     cutoff = control.resume_cutoff or control.coverage_from
     now = timezone.now()
-    if not all(
-        _valid_time(value, cutoff, now) for value in (message.received_at, message.created_at, reply.created_at)
+    from .reply_dispatch import human_observed_action_allowed
+
+    timestamps = (message.received_at, message.created_at, reply.created_at)
+    valid_times = all(isinstance(value, datetime) and timezone.is_aware(value) and value <= now for value in timestamps)
+    if not valid_times or (
+        not all(_valid_time(value, cutoff, now) for value in timestamps)
+        and not human_observed_action_allowed(dispatch_binding, reply, cutoff=cutoff, now=now)
     ):
         raise DMSendGateError(
             "old_target", "This DM target or draft predates resume, or has an invalid timestamp; sending is held."
@@ -333,8 +349,9 @@ def _check_send(control, account, reply, message, authorization, automated, disp
     validate_dm_target(message)
     check_dm_receipts(message, reply, include_drafts=True)
     _authorize(authorization, account)
-    if automated:
-        validate_automated_reply_window(message)
+    from .services import validate_meta_reply_window
+
+    validate_meta_reply_window(message, automated=automated)
 
 
 def _lock_target(reply, account):
@@ -461,7 +478,11 @@ def send_enrolled_dm(reply, *, actor, authorization, automated, snapshot, dispat
                             raise _PreDispatchRefusedError(exc) from None
 
                     mid = _dispatch_to_platform(
-                        message, reply.body, automated=automated, before_provider=before_provider
+                        message,
+                        reply.body,
+                        automated=automated,
+                        before_provider=before_provider,
+                        **({"reply": reply} if reply.quote_target_id else {}),
                     )
                     if not isinstance(mid, str) or not mid.strip() or len(mid) > 255:
                         raise DMSendUnknownError()

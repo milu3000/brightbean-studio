@@ -9,7 +9,9 @@ from django.utils import timezone
 
 from apps.mcp.event_delivery import CallbackError, post_signed
 from apps.mcp.events import _stop, events_enabled, subscription_authorized
+from apps.mcp.events_canonical import SOURCE_UNAVAILABLE, delivery_source_error
 from apps.mcp.models import EventOutbox, EventSubscription
+from apps.social_accounts.models import SocialAccount
 
 MAX_ATTEMPTS = 8
 SWEEP_INTERVAL_SECONDS = 60
@@ -22,22 +24,23 @@ def process_delivery(delivery_id):
     Hold a short DB row lock during the bounded network call. A worker crash
     rolls back its claim and the sweep retries the SAME id/body. A receiver must
     deduplicate webhook-id; no sender can guarantee exactly-once HTTP delivery.
-    Lock the subscription before its outbox to keep unsubscribe's order stable.
+    Lock account, subscription, then outbox: canonical writes use this order too.
+    This also serializes content restriction and native identity changes with a
+    bounded callback; retries cannot send withdrawn content references.
     """
     if not events_enabled():
         return
-    sub_id = EventOutbox.objects.filter(pk=delivery_id).values_list("subscription_id", flat=True).first()
-    if sub_id is None:
+    hint = (
+        EventOutbox.objects.filter(pk=delivery_id).values("subscription_id", "subscription__social_account_id").first()
+    )
+    if hint is None:
         return
     with transaction.atomic():
-        sub = EventSubscription.objects.select_for_update().filter(pk=sub_id).first()
+        SocialAccount.objects.select_for_update().filter(pk=hint["subscription__social_account_id"]).first()
+        sub = EventSubscription.objects.select_for_update().filter(pk=hint["subscription_id"]).first()
         if sub is None:
             return
-        # Only lock the outbox row. Locking the joined message would invert
-        # ingestion's account/message -> outbox order while we hold the sub.
-        delivery = (
-            EventOutbox.objects.select_for_update(of=("self",)).select_related("message").filter(pk=delivery_id).first()
-        )
+        delivery = EventOutbox.objects.select_for_update().filter(pk=delivery_id).first()
         now = timezone.now()
         if delivery is None or delivery.status != EventOutbox.Status.PENDING or delivery.next_attempt_at > now:
             return
@@ -49,15 +52,16 @@ def process_delivery(delivery_id):
         if sub.expires_at <= now or not subscription_authorized(sub):
             _stop(sub, "expired" if sub.expires_at <= now else "access_revoked")
             return
-        message = delivery.message
-        if (
-            message.workspace_id != sub.workspace_id
-            or message.social_account_id != sub.social_account_id
-            or message.message_type != "dm"
-        ):
-            delivery.status = EventOutbox.Status.CANCELLED
-            delivery.last_error = "message_scope_changed"
-            delivery.save(update_fields=["status", "last_error"])
+        source_error = delivery_source_error(delivery, sub)
+        if source_error:
+            delivery.last_error = source_error
+            if source_error == SOURCE_UNAVAILABLE:
+                # Source proof may recover. Do not spend a network attempt or
+                # convert temporary unavailability into a permanent restriction.
+                delivery.next_attempt_at = now + timedelta(seconds=SWEEP_INTERVAL_SECONDS)
+            else:
+                delivery.status = EventOutbox.Status.CANCELLED
+            delivery.save(update_fields=["status", "last_error", "next_attempt_at"])
             return
         delivery.attempts += 1
         previous_secret = sub.previous_secret if sub.previous_secret_until and sub.previous_secret_until > now else ""

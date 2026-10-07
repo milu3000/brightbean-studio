@@ -671,6 +671,7 @@ class InstagramLoginProvider(SocialProvider):
         extra: dict | None = None,
         *,
         human_agent: bool = False,
+        reply_to_message_id: str | None = None,
     ) -> ReplyResult:
         """Send a DM reply addressed to the sender's IGSID."""
         igsid = resolve_recipient_id(extra)
@@ -681,7 +682,7 @@ class InstagramLoginProvider(SocialProvider):
                 platform=self.platform_name,
             )
 
-        payload = build_send_payload(igsid, text, human_agent=human_agent)
+        payload = build_send_payload(igsid, text, human_agent=human_agent, reply_to_message_id=reply_to_message_id)
 
         resp = self._request(
             "POST",

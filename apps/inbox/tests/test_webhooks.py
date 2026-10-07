@@ -507,7 +507,7 @@ class TestInstagramCommentEvents:
         )
 
         msg = InboxMessage.objects.get(platform_message_id="ig-comment-4")
-        assert "parent_id" not in msg.extra
+        assert msg.extra["parent_id"] == ""
 
     @override_settings(
         PLATFORM_CREDENTIALS_FROM_ENV={"instagram_login": {"app_secret": "ig-secret"}},
@@ -852,7 +852,7 @@ class TestFacebookFeedItemFiltering:
         )
 
         message = InboxMessage.objects.get(platform_message_id="comment-top")
-        assert "parent_id" not in message.extra
+        assert message.extra["parent_id"] == ""
 
     @_FB_ENV
     def test_a_real_reply_keeps_its_parent_comment_id(self, client, fb_account):
@@ -951,7 +951,7 @@ class TestFacebookFeedItemFiltering:
         assert message.sentiment_source == InboxMessage.SentimentSource.MANUAL
 
     @_FB_ENV
-    def test_an_edit_reclassifies_an_auto_scored_comment(self, client, fb_account):
+    def test_an_edit_preserves_retired_auto_scored_comment(self, client, fb_account):
         base = {
             "item": "comment",
             "comment_id": "comment-auto",
@@ -963,6 +963,4 @@ class TestFacebookFeedItemFiltering:
 
         message = InboxMessage.objects.get(platform_message_id="comment-auto")
         assert message.sentiment_source == InboxMessage.SentimentSource.AUTO
-        from apps.inbox.sentiment import analyze_sentiment
-
-        assert message.sentiment == analyze_sentiment("this is great, thanks!")
+        assert message.sentiment == InboxMessage.Sentiment.NEUTRAL

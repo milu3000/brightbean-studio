@@ -1303,6 +1303,8 @@ _MCP_INBOX_LIMIT_MAX = 100
 
 
 def _list_inbox_messages(args: dict, context: dict[str, Any]) -> dict:
+    from apps.mcp.canonical_reads import invoke, reader, scope
+
     _require_perm(context, "use_inbox")
     api_key = context["api_key"]
 
@@ -1321,16 +1323,32 @@ def _list_inbox_messages(args: dict, context: dict[str, Any]) -> dict:
     if limit < 1 or limit > _MCP_INBOX_LIMIT_MAX:
         raise JsonRpcError(INVALID_PARAMS, f"limit must be between 1 and {_MCP_INBOX_LIMIT_MAX}")
 
+    invoke(
+        reader.list_legacy_dm_adapter,
+        scope(context),
+        message_type=message_type,
+        status=status,
+        social_account_id=args.get("social_account_id"),
+        cursor=args.get("cursor"),
+        limit=limit,
+    )
+
     try:
         offset = decode_offset_cursor(args.get("cursor"))
     except ValueError as exc:
         raise JsonRpcError(INVALID_PARAMS, "cursor is not a valid pagination cursor") from exc
 
-    qs = _visible_inbox_qs(api_key).prefetch_related("replies__author")
+    qs = (
+        _visible_inbox_qs(api_key)
+        .exclude(pk__in=InboxMessage.objects.filter(extra__transport_projection=True).values("pk"))
+        .prefetch_related("replies__author")
+    )
     if status:
         qs = qs.filter(status=status)
     if message_type:
-        qs = qs.filter(message_type=message_type)
+        from apps.inbox.public_threads import public_type_filter
+
+        qs = qs.filter(public_type_filter(message_type))
     sa_id = args.get("social_account_id")
     if sa_id is not None:
         sa_uuid = _parse_uuid(sa_id, "social_account_id")
@@ -1360,7 +1378,8 @@ register_tool(
             "(including any draft replies). Optional `status` (unread/open/resolved/archived), "
             "`message_type` (comment/mention/dm/review) and `social_account_id` filters, plus "
             "`limit` (default 50, max 100). When more remain, `next_cursor` is non-null — pass it "
-            "back as `cursor`. Requires the use_inbox permission."
+            "back as `cursor`. Canonical-owned DM cohorts require list_conversations and return a versioned upgrade error; "
+            "public-domain filters retain this contract. Requires the use_inbox permission."
         ),
         input_schema={
             "type": "object",
@@ -1392,8 +1411,20 @@ def _get_inbox_message(args: dict, context: dict[str, Any]) -> dict:
     _require_perm(context, "use_inbox")
     if "message_id" not in args:
         raise JsonRpcError(INVALID_PARAMS, "message_id is required")
-    message = _get_inbox_message_for_key(context["api_key"], args["message_id"])
-    return _wrap_text(_serialize_inbox_message(message))
+    from apps.mcp.canonical_reads import invoke, reader, scope
+
+    actor = scope(context)
+    try:
+        message = _get_inbox_message_for_key(context["api_key"], args["message_id"])
+    except JsonRpcError as original:
+        try:
+            return _wrap_text(invoke(reader.read_canonical_incoming_message, actor, args["message_id"]))
+        except JsonRpcError as canonical_error:
+            if (canonical_error.data or {}).get("error") == "not_found_or_denied":
+                raise original from canonical_error
+            raise
+    result = invoke(reader.read_legacy_message, actor, message)
+    return _wrap_text(result if result is not None else _serialize_inbox_message(message))
 
 
 register_tool(
@@ -1401,8 +1432,10 @@ register_tool(
         name="get_inbox_message",
         description=(
             "Retrieve one stored inbox message by ID, including BrightBean replies and drafts. "
-            "Native Instagram/Facebook replies may be absent; an empty replies array does not mean unanswered. "
-            "Use read_native_inbox_thread for an explicit one-time platform snapshot when a native thread ID is known. "
+            "Mapped original incoming IDs retain the legacy message DTO with canonical safe content. "
+            "Canonical-only incoming IDs return id_namespace=canonical_message; outbound IDs are not accepted. "
+            "Read the canonical conversation for native outgoing history; replies lists only genuine BrightBean receipts. "
+            "An empty replies array does not mean unanswered. "
             "Returns 'Inbox message not found' for IDs outside this key's workspace or "
             "account allowlist (same as a truly nonexistent ID). Requires the use_inbox permission."
         ),
@@ -1430,6 +1463,15 @@ def _get_inbox_thread(args: dict, context: dict[str, Any]) -> dict:
         raise JsonRpcError(INVALID_PARAMS, "message_id is required")
     key = context["api_key"]
     message = _get_inbox_message_for_key(key, args["message_id"])
+    from apps.mcp.canonical_reads import invoke, reader, scope
+
+    invoke(
+        reader.read_legacy_thread,
+        scope(context),
+        message,
+        cursor=args.get("cursor", args.get("continuation")),
+        limit=args.get("limit", 20),
+    )
     try:
         result = read_stored_thread(message, actor_id=key.id, cursor=args.get("cursor"), limit=args.get("limit", 20))
     except ValueError as exc:
@@ -1478,6 +1520,15 @@ def _read_native_inbox_thread(args: dict, context: dict[str, Any]) -> dict:
     request = context.get("request")
     if request is not None:
         request._native_inbox_snapshot = True
+    from apps.mcp.canonical_reads import invoke, reader, scope
+
+    invoke(
+        reader.read_legacy_thread,
+        scope(context),
+        message,
+        cursor=args.get("cursor", args.get("continuation")),
+        limit=args.get("limit", 20),
+    )
     try:
         result = read_native_thread(
             message,
@@ -1524,6 +1575,17 @@ register_tool(
 )
 
 
+def _require_legacy_inbox_write(context, message_id):
+    from apps.inbox.composer_surfaces import legacy_write_upgrade
+
+    try:
+        value = legacy_write_upgrade(context["api_key"], message_id, context.get("request"))
+    except ValueError as exc:
+        raise JsonRpcError(INVALID_PARAMS, str(exc)) from None
+    if value is not None:
+        raise JsonRpcError(INVALID_PARAMS, value["detail"], data=value)
+
+
 def _create_reply_draft(args: dict, context: dict[str, Any]) -> dict:
     _require_perm(context, "use_inbox")
     api_key = context["api_key"]
@@ -1531,6 +1593,7 @@ def _create_reply_draft(args: dict, context: dict[str, Any]) -> dict:
         raise JsonRpcError(INVALID_PARAMS, "message_id is required")
     if not args.get("body"):
         raise JsonRpcError(INVALID_PARAMS, "body is required")
+    _require_legacy_inbox_write(context, args["message_id"])
     message = _get_inbox_message_for_key(api_key, args["message_id"])
     follow_up_of = (
         _get_inbox_reply_for_key(api_key, args["follow_up_reply_id"]) if "follow_up_reply_id" in args else None
@@ -1584,6 +1647,7 @@ def _update_reply_draft(args: dict, context: dict[str, Any]) -> dict:
     if not args.get("body"):
         raise JsonRpcError(INVALID_PARAMS, "body is required")
     reply = _get_inbox_reply_for_key(context["api_key"], args["reply_id"])
+    _require_legacy_inbox_write(context, reply.inbox_message_id)
     try:
         update_reply_draft(reply, body=args["body"])
     except (ReplyStateError, ValueError) as exc:
@@ -1622,6 +1686,7 @@ def _discard_reply_draft(args: dict, context: dict[str, Any]) -> dict:
     if "reply_id" not in args:
         raise JsonRpcError(INVALID_PARAMS, "reply_id is required")
     reply = _get_inbox_reply_for_key(context["api_key"], args["reply_id"])
+    _require_legacy_inbox_write(context, reply.inbox_message_id)
     reply_id = str(reply.id)
     try:
         discard_reply_draft(reply)
@@ -1664,12 +1729,14 @@ def _send_reply(args: dict, context: dict[str, Any]) -> dict:
         raise JsonRpcError(INVALID_PARAMS, "reply_id cannot be combined with message_id, body or follow_up_reply_id")
     if "reply_id" in args:
         reply = _get_inbox_reply_for_key(api_key, args["reply_id"])
+        _require_legacy_inbox_write(context, reply.inbox_message_id)
     else:
         if "message_id" not in args or not args.get("body"):
             raise JsonRpcError(
                 INVALID_PARAMS,
                 "Provide either reply_id (to send an existing draft) or message_id + body",
             )
+        _require_legacy_inbox_write(context, args["message_id"])
         message = _get_inbox_message_for_key(api_key, args["message_id"])
         follow_up_of = (
             _get_inbox_reply_for_key(api_key, args["follow_up_reply_id"]) if "follow_up_reply_id" in args else None

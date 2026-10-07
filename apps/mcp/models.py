@@ -61,7 +61,11 @@ class EventOutbox(models.Model):
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     subscription = models.ForeignKey(EventSubscription, on_delete=models.CASCADE, related_name="deliveries")
-    message = models.ForeignKey("inbox.InboxMessage", on_delete=models.CASCADE)
+    message = models.ForeignKey("inbox.InboxMessage", null=True, blank=True, on_delete=models.CASCADE)
+    canonical_message = models.ForeignKey("inbox.ConversationMessage", null=True, blank=True, on_delete=models.PROTECT)
+    # Immutable proof captured at enqueue, independent of subscription rotation.
+    canonical_generation = models.UUIDField(null=True, blank=True)
+    canonical_event_revision = models.PositiveBigIntegerField(null=True, blank=True)
     generation = models.UUIDField()
     event_id = models.CharField(max_length=68)
     # Serialize once; retries preserve the original body and event ID.
@@ -77,5 +81,9 @@ class EventOutbox(models.Model):
     class Meta:
         constraints = [
             models.UniqueConstraint(fields=["subscription", "event_id"], name="mcp_event_subscription_dedupe"),
+            models.CheckConstraint(
+                condition=models.Q(message__isnull=False) | models.Q(canonical_message__isnull=False),
+                name="mcp_event_message_required",
+            ),
         ]
         indexes = [models.Index(fields=["status", "next_attempt_at"], name="mcp_outbox_due")]

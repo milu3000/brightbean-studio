@@ -6,6 +6,7 @@
     {% if notifications %}
     <button
         hx-post="{% url 'notifications:mark_all_read' %}"
+        hx-vals='{"snapshot":"{{ notification_snapshot }}","surface":"drawer"}'
         hx-target="#notification-drawer-content"
         hx-swap="innerHTML"
         class="text-xs font-semibold text-orange-600 hover:text-orange-700 transition-colors duration-150 cursor-pointer"
@@ -24,13 +25,7 @@
             class="group relative {% if not n.is_read %}bg-orange-50/50{% endif %} hover:bg-stone-50 transition-colors duration-150"
         >
             <a
-                href="{% if n.data.action_url %}{{ n.data.action_url }}{% else %}{% url 'notifications:list' %}{% endif %}"
-                {% if not n.is_read %}
-                hx-post="{% url 'notifications:mark_as_read' n.id %}"
-                hx-target="#notif-{{ n.id }}"
-                hx-swap="outerHTML"
-                hx-trigger="click"
-                {% endif %}
+                href="{% if n.action_url %}{{ n.action_url }}{% else %}{% url 'notifications:list' %}{% endif %}"
                 class="flex gap-3 px-5 py-3.5 cursor-pointer"
             >
                 {# Event type icon #}
@@ -67,11 +62,11 @@
                 </div>
 
                 <div class="flex-1 min-w-0">
-                    <p class="text-[13px] font-semibold text-stone-900 leading-snug truncate">{{ n.title }}</p>
-                    {% if n.body %}
-                    <p class="text-[12px] text-stone-500 leading-relaxed mt-0.5 line-clamp-2">{{ n.body }}</p>
+                    <p class="text-[13px] font-semibold text-stone-900 leading-snug truncate">{{ n.display_title }}</p>
+                    {% if n.display_body %}
+                    <p class="text-[12px] text-stone-500 leading-relaxed mt-0.5 line-clamp-2">{{ n.display_body }}</p>
                     {% endif %}
-                    <p class="text-[11px] text-stone-400 mt-1 font-medium tabular-nums">{{ n.created_at|timesince }} ago</p>
+                    <p class="text-[11px] text-stone-400 mt-1 font-medium tabular-nums">{{ n.last_event_at|timesince }} ago</p>
                 </div>
 
                 {% if not n.is_read %}
@@ -80,6 +75,11 @@
                 </div>
                 {% endif %}
             </a>
+            <div class="flex gap-3 px-5 pb-3">
+            {% if not n.is_read %}<button hx-post="{% url 'notifications:mark_as_read' n.id %}" hx-target="#notification-drawer-content" hx-swap="innerHTML" hx-vals='{"snapshot":"{{ n.read_snapshot }}","surface":"drawer"}' class="text-xs text-orange-600 cursor-pointer">Mark read</button>{% endif %}
+            <button hx-post="{% url 'notifications:dismiss' n.id %}" hx-target="#notification-drawer-content" hx-swap="innerHTML" hx-vals='{"snapshot":"{{ n.read_snapshot }}","surface":"drawer"}' class="text-xs text-stone-500 cursor-pointer">Close</button>
+            {% if n.event_count > 1 %}<span class="text-xs text-stone-400">{{ n.event_count }} messages</span>{% endif %}
+            </div>
         </li>
         {% endfor %}
     </ul>

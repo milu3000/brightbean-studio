@@ -33,7 +33,7 @@ _COMMENT_LIKE_TYPES = {
     InboxMessage.MessageType.REVIEW,
 }
 
-# Past this age Meta only accepts a reply tagged as written by a person.
+# Extended replies require separately verified Meta feature approval and permitted use.
 HUMAN_AGENT_AFTER = timedelta(hours=24)
 
 # States a reply can be sent (or re-sent) from.
@@ -60,6 +60,37 @@ def validate_automated_reply_window(message: InboxMessage) -> None:
         raise ReplyStateError("Automated Meta replies are only allowed within 24 hours of the inbound message.")
 
 
+def validate_meta_reply_window(message: InboxMessage, *, automated: bool) -> None:
+    """No Meta DM surface may infer app feature approval from manual mode.
+
+    Current account metadata records missing OAuth scopes, not Meta's Human
+    Agent feature approval or permitted purpose. No empty scope list, setting,
+    session identity or provider mock supplies that missing evidence.
+    """
+    from .dm_send_gate import DMSendGateError
+
+    if message.message_type != InboxMessage.MessageType.DM or message.social_account.platform not in {
+        "facebook",
+        "instagram",
+        "instagram_login",
+    }:
+        return
+    if automated:
+        validate_automated_reply_window(message)
+        return
+    received_at = message.received_at
+    if not isinstance(received_at, datetime) or timezone.is_naive(received_at):
+        raise DMSendGateError("invalid_reply_window", "This reply requires a verified incoming message timestamp.")
+    age = timezone.now() - received_at
+    if age < timedelta(0) or age >= timedelta(days=7):
+        raise DMSendGateError("reply_window_closed", "The incoming message is outside the supported reply window.")
+    if age >= HUMAN_AGENT_AFTER:
+        raise DMSendGateError(
+            "human_agent_permission_unverified",
+            "Replies after 24 hours require verified platform Human Agent approval and permitted use; that approval is not verified for this account.",
+        )
+
+
 # ---------------------------------------------------------------------------
 # Platform dispatch (moved from views.py, behaviour unchanged)
 # ---------------------------------------------------------------------------
@@ -82,7 +113,9 @@ def reply_failure_reason(exc: Exception) -> str:
     return provider_failure_reason(exc)
 
 
-def _dispatch_to_platform(message: InboxMessage, body: str, *, automated: bool = False, before_provider=None) -> str:
+def _dispatch_to_platform(
+    message: InboxMessage, body: str, *, automated: bool = False, before_provider=None, reply=None
+) -> str:
     """Post ``body`` back to the platform and return the platform's reply ID.
 
     Raises if the platform refuses it, so the caller can avoid recording a
@@ -91,6 +124,7 @@ def _dispatch_to_platform(message: InboxMessage, body: str, *, automated: bool =
     from apps.publisher.engine import _resolve_publish_credentials
 
     account = message.social_account
+    validate_meta_reply_window(message, automated=automated)
     provider = get_provider(account.platform, _resolve_publish_credentials(account))
 
     # The messaging endpoints address a person, not a message, so carry the
@@ -109,10 +143,18 @@ def _dispatch_to_platform(message: InboxMessage, body: str, *, automated: bool =
             extra=extra,
         )
     else:
-        if automated:
-            # Recheck immediately before dispatch, including time spent acquiring
-            # locks or resolving credentials. Never label automation as a person.
-            validate_automated_reply_window(message)
+        quote_kwargs = {}
+        if reply is not None and reply.quote_target_id:
+            if before_provider is None:
+                from .reply_quotes import validate_quote
+
+                validate_quote(reply, reply.conversation, account)
+            # The shared before_provider gate validates this immutable quote
+            # and fingerprint immediately before HTTP. Do not validate earlier
+            # outside its known-not-sent exception boundary.
+            quote_kwargs["reply_to_message_id"] = reply.quote_platform_message_id
+        # Recheck after credentials resolve and immediately before provider dispatch.
+        validate_meta_reply_window(message, automated=automated)
         overdue = not automated and timezone.now() - message.received_at > HUMAN_AGENT_AFTER
         if before_provider is not None:
             before_provider()
@@ -122,6 +164,7 @@ def _dispatch_to_platform(message: InboxMessage, body: str, *, automated: bool =
             text=body,
             extra=extra,
             human_agent=overdue,
+            **quote_kwargs,
         )
 
     return result.platform_message_id
@@ -129,6 +172,10 @@ def _dispatch_to_platform(message: InboxMessage, body: str, *, automated: bool =
 
 def _apply_post_send_side_effects(message: InboxMessage) -> None:
     """Resolve or open the message after a reply goes out, per SLA config."""
+    from .canonical_send_target import is_transport_projection
+
+    if is_transport_projection(message):
+        return
     sla_config = InboxSLAConfig.objects.filter(workspace=message.workspace, is_active=True).first()
     if sla_config and sla_config.auto_resolve_on_reply:
         if message.status != InboxMessage.Status.RESOLVED:
@@ -252,6 +299,8 @@ def _lock_reply_with_account(reply: InboxReply) -> None:
 def update_reply_draft(reply: InboxReply, *, body: str) -> InboxReply:
     """Edit a draft (or failed) reply's body."""
     _lock_reply_with_account(reply)
+    if reply.conversation_id:
+        raise ReplyStateError("Use the conversation composer revision to edit this draft.")
     from .reply_safety import LEGACY_UNVERIFIED_MESSAGE, UNKNOWN_MESSAGE, is_unresolved_reply
 
     if is_unresolved_reply(reply):
@@ -274,6 +323,8 @@ def update_reply_draft(reply: InboxReply, *, body: str) -> InboxReply:
 def discard_reply_draft(reply: InboxReply) -> None:
     """Delete a draft (or failed) reply. Sent replies are permanent."""
     _lock_reply_with_account(reply)
+    if reply.conversation_id:
+        raise ReplyStateError("Conversation action receipts must be preserved; use an explicit composer action.")
     from .reply_safety import LEGACY_UNVERIFIED_MESSAGE, UNKNOWN_MESSAGE, is_unresolved_reply
 
     if is_unresolved_reply(reply):

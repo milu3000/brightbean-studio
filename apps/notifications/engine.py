@@ -149,6 +149,8 @@ def notify(
     title: str,
     body: str = "",
     data: dict | None = None,
+    *,
+    inbox_incoming: bool = False,
 ) -> Notification | None:
     """Create a notification and dispatch to enabled channels.
 
@@ -167,6 +169,11 @@ def notify(
     if event_type not in EventType.values:
         logger.warning("Unknown event_type: %s", event_type)
         return None
+
+    if inbox_incoming and event_type == EventType.NEW_INBOX_MESSAGE and data and data.get("message_id"):
+        from .inbox import notify_legacy_incoming
+
+        return notify_legacy_incoming(user, data)
 
     notification = Notification.objects.create(
         user=user,
@@ -413,7 +420,7 @@ def _dispatch_webhook(delivery: NotificationDelivery) -> None:
         {
             "event_type": notification.event_type,
             "title": notification.title,
-            "body": notification.body,
+            "body": notification.display_body,
             "data": notification.data,
             "created_at": notification.created_at.isoformat(),
             "user_id": str(notification.user_id),

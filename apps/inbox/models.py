@@ -6,6 +6,9 @@ from django.conf import settings
 from django.db import models
 
 from apps.common.managers import WorkspaceScopedManager
+from apps.inbox.read_models import ConversationReadState  # noqa: F401
+
+from .receipt_models import InboxArchiveIdentity, InboxReplyContentRecovery  # noqa: F401
 
 
 class InboxMessage(models.Model):
@@ -175,6 +178,8 @@ class InboxMessage(models.Model):
 
     @property
     def content_status(self):
+        if hasattr(self, "canonical_content_status"):
+            return self.canonical_content_status
         from providers.meta_inbox_content import message_content_status
 
         return message_content_status(self.extra, self.body or "")
@@ -215,6 +220,25 @@ class InboxReply(models.Model):
     is_follow_up = models.BooleanField(default=False, db_default=False)
     not_sent_verified = models.BooleanField(default=False, db_default=False)
     send_generation = models.PositiveBigIntegerField(default=0, db_default=0)
+    # Explicit conversation actions coexist with all historical incoming-bound
+    # replies. A nonce identifies one outgoing intent, never a conversation.
+    conversation = models.ForeignKey(
+        "InboxConversation", on_delete=models.PROTECT, null=True, blank=True, related_name="composer_replies"
+    )
+    action_nonce = models.UUIDField(null=True, blank=True)
+    account_platform_id = models.CharField(max_length=255, blank=True, default="", db_default="")
+    recipient_id = models.CharField(max_length=255, blank=True, default="", db_default="")
+    platform_conversation_id = models.CharField(max_length=255, blank=True, default="", db_default="")
+    connection_generation = models.UUIDField(null=True, blank=True)
+    conversation_incoming_generation = models.PositiveBigIntegerField(default=0, db_default=0)
+    retired_at = models.DateTimeField(null=True, blank=True)
+    content_compacted_at = models.DateTimeField(null=True, blank=True)
+    quote_target = models.ForeignKey(
+        "ConversationMessage", on_delete=models.PROTECT, null=True, blank=True, related_name="quoted_by_replies"
+    )
+    quote_platform_message_id = models.CharField(max_length=255, blank=True, default="", db_default="")
+    quote_platform_conversation_id = models.CharField(max_length=255, blank=True, default="", db_default="")
+    quote_connection_generation = models.UUIDField(null=True, blank=True)
     author = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
@@ -239,6 +263,37 @@ class InboxReply(models.Model):
     class Meta:
         db_table = "inbox_reply"
         ordering = ["created_at"]
+        constraints = [
+            models.UniqueConstraint(fields=["conversation", "action_nonce"], name="inbox_reply_conversation_nonce"),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(
+                        quote_target__isnull=True,
+                        quote_platform_message_id="",
+                        quote_platform_conversation_id="",
+                        quote_connection_generation__isnull=True,
+                    )
+                    | (
+                        models.Q(quote_target__isnull=False, conversation__isnull=False)
+                        & ~models.Q(quote_platform_message_id="")
+                        & ~models.Q(quote_platform_conversation_id="")
+                    )
+                ),
+                name="inbox_reply_quote_identity",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(conversation__isnull=True, action_nonce__isnull=True)
+                    | (
+                        models.Q(conversation__isnull=False, action_nonce__isnull=False)
+                        & ~models.Q(account_platform_id="")
+                        & ~models.Q(recipient_id="")
+                        & ~models.Q(platform_conversation_id="")
+                    )
+                ),
+                name="inbox_reply_conversation_intent",
+            ),
+        ]
 
     def __str__(self):
         return f"{self.get_status_display()} reply by {self.author} ({self.created_at:%Y-%m-%d %H:%M})"
@@ -402,6 +457,25 @@ class InboxConversation(models.Model):
     classification_reason = models.CharField(max_length=40, default="participants_missing")
     identity_kind = models.CharField(max_length=20, choices=IdentityKind.choices)
     revision = models.PositiveBigIntegerField(default=0)
+    active_reply = models.ForeignKey(
+        InboxReply, on_delete=models.SET_NULL, null=True, blank=True, related_name="active_composer_slots"
+    )
+    composer_revision = models.PositiveBigIntegerField(default=0, db_default=0)
+    incoming_generation = models.PositiveBigIntegerField(default=0, db_default=0)
+    incoming_observed_at = models.DateTimeField(null=True, blank=True)
+    incoming_watermark_at = models.DateTimeField(null=True, blank=True)
+    workflow_state = models.CharField(
+        max_length=20,
+        null=True,
+        blank=True,
+        choices=[("needs_action", "Needs action"), ("waiting", "Waiting"), ("done", "Done")],
+    )
+    workflow_baseline_at = models.DateTimeField(null=True, blank=True)
+    workflow_completed_at = models.DateTimeField(null=True, blank=True)
+    workflow_completed_generation = models.PositiveBigIntegerField(default=0, db_default=0)
+    workflow_outbound_at = models.DateTimeField(null=True, blank=True)
+    workflow_order_uncertain = models.BooleanField(default=False, db_default=False)
+    workflow_reviewed_generation = models.PositiveBigIntegerField(default=0, db_default=0)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -480,6 +554,7 @@ class ConversationMessage(models.Model):
         InboxReply, on_delete=models.SET_NULL, null=True, blank=True, related_name="conversation_message"
     )
     first_seen_at = models.DateTimeField(auto_now_add=True)
+    incoming_generation = models.PositiveBigIntegerField(null=True, blank=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     objects = WorkspaceScopedManager()
@@ -613,6 +688,8 @@ class SendOperation(models.Model):
     conversation = models.ForeignKey(InboxConversation, on_delete=models.CASCADE, related_name="send_operations")
     actor_scope = models.CharField(max_length=255)
     idempotency_key = models.CharField(max_length=128)
+    conversation_action_nonce = models.UUIDField(null=True, blank=True)
+    human_observed_at = models.DateTimeField(null=True, blank=True)
     payload_fingerprint = models.CharField(max_length=64)
     body = models.TextField()
     target = models.ForeignKey(
@@ -652,8 +729,16 @@ class SendOperation(models.Model):
             ),
             models.UniqueConstraint(
                 fields=["conversation", "target_platform_message_id"],
-                condition=models.Q(status="confirmed") & ~models.Q(target_platform_message_id=""),
+                condition=models.Q(status="confirmed", conversation_action_nonce__isnull=True)
+                & ~models.Q(target_platform_message_id=""),
                 name="inbox_send_confirmed_target",
+            ),
+            models.UniqueConstraint(
+                fields=["conversation", "conversation_action_nonce"], name="inbox_send_conversation_action"
+            ),
+            models.CheckConstraint(
+                condition=models.Q(conversation_action_nonce__isnull=True) | models.Q(reply__isnull=False),
+                name="inbox_send_action_has_reply",
             ),
             models.UniqueConstraint(
                 fields=["conversation"],
@@ -661,3 +746,14 @@ class SendOperation(models.Model):
                 name="inbox_send_single_active",
             ),
         ]
+
+
+# Reconstructed durable schema remains disabled until explicit enrollment.
+from .sync_models import (  # noqa: E402, F401
+    ConversationObservationState,
+    ConversationSyncIdentity,
+    InboxSyncBudget,
+    InboxSyncCheckpoint,
+    InboxSyncConnection,
+)
+from .sync_receipt_models import InboxSyncReceipt  # noqa: E402, F401

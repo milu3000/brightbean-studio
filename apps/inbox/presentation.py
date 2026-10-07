@@ -71,11 +71,23 @@ def stored_thread_messages(message):
         social_account_id=message.social_account_id,
         social_account__workspace_id=message.workspace_id,
     )
+    from .canonical_send_target import exclude_transport_projections
+
+    qs = exclude_transport_projections(qs)
     native_id = thread_id(message)
     if native_id:
         return qs.annotate(presentation_native_id=_NativeThreadId(F("extra"))).filter(
             message_type=InboxMessage.MessageType.DM, presentation_native_id=native_id
         )
+    if message.message_type in {"comment", "mention"}:
+        from .public_threads import public_thread_key
+
+        parents = {}
+        key = public_thread_key(message, parents=parents)
+        candidates = qs.filter(message_type__in={"comment", "mention"}).only(
+            "id", "workspace_id", "social_account_id", "platform_message_id", "message_type", "extra"
+        )
+        return qs.filter(pk__in=[row.pk for row in candidates if public_thread_key(row, parents=parents) == key])
     return qs.filter(pk=message.pk)
 
 
@@ -135,11 +147,14 @@ def inbox_page(queryset, page_number, *, per_page=50):
     Streaming lightweight metadata avoids a query per row or loading media bodies.
     """
     groups = {}
+    public_parents = {}
     columns = (
         "pk",
         "workspace_id",
         "social_account_id",
         "message_type",
+        "platform_message_id",
+        "extra",
         "presentation_native_id",
         "status",
         "assigned_to_id",
@@ -152,6 +167,13 @@ def inbox_page(queryset, page_number, *, per_page=50):
             else ""
         )
         key = (record["workspace_id"], record["social_account_id"], native_id) if native_id else (record["pk"],)
+        if enabled() and record["message_type"] in {"comment", "mention"}:
+            from .public_threads import public_thread_key
+
+            message = InboxMessage(
+                **{name: value for name, value in record.items() if name != "presentation_native_id"}
+            )
+            key = public_thread_key(message, parents=public_parents)
         row = groups.setdefault(key, InboxRow(message_id=record["pk"]))
         row.matched_count += 1
         row.unread_count += record["status"] == InboxMessage.Status.UNREAD

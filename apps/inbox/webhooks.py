@@ -19,7 +19,6 @@ from apps.credentials.models import resolve_app_secret, resolve_app_secrets
 from apps.social_accounts.models import SocialAccount
 
 from .models import InboxMessage
-from .sentiment import analyze_sentiment
 
 logger = logging.getLogger(__name__)
 
@@ -121,8 +120,19 @@ def _process_meta_events(payload: dict, platforms: list[str], valid_secrets: set
             for change in entry.get("changes", []):
                 _handle_facebook_change(account, change)
 
+            from .sync_ingestion import verified_meta_delivery
+
+            expected_object = "instagram" if account.platform == "instagram_login" else "page"
+            delivery = verified_meta_delivery(account, page_id) if payload.get("object") == expected_object else None
             for messaging in entry.get("messaging", []):
-                _handle_facebook_messaging(account, messaging)
+                _handle_facebook_messaging(
+                    account,
+                    messaging,
+                    verified_delivery=delivery,
+                    verified_instagram_delivery=(
+                        platforms == ["instagram_login"] and payload.get("object") == "instagram"
+                    ),
+                )
 
 
 # --- Webhook entry points ---
@@ -230,7 +240,9 @@ def _facebook_comment_extra(value: dict) -> dict:
         "source": "webhook",
     }
     parent_id = str(value.get("parent_id") or "")
-    if parent_id and parent_id in {post_id, extra["stored_post_id"]}:
+    if parent_id and parent_id == post_id:
+        extra["parent_id"] = ""
+    elif parent_id and parent_id == extra["stored_post_id"]:
         extra.pop("parent_id", None)
     return extra
 
@@ -256,19 +268,34 @@ def _instagram_comment_extra(value: dict, *, reply_edge: str) -> dict:
     parent_id = str(value.get("parent_id") or "")
     if parent_id and parent_id not in {str(value.get("id") or ""), media_id}:
         extra["parent_id"] = parent_id
+    elif "parent_id" in value and value.get("parent_id") in {"", media_id}:
+        extra["parent_id"] = ""
     else:
         extra.pop("parent_id", None)
     return extra
 
 
+@transaction.atomic
 def _upsert_facebook_comment(account, value: dict):
     """Upsert a Facebook comment from a webhook event."""
+    from .locking import lock_dm_account
+
+    expected_identity = (account.platform, account.account_platform_id, account.webhook_target_id)
+    account = lock_dm_account(account.pk, account.workspace_id)
+    if (
+        account is None
+        or (account.platform, account.account_platform_id, account.webhook_target_id) != expected_identity
+        or account.connection_status != "connected"
+    ):
+        return
     # Both default leniently: an older or variant payload shape that omits them
     # is still a comment being added, which is how this used to behave.
     if value.get("item", "comment") != "comment":
         return
 
-    comment_id = value.get("comment_id") or value.get("id")
+    from .public_threads import public_native_id
+
+    comment_id = public_native_id(value.get("comment_id") or value.get("id"))
     if not comment_id:
         return
 
@@ -277,8 +304,10 @@ def _upsert_facebook_comment(account, value: dict):
         # A deleted or hidden comment should stop its SLA clock rather than
         # sit in the inbox waiting for a reply that can no longer be posted.
         InboxMessage.objects.filter(
+            workspace_id=account.workspace_id,
             social_account=account,
-            platform_message_id=str(comment_id),
+            platform_message_id=comment_id,
+            message_type=InboxMessage.MessageType.COMMENT,
         ).update(status=InboxMessage.Status.ARCHIVED)
         return
     if verb not in FACEBOOK_FEED_ADD_VERBS | FACEBOOK_FEED_EDIT_VERBS:
@@ -292,26 +321,9 @@ def _upsert_facebook_comment(account, value: dict):
     text = value.get("message", "")
     extra = _facebook_comment_extra(value)
 
-    if verb in FACEBOOK_FEED_EDIT_VERBS:
-        # An edit of a comment we already hold must replace the stored text, or
-        # the team answers wording the customer has already taken back. Falls
-        # through to the create path when we have never seen the comment.
-        existing = InboxMessage.objects.filter(
-            social_account=account,
-            platform_message_id=str(comment_id),
-        )
-        if existing.update(body=text, extra=extra):
-            # Re-classify only rows we classified ourselves. A human who set the
-            # sentiment by hand outranks the classifier, and silently recomputing
-            # it would also leave sentiment_source claiming "manual".
-            existing.filter(sentiment_source=InboxMessage.SentimentSource.AUTO).update(
-                sentiment=analyze_sentiment(text)
-            )
-            return
-
     _create_if_new(
         account=account,
-        platform_message_id=str(comment_id),
+        platform_message_id=comment_id,
         message_type=InboxMessage.MessageType.COMMENT,
         sender_name=from_data.get("name", "Unknown"),
         sender_id=from_data.get("id", ""),
@@ -331,7 +343,7 @@ def _upsert_facebook_mention(account, value: dict):
 
     _create_if_new(
         account=account,
-        platform_message_id=str(mention_id),
+        platform_message_id=mention_id,
         message_type=InboxMessage.MessageType.MENTION,
         sender_name=from_data.get("name", "Unknown"),
         sender_id=from_data.get("id", ""),
@@ -355,7 +367,7 @@ def _upsert_instagram_comment(account, value: dict):
 
     _create_if_new(
         account=account,
-        platform_message_id=str(comment_id),
+        platform_message_id=comment_id,
         message_type=InboxMessage.MessageType.COMMENT,
         sender_name=from_data.get("username", "Unknown"),
         sender_id=from_data.get("id", ""),
@@ -385,7 +397,7 @@ def _upsert_instagram_mention(account, value: dict):
 
     _create_if_new(
         account=account,
-        platform_message_id=str(mention_id),
+        platform_message_id=mention_id,
         message_type=InboxMessage.MessageType.MENTION,
         sender_name="Instagram",
         sender_id="",
@@ -394,10 +406,15 @@ def _upsert_instagram_mention(account, value: dict):
     )
 
 
-def _handle_facebook_messaging(account, messaging: dict):
+def _handle_facebook_messaging(account, messaging: dict, *, verified_instagram_delivery=False, verified_delivery=None):
     """Handle a Facebook/Instagram messaging event (DM)."""
+    from .sync_ingestion import ingest_meta_webhook
     from .tasks import _is_outgoing_dm
 
+    if ingest_meta_webhook(
+        account, messaging, verified_instagram_delivery=verified_instagram_delivery, verified_delivery=verified_delivery
+    ):
+        return
     message_data = messaging.get("message") or {}
     if not isinstance(message_data, dict):
         return
@@ -460,16 +477,36 @@ def _create_if_new(
 
     from .tasks import UNKNOWN_MESSAGE_TIMESTAMP, _is_outgoing_dm, _related_post_key, _safe_message_timestamp
 
-    platform_message_id = str(platform_message_id or "").strip()
+    if message_type in {"comment", "mention"}:
+        from .public_threads import public_native_id
+
+        platform_message_id = public_native_id(platform_message_id)
+    else:
+        platform_message_id = str(platform_message_id or "").strip()
     if not platform_message_id:
         return
-    if message_type == InboxMessage.MessageType.DM:
-        from .locking import lock_dm_account
+    from .locking import lock_dm_account
 
-        expected_platform = account.platform
-        account = lock_dm_account(account.pk, account.workspace_id)
-        if account is None or account.platform != expected_platform:
+    expected_identity = (account.platform, account.account_platform_id, account.webhook_target_id)
+    account = lock_dm_account(account.pk, account.workspace_id)
+    if (
+        account is None
+        or (account.platform, account.account_platform_id, account.webhook_target_id) != expected_identity
+        or account.connection_status != "connected"
+    ):
+        return
+    if message_type == InboxMessage.MessageType.DM:
+        from .sync_identity import canonical_owns_account
+
+        if canonical_owns_account(account):
             return
+    existing_scope = (
+        InboxMessage.objects.filter(social_account_id=account.pk, platform_message_id=platform_message_id)
+        .values_list("workspace_id", flat=True)
+        .first()
+    )
+    if existing_scope is not None and existing_scope != account.workspace_id:
+        return
     ledger = None
     if message_type == InboxMessage.MessageType.DM:
         from .conversations import link_legacy_message, upsert_conversation_message
@@ -495,7 +532,6 @@ def _create_if_new(
         "sender_name": sender_name,
         "sender_handle": sender_id,  # Platform user ID as fallback handle
         "body": body,
-        "sentiment": analyze_sentiment(body),
         "extra": extra,
         "received_at": _safe_message_timestamp(received_at),
     }
@@ -506,7 +542,9 @@ def _create_if_new(
         from apps.composer.models import PlatformPost
 
         related_id = (
-            PlatformPost.objects.filter(social_account=account, platform_post_id=post_key)
+            PlatformPost.objects.filter(
+                social_account=account, platform_post_id=post_key, post__workspace_id=account.workspace_id
+            )
             .values_list("id", flat=True)
             .first()
         )
@@ -524,12 +562,33 @@ def _create_if_new(
             defaults["received_at"] = UNKNOWN_MESSAGE_TIMESTAMP
             defaults["body"] = ""
             notify = False
-    obj, created = InboxMessage.objects.get_or_create(
+    if message_type in {"comment", "mention"}:
+        from .public_threads import public_upsert_defaults
+
+        defaults = public_upsert_defaults(None, defaults)
+    obj, created = InboxMessage.objects.select_for_update().get_or_create(
         social_account=account,
         platform_message_id=platform_message_id,
         defaults=defaults,
     )
+    if (
+        not created
+        and message_type != obj.message_type
+        and not {message_type, obj.message_type} <= {"comment", "mention"}
+    ):
+        return
+    if not created and message_type in {"comment", "mention"}:
+        from .public_threads import public_upsert_defaults
+
+        values = public_upsert_defaults(obj, defaults)
+        for field, value in values.items():
+            setattr(obj, field, value)
+        obj.save(update_fields=list(values))
     if not created and message_type == InboxMessage.MessageType.DM:
+        from .canonical_send_target import is_transport_projection
+
+        if is_transport_projection(obj):
+            return
         # Account lock above serializes webhook/poll/send. Enrichment is not a
         # new arrival: never change status/time or replay notifications/events.
         obj.extra = merge_message_extra(obj.extra, extra)

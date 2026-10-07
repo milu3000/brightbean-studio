@@ -69,7 +69,7 @@ def test_share_only_detail_renders_safe_card_and_preserves_reply_composer():
     assert "Shared post" in html
     assert 'href="https://www.instagram.com/p/shared/"' in html
     assert 'target="_blank" rel="noopener noreferrer"' in html
-    assert "Open shared content" in html
+    assert "Open original post" in html
     assert 'text-stone-800 leading-relaxed whitespace-pre-wrap"></p>' not in html
     assert "Save as draft" in html
     assert "Send Reply" in html
@@ -92,14 +92,13 @@ def test_mixed_detail_and_child_cards_escape_body_and_title():
     assert body not in html
     assert title not in html
     assert "Child share" in html
-    assert html.count("Open shared content") == 2
+    assert html.count("Open original post") == 2
 
 
 def test_missing_url_has_truthful_placeholder_and_no_link_or_image():
     html = _render("_attachment_cards", _message(attachments=[_attachment(url="", availability="unavailable")]))
 
-    assert "Original content unavailable" in html
-    assert "No usable link is available for this message" in html
+    assert "Content unavailable." in html
     assert "<a " not in html
     assert "<img " not in html
 
@@ -117,9 +116,8 @@ def test_preview_is_lazy_and_does_not_send_referrer():
 def test_empty_legacy_message_shows_unknown_content_without_inventing_attachment():
     html = _render("_message_panel", _message(attachments=[], content_preview="Non-text message"))
 
-    assert "Non-text message" in html
-    assert "No displayable text or attachment metadata was provided for this message" in html
-    assert "its original content has not been verified" in html
+    assert "Content unavailable." in html
+    assert "original content has not been verified" not in html
     assert "Open attachment" not in html
 
 
@@ -142,15 +140,24 @@ def inbox_owner_client(client, inbox_workspace, org_owner):
 
 @pytest.mark.django_db
 @pytest.mark.parametrize("htmx", [False, True])
-def test_detail_view_renders_normalized_parent_and_child_shares(inbox_owner_client, inbox_message, htmx):
+@pytest.mark.parametrize("native_thread", [False, True])
+def test_detail_view_renders_normalized_shares_only_with_thread_evidence(
+    inbox_owner_client, inbox_message, htmx, native_thread
+):
     inbox_message.body = ""
+    inbox_message.message_type = InboxMessage.MessageType.DM
     inbox_message.extra = {
         "message": {
             "attachments": [{"type": "share", "payload": {"url": "https://www.instagram.com/p/parent-share/"}}]
         },
         "access_token": "private-provider-token",
     }
-    inbox_message.save(update_fields=["body", "extra"])
+    if native_thread:
+        inbox_message.extra["conversation_id"] = "native-share-thread"
+    inbox_message.save(update_fields=["body", "message_type", "extra"])
+    child_extra = {"inbox_attachments": [_attachment(url="https://www.instagram.com/p/child-share/")]}
+    if native_thread:
+        child_extra["conversation_id"] = "native-share-thread"
     InboxMessage.objects.create(
         workspace=inbox_message.workspace,
         social_account=inbox_message.social_account,
@@ -159,7 +166,7 @@ def test_detail_view_renders_normalized_parent_and_child_shares(inbox_owner_clie
         message_type="dm",
         sender_name="Child sender",
         body="",
-        extra={"inbox_attachments": [_attachment(url="https://www.instagram.com/p/child-share/")]},
+        extra=child_extra,
         received_at=timezone.now(),
     )
 
@@ -171,8 +178,9 @@ def test_detail_view_renders_normalized_parent_and_child_shares(inbox_owner_clie
     assert response.status_code == 200
     html = response.content.decode()
     assert 'href="https://www.instagram.com/p/parent-share/"' in html
-    assert 'href="https://www.instagram.com/p/child-share/"' in html
-    assert html.count("Open shared content") == 2
+    # A parent FK is not provider evidence of a private native conversation.
+    assert ('href="https://www.instagram.com/p/child-share/"' in html) is native_thread
+    assert html.count("Open original post") == (2 if native_thread else 1)
     assert "private-provider-token" not in html
     assert "Save as draft" in html
     inbox_message.refresh_from_db()

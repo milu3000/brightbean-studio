@@ -1,0 +1,4 @@
+{% extends "inbox/basic/base.html" %}{% block content %}<h2>Preserved history</h2>
+<form method="get"><label>Search <input name="q" value="{{ filters.q }}" maxlength="500"></label><label>Account <select name="account"><option value="">All</option>{% for account in accounts %}<option value="{{ account.id }}"{% if account.id == filters.account %} selected{% endif %}>{{ account.account_name }} ({{ account.platform }})</option>{% endfor %}</select></label><button type="submit">Search</button></form>
+{% for record in page.records %}<h3><a href="{{ record.detail_url }}">Record</a></h3>{% include "inbox/basic/preserved_message.html" %}{% empty %}<p>No records on this page</p>{% endfor %}
+<nav><a href="{{ newest_url }}">Newest</a>{% if older_url %} · <a href="{{ older_url }}">Older</a>{% endif %}</nav>{% endblock %}
