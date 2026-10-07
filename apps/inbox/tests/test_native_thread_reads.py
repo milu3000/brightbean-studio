@@ -748,6 +748,80 @@ def paged_payload(dm, *, page=0, count=20, more=True):
     return data
 
 
+@pytest.mark.parametrize("long_index", [0, 19])
+@pytest.mark.parametrize("body", ["x" * reads.MAX_BODY_CHARACTERS, "中" * 2000], ids=["ascii", "unicode"])
+def test_output_budget_reclaims_empty_rows_share_for_one_long_body(dm, long_index, body):
+    data = paged_payload(dm)
+    rows = data["messages"]["data"]
+    for index, row in enumerate(rows):
+        row["message"] = body if index == long_index else ""
+        if index % 2:
+            row["from"]["id"], row["to"]["data"][0]["id"] = "peer-1", dm.account.account_platform_id
+    result, request = read(dm, data)
+    items = {item["platform_message_id"]: item for item in result["items"]}
+    assert set(items) == {row["id"] for row in rows}
+    for index, row in enumerate(rows):
+        item = items[row["id"]]
+        assert item["body"] == row["message"]
+        assert item["occurred_at"] == row["created_time"]
+        assert item["direction"] == ("inbound" if index % 2 else "outbound")
+        assert item["body_truncated"] is False and item["attachments_truncated"] is False
+    assert result["coverage"]["output_truncated"] is False
+    assert result["coverage"]["output_omitted_count"] == 0
+    assert result["older_continuation"]
+    assert len(json.dumps(result).encode()) < reads.MAX_RESULT_BYTES
+    request.assert_called_once()
+
+
+def test_output_budget_reclaims_short_rows_share_for_mixed_text_and_media(dm):
+    data = paged_payload(dm)
+    rows = data["messages"]["data"]
+    for row in rows:
+        row["message"] = ""
+    rows[0]["message"] = "Long body " * 600
+    rows[7]["message"] = "Photos"
+    urls = [f"https://cdninstagram.com/{index}?q=" + "z" * 1000 for index in range(3)]
+    rows[7]["attachments"] = {
+        "data": [{"id": str(index), "type": "image", "url": url} for index, url in enumerate(urls)]
+    }
+    rows[12]["message"] = "Short note"
+    result, request = read(dm, data)
+    items = {item["platform_message_id"]: item for item in result["items"]}
+    assert set(items) == {row["id"] for row in rows}
+    for row in rows:
+        item = items[row["id"]]
+        assert item["body"] == row["message"]
+        assert item["occurred_at"] == row["created_time"] and item["direction"] == "outbound"
+        assert item["body_truncated"] is False and item["attachments_truncated"] is False
+    attachments = items[rows[7]["id"]]["attachments"]
+    assert [attachment["url"] for attachment in attachments] == urls
+    assert [attachment["preview_url"] for attachment in attachments] == urls
+    assert result["coverage"]["output_truncated"] is False
+    assert result["coverage"]["output_omitted_count"] == 0
+    assert result["older_continuation"]
+    assert len(json.dumps(result).encode()) < reads.MAX_RESULT_BYTES
+    request.assert_called_once()
+
+
+def test_output_budget_shares_capacity_fairly_when_every_body_is_large(dm):
+    data = paged_payload(dm)
+    result, _ = read(dm, data)
+    items = {item["platform_message_id"]: item for item in result["items"]}
+    assert set(items) == {row["id"] for row in data["messages"]["data"]}
+    for row in data["messages"]["data"]:
+        item = items[row["id"]]
+        assert item["occurred_at"] == row["created_time"] and item["direction"] == "outbound"
+        assert item["body_truncated"] is True and item["attachments_truncated"] is False
+        assert 0 < len(item["body"]) < reads.MAX_BODY_CHARACTERS
+        assert row["message"].startswith(item["body"])
+    lengths = [len(item["body"]) for item in items.values()]
+    assert max(lengths) - min(lengths) <= 1
+    assert result["coverage"]["body_truncated_count"] == reads.PROVIDER_PAGE_LIMIT
+    assert result["coverage"]["output_omitted_count"] == 0
+    assert result["older_continuation"]
+    assert len(json.dumps(result).encode()) < reads.MAX_RESULT_BYTES
+
+
 def test_older_pages_preserve_every_identity_despite_large_bodies_without_writes(dm):
     observed = []
     continuation, page_keys = None, set()

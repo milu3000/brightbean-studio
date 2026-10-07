@@ -545,9 +545,16 @@ def _fit_items(items):
         bases.append(_encoded_size(bare) + 1)
     if sum(bases) > budget:
         raise _ProviderReadError("response_too_large")
-    allowance = (budget - sum(bases)) // max(len(items), 1)
-    for original, base in zip(items, bases, strict=True):
-        remaining = base + allowance
+    demands = [_encoded_size(original) + 1 - base for original, base in zip(items, bases, strict=True)]
+    allowances = bases.copy()
+    surplus = budget - sum(bases)
+    # Satisfy short rows first so their unused shares reach longer rows. Rows
+    # that still need truncation receive equal shares of the remaining space.
+    for position, index in enumerate(sorted(range(len(items)), key=lambda index: demands[index])):
+        allowance = min(demands[index], surplus // (len(items) - position))
+        allowances[index] += allowance
+        surplus -= allowance
+    for original, remaining in zip(items, allowances, strict=True):
         item = deepcopy(original)
         while item["attachments"] and _encoded_size(item) + 1 > remaining:
             item["attachments"].pop()
