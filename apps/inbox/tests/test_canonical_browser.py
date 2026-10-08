@@ -254,6 +254,7 @@ def browser_export(client, owner, settings, tmp_path):
                     "send": url("conversation_send_reply", thread),
                     "save": url("conversation_save_draft", thread),
                     "initialIds": [item["id"] for item in detail.context["canonical_messages"]],
+                    "initialOlderUrl": detail.context["canonical_older_url"],
                     "historyIds": expected_ids,
                     "composerFields": composer_fields(detail),
                     # Export the actual endpoint, including workspace-bound
@@ -364,6 +365,7 @@ def browser_export(client, owner, settings, tmp_path):
         "contentRoutes": contents,
         "viewerCases": viewer_cases,
         "lateImageUrl": LATE_IMAGE,
+        "lateImageId": str(rows[35].pk),
         "freshComposerFields": fresh_fields,
         "conflictHistory": conflict.content.decode(),
         "conflictComposerFields": conflict_fields,
@@ -377,7 +379,7 @@ def browser_export(client, owner, settings, tmp_path):
 def test_canonical_browser_fixture_export(browser_export):
     """Exercise the real synthetic export even when the DOM gate is blocked."""
     destination, manifest = browser_export
-    assert len(manifest["routes"]) >= 22
+    assert all(thread["initialOlderUrl"] in manifest["routes"] for thread in manifest["threads"])
     assert "htmx.min.js" in manifest["routes"][manifest["feed"]]
     assert "alpine.min.js" in manifest["routes"][manifest["feed"]]
     assert "inbox-message-details.js" in manifest["routes"][manifest["feed"]]
@@ -386,11 +388,19 @@ def test_canonical_browser_fixture_export(browser_export):
     assert all("PRIVATE SYNTHETIC RETAINED" not in html for html in manifest["routes"].values())
     panel = manifest["routes"][manifest["threads"][0]["detail"]]
     for item in manifest["viewerCases"]:
+        assert item["id"] in manifest["threads"][0]["initialIds"]
         article = re.search(
             rf'<article[^>]*data-canonical-message="{re.escape(item["id"])}".*?</article>', panel, re.DOTALL
         )
         assert article and f'data-inbox-detail-open="{item["kind"]}"' in article.group()
-    assert f'src="{LATE_IMAGE}"' in "".join(manifest["routes"].values())
+    assert manifest["lateImageId"] in manifest["threads"][0]["historyIds"]
+    assert manifest["lateImageId"] not in manifest["threads"][0]["initialIds"]
+    image_article = re.search(
+        rf'<article[^>]*data-canonical-message="{re.escape(manifest["lateImageId"])}".*?</article>',
+        "".join(manifest["routes"].values()),
+        re.DOTALL,
+    )
+    assert image_article and f'src="{LATE_IMAGE}"' in image_article.group()
     initial, fresh, conflict = (
         manifest["threads"][0]["composerFields"],
         manifest["freshComposerFields"],

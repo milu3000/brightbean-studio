@@ -23,7 +23,6 @@ function validateFixture(fixture) {
     assert.equal(fixture.origin, 'https://canonical.test');
     assert.equal(fixture.threads.length, 2);
     assert(fixture.rowCount > 500, 'Fixture must cross the rendered history bound');
-    assert(Object.keys(fixture.routes).length > 20, 'Fixture must include full history continuation');
     for (const [url, html] of Object.entries(fixture.routes)) {
         assert(url.startsWith('/') && !url.startsWith('//'), `Not a local fixture route: ${url}`);
         assert.equal(typeof html, 'string');
@@ -38,10 +37,13 @@ function validateFixture(fixture) {
         assert(thread.initialIds.length > 1);
         assert.equal(new Set(thread.historyIds).size,thread.historyIds.length,'Expected history IDs are unique');
         assert.deepEqual(thread.initialIds,thread.historyIds.slice(-thread.initialIds.length));
+        assert(thread.initialOlderUrl && fixture.routes[thread.initialOlderUrl],'Each thread exports a usable older-history route');
         assert(thread.initialHistory.includes('data-canonical-page'));
     }
     assert(fixture.routes[fixture.freshPath].includes(fixture.freshId));
     assert.equal(fixture.lateImageUrl,'https://synthetic-browser-fixture.fbcdn.net/fixture/late-image.svg');
+    assert(fixture.threads[0].historyIds.includes(fixture.lateImageId),'Late image belongs to saved fixture history');
+    assert(!fixture.threads[0].initialIds.includes(fixture.lateImageId),'Late image must exercise a prepend');
     assert.deepEqual(fixture.viewerCases.map(item=>item.kind),['body','attachments','retained']);
     const initial=fixture.threads[0].composerFields, fresh=fixture.freshComposerFields, conflict=fixture.conflictComposerFields;
     assert(initial.sendAllowed && fresh.sendAllowed,'Synthetic current owner can send before and after seeing fresh history');
@@ -49,6 +51,7 @@ function validateFixture(fixture) {
     assert.notEqual(initial.observation,fresh.observation); assert.notEqual(initial.scope,fresh.scope);
     assert.equal(initial.revision,fresh.revision); assert.notEqual(fresh.revision,conflict.revision);
     for (const item of fixture.viewerCases) {
+        assert(fixture.threads[0].initialIds.includes(item.id),'Explicit content-viewer target is initially rendered');
         const pages=fixture.contentRoutes[item.path][item.kind];
         assert(pages.length>1,'Each content viewer must exercise signed continuation');
         assert.equal(pages.map(page=>page.payload.body||'').join(''),item.body);
@@ -250,13 +253,32 @@ async function draftHistoryScenario(browser, fixture) {
         await page.click('[data-inbox-quote-cancel]');
         assert.equal(await page.evaluate(`document.querySelector('${selectors.quote}').value`),'');
         await page.click('[data-inbox-quote-target]');
-        const before = await page.evaluate(anchor), count = await page.evaluate(`document.querySelectorAll('${selectors.rows}').length`);
-        await page.click(selectors.older);
-        await page.wait(`document.querySelectorAll('${selectors.rows}').length>${count}`, 'older rows prepended');
-        await page.settle();
-        const prependedOffset = await page.evaluate(anchorOffset(before));
-        assert(Math.abs(prependedOffset-before.offset)<3,
-            `Prepend preserves visible row: ${JSON.stringify({before,after:prependedOffset,geometry:await page.evaluate(geometry)})}`);
+        const before = await page.evaluate(anchor), expectedIds=fixture.threads[0].historyIds, seenCursors=new Set();
+        const lateImage=`[data-canonical-message="${fixture.lateImageId}"] [data-inbox-preview]`;
+        let seenIds=fixture.threads[0].initialIds.slice(), rounds=0;
+        const maxRounds=expectedIds.length-seenIds.length;
+        async function prependHistory(label='older rows prepended') {
+            const cursor=await page.evaluate(`document.querySelector('[data-canonical-page]').dataset.olderUrl`);
+            assert(cursor && !seenCursors.has(cursor),'Late-image traversal has a new older-history cursor');
+            assert(rounds++<maxRounds,'Late-image traversal terminates within the remaining fixture rows');
+            seenCursors.add(cursor);
+            const prior=await page.evaluate(anchor);
+            await page.click(selectors.older);
+            await page.wait(`document.querySelector('[data-canonical-page]').dataset.olderUrl!==${Q(cursor)}`, label);
+            await page.settle();
+            const ids=await page.evaluate(`Array.from(document.querySelectorAll('${selectors.rows}'),row=>row.dataset.canonicalMessage)`);
+            assert(ids.length>seenIds.length,'Each prepend reaches previously unseen messages');
+            assert.equal(new Set(ids).size,ids.length,'Prepended history has no duplicate messages');
+            assert.deepEqual(ids.slice(-seenIds.length),seenIds,'Prepending retains already rendered history');
+            assert.deepEqual(ids,expectedIds.slice(-ids.length),'Prepending advances without gaps or reordering');
+            seenIds=ids;
+            const prependedOffset = await page.evaluate(anchorOffset(prior));
+            assert(Math.abs(prependedOffset-prior.offset)<3,
+                `Prepend preserves visible row: ${JSON.stringify({before:prior,after:prependedOffset,geometry:await page.evaluate(geometry)})}`);
+            assert.equal(await page.evaluate(`document.querySelector('${selectors.input}').value`),text);
+            assert.equal(await page.evaluate(`document.querySelector('${selectors.quote}').value`),quoted);
+        }
+        while (!(await page.evaluate(`!!document.querySelector(${Q(lateImage)})`))) await prependHistory();
         // Loading the lazy image is intentional; otherwise an off-screen lazy
         // image would never exercise late decode and size correction.
         await page.evaluate(`document.querySelectorAll('[data-inbox-preview]').forEach(image=>image.loading='eager')`);
@@ -276,9 +298,7 @@ async function draftHistoryScenario(browser, fixture) {
         assert(page.dialogs.length>0,'Unsaved text invokes actual confirmation dialog');
         assert.equal(await page.evaluate(`document.querySelector('${selectors.panel}').dataset.conversationId`),fixture.threads[0].id);
         assert.equal(await page.evaluate(`document.querySelector('${selectors.input}').value`),text);
-        const cursorAfterCancel=await page.evaluate(`document.querySelector('[data-canonical-page]').dataset.olderUrl`);
-        await page.click(selectors.older);
-        await page.wait(`document.querySelector('[data-canonical-page]').dataset.olderUrl!==${Q(cursorAfterCancel)}`,'declining navigation keeps the current conversation reader active');
+        await prependHistory('declining navigation keeps the current conversation reader active');
         page.acceptDialogs=true; await page.open(fixture.threads[1]);
         await page.clean();
         process.stdout.write('PASS real DOM drafts, quote select/cancel, unsaved navigation, prepend and late image anchor\n');
@@ -333,6 +353,7 @@ async function raceScenario(browser, fixture) {
         assert(!page.posts.some(item=>item.route===a.read),'Stale A must never be read-acknowledged after choosing B');
         page.delays.delete(a.detail); await page.open(a);
         const history = await page.evaluate(`document.querySelector('[data-canonical-page]').dataset.olderUrl`);
+        assert.equal(history,a.initialOlderUrl,'Stale-history race uses an exported continuation route');
         page.delays.set(history,350); await page.click(selectors.older);
         await page.open(b); await delay(450);
         assert.equal(await page.evaluate(`document.querySelector('${selectors.panel}').dataset.conversationId`),b.id);
@@ -407,7 +428,7 @@ async function boundedRefreshScenario(browser, fixture) {
         })()`);
         await page.releaseImages();
         const expectedIds=fixture.threads[0].historyIds, seenCursors=new Set();
-        let seenIds=fixture.threads[0].initialIds.slice(), rounds=0;
+        let seenIds=fixture.threads[0].initialIds.slice(), rounds=0, trimmed=false;
         const maxRounds=expectedIds.length-seenIds.length;
         while (await page.evaluate(`!!document.querySelector('[data-canonical-page]').dataset.olderUrl`)) {
             const cursor = await page.evaluate(`document.querySelector('[data-canonical-page]').dataset.olderUrl`);
@@ -422,12 +443,14 @@ async function boundedRefreshScenario(browser, fixture) {
             const newIds=ids.filter(id=>!seenIds.includes(id));
             assert(newIds.length>0,'Each history page reaches previously unseen messages');
             seenIds=newIds.concat(seenIds);
+            trimmed=trimmed || ids.length<seenIds.length;
             assert.deepEqual(ids,seenIds.slice(0,ids.length),'Rendered history stays in chronological order after trimming');
             assert.deepEqual(seenIds,expectedIds.slice(-seenIds.length),'History advances without gaps or reordering');
             assert(++rounds<=maxRounds,'History continuation terminates within the remaining fixture rows');
         }
         assert.deepEqual(seenIds,expectedIds,'Every saved fixture message is reachable exactly once');
-        assert(rounds>=16,'Read beyond the old500-row cutoff');
+        assert(seenIds.length>500,'Read beyond the old500-row cutoff');
+        assert(trimmed,'History continuation exercises the bounded DOM window');
         assert(await page.evaluate(`document.querySelector('[data-canonical-page]').textContent.includes('Synthetic browser message 0539')`),'Oldest saved row remains reachable');
         await page.evaluate(`document.querySelector('${selectors.scroll}').scrollTop=300`);
         await page.settle(); const oldAnchor=await page.evaluate(anchor);
