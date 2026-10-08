@@ -52,6 +52,16 @@ __all__ = [
     "resolve_legacy_conversation",
 ]
 SALT = "brightbean.canonical-inbox.read.v1"
+_OBSERVATION_SOURCES = frozenset({"poll", "webhook", "app_send", "legacy_backfill"})
+_PARTICIPANT_STATUS = {
+    "participants_pair": "pair_verified",
+    "participants_group": "group_observed",
+    "participants_missing": "missing",
+    "participants_incomplete": "incomplete",
+    "participants_invalid": "invalid",
+    "participant_endpoints_conflict": "conflict",
+    "identity_conflict": "conflict",
+}
 
 
 def _iso(value):
@@ -123,6 +133,20 @@ def _visible_content_query():
     )
 
 
+def _classification(row):
+    """Bounded stored evidence, never reconstructed participants or send proof."""
+    kind = row.conversation_type if row.conversation_type in {"direct", "group"} else "unknown"
+    reason = row.classification_reason if row.classification_reason in _PARTICIPANT_STATUS else "unknown"
+    if kind == "direct" and getattr(row, "peer_ambiguous", False):
+        kind, reason = "unknown", "identity_conflict"
+    if kind == "direct" and reason != "participants_pair":
+        kind = "unknown"
+    status = _PARTICIPANT_STATUS.get(reason, "unknown")
+    if (reason == "participants_pair" and kind != "direct") or (reason == "participants_group" and kind != "group"):
+        status = "unknown"
+    return {"conversation_type": kind, "classification_reason": reason, "participants_status": status}
+
+
 def project_message(row):
     """Internal projection: row must come from the exact shared scoped query."""
     content = visible_content(row, provenance_checked=True)
@@ -140,7 +164,19 @@ def project_message(row):
         attachments.append(value)
     result = {
         "id": str(row.pk),
+        "id_namespace": "canonical_message",
         "conversation_id": str(row.conversation_id) if row.conversation_id else None,
+        "platform_message_id": row.platform_message_id or None,
+        "social_account_id": str(row.social_account_id),
+        "platform": row.platform,
+        **_classification(row),
+        "source": "canonical",
+        "persisted": True,
+        "sources": sorted({value for value in row.sources if isinstance(value, str) and value in _OBSERVATION_SOURCES})
+        if isinstance(row.sources, list)
+        else [],
+        "first_seen_at": _iso(row.first_seen_at),
+        "updated_at": _iso(row.updated_at),
         "direction": row.direction,
         "incoming_generation": row.incoming_generation,
         "sender_name": row.sender_name[:255],
@@ -157,6 +193,14 @@ def project_message(row):
         if body
         else "unknown",
         "content_status": content["content_status"],
+        "content_available": content["available"] and bool(body or any(item.get("url") for item in raw_attachments)),
+        "content_completeness": "unavailable"
+        if not content["available"]
+        else "partial"
+        if content["content_status"] in {"partial", "fields_unavailable", "unsupported"}
+        else "unknown",
+        "media_fetched": False,
+        "platform_media_complete": False,
         "is_deleted": content["is_deleted"],
         "is_expired": content["is_expired"],
         "occurred_at": _iso(row.occurred_at),
@@ -171,6 +215,8 @@ def project_message(row):
     while _size(result) > 10000 and result["body"]:
         result["body"] = result["body"][: len(result["body"]) // 2]
         result["body_truncated"] = True
+    if content["available"] and (result["body_truncated"] or result["attachments_truncated"]):
+        result["content_completeness"] = "partial"
     return result
 
 
@@ -217,15 +263,21 @@ def _conversation(scope, accounts, row):
         .values_list("legacy_message_id", flat=True)
         .first()
     )
+    classification = _classification(row)
     peer_name = (
         (name or row.peer_id)
-        if row.conversation_type == "direct"
+        if classification["conversation_type"] == "direct"
         else "Group conversation"
-        if row.conversation_type == "group"
+        if classification["conversation_type"] == "group"
         else "Conversation (type unknown)"
     )
     return {
         "id": str(row.pk),
+        "id_namespace": "canonical_conversation",
+        "platform_conversation_id": row.platform_conversation_id or None,
+        "identity_kind": row.identity_kind,
+        "source": "canonical",
+        "persisted": True,
         "workspace_id": str(row.workspace_id),
         "social_account_id": str(row.social_account_id),
         "platform": row.platform,
@@ -233,8 +285,8 @@ def _conversation(scope, accounts, row):
         "account_name": account.account_name,
         "account_handle": account.account_handle,
         "peer_name": peer_name,
-        "conversation_type": row.conversation_type,
-        "classification_reason": row.classification_reason,
+        **classification,
+        "sync": _coverage(account),
         "revision": row.revision,
         "incoming_generation": row.incoming_generation,
         "workflow_state": row.workflow_state,
@@ -259,9 +311,13 @@ def _coverage(account):
     ).first()
     return {
         "domain": "dm",
+        "scope": "account_dm_stream",
+        "source": "legacy_poll_stream",
         "status": state.status if state else "unknown",
         "coverage": state.coverage if state else "unknown",
+        "last_attempt_at": _iso(state.last_attempt_at) if state else None,
         "last_success_at": _iso(state.last_success_at) if state else None,
+        "conversation_freshness": "unknown",
         "history_complete": False,
         "unsupported_domains": ["comment", "mention", "review"],
     }
@@ -393,6 +449,7 @@ def list_conversations(
     more = len(rows) > len(consumed)
     return {
         "source": "canonical",
+        "persisted": True,
         "conversations": items,
         "items": items,
         "limit": limit,
@@ -442,9 +499,11 @@ def read_conversation(scope, conversation_id, *, cursor=None, limit=30):
             if stamp is not None:
                 raise CanonicalReadError("stale_cursor", "Undated messages have no chronological position")
             undated = undated.filter(pk__lt=pk)
+    conversation = _conversation(scope, accounts, row)
     result = {
         "source": "canonical",
-        "conversation": _conversation(scope, accounts, row),
+        "persisted": True,
+        "conversation": conversation,
         "messages": [],
         "undated_messages": [],
         "next_cursor": None,
@@ -452,7 +511,7 @@ def read_conversation(scope, conversation_id, *, cursor=None, limit=30):
         "history_complete": False,
         "ordering": "occurred_at_asc",
         "limit": limit,
-        "coverage": _coverage(accounts[row.social_account_id]),
+        "coverage": conversation["sync"],
     }
     unknown_limit = limit if lane == "undated" else min(limit, 5)
     pages = [

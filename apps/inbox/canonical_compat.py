@@ -114,10 +114,11 @@ def _receipt(reply):
 
 
 def _metadata(scope, conversation):
-    from .canonical_reads import _read_state
+    from .canonical_reads import _classification, _read_state
 
     return {
         "source": "canonical",
+        **_classification(conversation),
         "canonical_contract_version": 2,
         "canonical_conversation_id": str(conversation.pk),
         "canonical_api": f"/api/v1/inbox-conversations/{conversation.pk}",
@@ -282,8 +283,6 @@ def read_canonical_incoming_message(scope, message_id):
         "social_account_id": str(row.social_account_id),
         "platform": row.platform,
         "message_type": "dm",
-        "conversation_type": conversation.conversation_type,
-        "classification_reason": conversation.classification_reason,
         "sender_handle": row.sender_id,
         "received_at": _iso(row.occurred_at),
         "created_at": _iso(row.first_seen_at),

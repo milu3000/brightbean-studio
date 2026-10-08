@@ -11,6 +11,8 @@ from django.db.models import Q
 from django.utils import timezone
 from django.utils.crypto import salted_hmac
 
+from providers.meta_inbox_paging import PAGE_LIMITS
+
 from .conversation_policy import capture_allowed
 from .locking import lock_dm_account
 from .models import InboxSyncCheckpoint, InboxSyncConnection
@@ -43,6 +45,7 @@ class PageLease:
     route_contract: str
     auth_fingerprint: str
     content_fields_mode: str = "extended"
+    attempts: int = 0
 
 
 def auth_fingerprint(account):
@@ -191,6 +194,7 @@ def claim_page(checkpoint_id, *, now=None):
         connection.route_contract,
         connection.auth_fingerprint,
         checkpoint.content_fields_mode,
+        checkpoint.attempts,
     )
 
 
@@ -209,6 +213,7 @@ def _current_lease(lease, now):
         lease.participants,
         lease.coverage_from,
         lease.content_fields_mode,
+        lease.attempts,
     )
     current = (
         checkpoint.connection_generation,
@@ -222,6 +227,7 @@ def _current_lease(lease, now):
         tuple(checkpoint.participant_ids),
         checkpoint.coverage_from,
         checkpoint.content_fields_mode,
+        checkpoint.attempts,
     )
     if (
         current != expected
@@ -324,6 +330,7 @@ def fail_page(lease, error, *, now=None):
         "invalid_response",
         "canonical_provenance_unverified",
         "content_fields_unavailable",
+        "page_size_rejected",
     }
     code = error.code if isinstance(error, SyncError) and error.code in stable_codes else "provider_unavailable"
     checkpoint.last_error_code = code
@@ -334,6 +341,10 @@ def fail_page(lease, error, *, now=None):
         # cursor on a later budgeted page; never add an unreserved fallback GET.
         checkpoint.content_fields_mode = "basic"
         checkpoint.content_probe_after = now + timedelta(hours=6)
+        checkpoint.status = "retry"
+    elif code == "page_size_rejected" and lease.attempts < len(PAGE_LIMITS) - 1:
+        # A rejected page advances no data/cursor. The next reserved attempt
+        # decreases its row limit; rejection at the minimum is terminal.
         checkpoint.status = "retry"
     elif code in {"cursor_invalid", "cursor_repeated"} and checkpoint.restarts < MAX_RESTARTS:
         checkpoint.restarts += 1

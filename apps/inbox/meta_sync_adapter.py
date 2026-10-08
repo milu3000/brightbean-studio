@@ -19,6 +19,7 @@ from providers.meta_inbox_content import (
     normalize_attachments,
     polled_message_extra,
 )
+from providers.meta_inbox_paging import PAGE_LIMITS, is_page_size_rejection
 
 from .durable_sync import ROUTE_CONTRACT, capture_permitted
 from .models import InboxSyncCheckpoint, InboxSyncConnection
@@ -70,6 +71,7 @@ def _unsupported_optional_field(error):
 
 def _get(client, account, route, params, *, edge=True, optional_content=False):
     deadline = time.monotonic() + 20.0
+    status_code = None
     try:
         with client.stream(
             "GET",
@@ -77,20 +79,23 @@ def _get(client, account, route, params, *, edge=True, optional_content=False):
             params=params,
             headers={"Authorization": f"Bearer {account.oauth_access_token}", "Accept-Encoding": "identity"},
         ) as response:
+            status_code = response.status_code
             if response.headers.get("Content-Encoding", "identity").lower() not in {"", "identity"}:
                 raise SyncError("invalid_response")
             if response.status_code in {401, 403}:
                 raise SyncError("permission_unavailable")
             if response.status_code == 429:
                 raise SyncError("rate_limited", retry_after=_retry_after(response.headers.get("Retry-After")))
-            if response.status_code != 400 and not 200 <= response.status_code < 300:
+            if response.status_code not in {400, 500} and not 200 <= response.status_code < 300:
                 raise SyncError("provider_unavailable")
             content = bytearray()
             for chunk in response.iter_bytes():
                 if time.monotonic() > deadline:
                     raise SyncError("provider_unavailable")
                 if len(content) + len(chunk) > MAX_BYTES:
-                    raise SyncError("response_too_large")
+                    # Oversized error pages are still transient failures, not
+                    # evidence that a successful provider page is malformed.
+                    raise SyncError("provider_unavailable" if status_code == 500 else "response_too_large")
                 content.extend(chunk)
         data = json.loads(content, object_pairs_hook=_unique_object)
     except SyncError:
@@ -98,10 +103,18 @@ def _get(client, account, route, params, *, edge=True, optional_content=False):
     except httpx.HTTPError:
         raise SyncError("provider_unavailable") from None
     except (ValueError, UnicodeError, RecursionError):
+        if status_code == 500:
+            raise SyncError("provider_unavailable") from None
         raise SyncError("invalid_response") from None
-    if response.status_code == 400:
+    if response.status_code in {400, 500}:
         error = data.get("error") if isinstance(data, dict) else None
         error = error if isinstance(error, dict) else {}
+        if edge and params.get("limit") and is_page_size_rejection(response.status_code, error):
+            # The next fenced, budgeted attempt retries this exact cursor with
+            # fewer rows. No extra GET or reduced content/identity fields here.
+            raise SyncError("page_size_rejected")
+        if response.status_code == 500:
+            raise SyncError("provider_unavailable")
         code = _numeric_code(error.get("code"))
         if code in {10, 102, 190, 200}:
             raise SyncError("permission_unavailable")
@@ -189,6 +202,7 @@ def _current_account(lease):
         scope_key=lease.scope_key,
         context=lease.context,
         content_fields_mode=lease.content_fields_mode,
+        attempts=lease.attempts,
     ).exists():
         raise SyncError("lease_lost")
     return account
@@ -209,15 +223,19 @@ class MetaSyncAdapter:
             if account.platform == "facebook"
             else "https://graph.instagram.com/v25.0"
         )
+        # Reuse the durable per-page retry counter rather than add a schema or
+        # spend unreserved GETs. Other transient retries are also safely smaller;
+        # a successful commit resets the counter for the next provider page.
+        page_limit = PAGE_LIMITS[min(lease.attempts, len(PAGE_LIMITS) - 1)]
         if lease.stream == "conversations":
             route = f"{base}/{quote(account.account_platform_id, safe='')}/conversations"
-            params = {"fields": "id,participants{id}", "limit": 50}
+            params = {"fields": "id,participants{id}", "limit": page_limit}
             if account.platform == "instagram_login":
                 params["platform"] = "instagram"
         else:
             route = f"{base}/{quote(lease.scope_key, safe='')}/messages"
             fields = BASIC_MESSAGE_FIELDS if lease.content_fields_mode == "basic" else CONTENT_MESSAGE_FIELDS
-            params = {"fields": fields + ",to{id}", "limit": 50}
+            params = {"fields": fields + ",to{id}", "limit": page_limit}
         if lease.cursor:
             params["after"] = lease.cursor
         started = timezone.now()
