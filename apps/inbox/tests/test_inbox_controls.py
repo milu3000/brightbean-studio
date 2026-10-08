@@ -125,3 +125,74 @@ def test_shortcut_control_is_only_on_the_reply_form_and_defaults_off(owner_clien
     assert '<input type="checkbox" data-inbox-enter-send>' in html
     assert "Ctrl+Enter to send" in html and "inbox-composer.js" in html
     assert "Reply will be posted on" not in html
+
+
+@pytest.mark.parametrize("identifier_kind", ["malformed", "missing", "foreign"])
+def test_legacy_unavailable_account_filter_has_only_escaped_empty_state(owner_client, inbox_account, identifier_kind):
+    from django.utils.html import escape
+
+    from apps.inbox.tests.test_conversation_presentation import incoming
+    from apps.workspaces.models import Workspace
+
+    local = incoming(inbox_account, "local-private", body="LOCAL DM MUST NOT APPEAR")
+    foreign_workspace = Workspace.objects.create(
+        organization=inbox_account.workspace.organization, name="Foreign workspace"
+    )
+    foreign = SocialAccount.objects.create(
+        workspace=foreign_workspace,
+        platform="facebook",
+        account_platform_id="foreign-native",
+        account_name="FOREIGN ACCOUNT NAME",
+    )
+    incoming(foreign, "foreign-private", body="FOREIGN DM MUST NOT APPEAR")
+    identifier = {
+        "malformed": '"><script>alert("unsafe")</script>',
+        "missing": str(uuid4()),
+        "foreign": str(foreign.pk),
+    }[identifier_kind]
+    response = owner_client.get(feed(inbox_account.workspace), {"account": identifier})
+    html = response.content.decode()
+    assert response.status_code == 200
+    assert response.context["inbox_page"].paginator.count == 0
+    assert response.context["active_filters"]["account"] == [identifier]
+    assert f'value="{escape(identifier)}" selected>Unavailable account' in html
+    assert local.body not in html and "FOREIGN DM MUST NOT APPEAR" not in html
+    assert "FOREIGN ACCOUNT NAME" not in html and "<script>alert" not in html
+
+
+def test_legacy_unavailable_account_in_multi_filter_never_expands_to_visible_account(owner_client, inbox_account):
+    from apps.inbox.tests.test_conversation_presentation import incoming
+
+    original = incoming(inbox_account, "visible-but-not-selected", body="UNSELECTED DM")
+    identifiers = [str(inbox_account.pk), str(uuid4())]
+    response = owner_client.get(feed(inbox_account.workspace), {"account": identifiers}, HTTP_HX_REQUEST="true")
+    assert response.status_code == 200
+    assert response.context["inbox_page"].paginator.count == 0
+    assert response.context["active_filters"]["account"] == identifiers
+    assert original.body not in response.content.decode()
+
+
+def test_legacy_empty_account_option_still_means_all_accounts(owner_client, inbox_account):
+    from apps.inbox.tests.test_conversation_presentation import incoming
+
+    original = incoming(inbox_account, "visible-blank-account")
+    response = owner_client.get(feed(inbox_account.workspace), {"account": ""})
+    assert response.status_code == 200
+    assert [item.pk for item in response.context["inbox_messages"]] == [original.pk]
+
+
+def test_legacy_unavailable_filter_still_rechecks_grants_after_render(owner_client, inbox_account):
+    from apps.inbox import views
+    from apps.members.models import WorkspaceMembership
+
+    actual = views.render
+
+    def revoke_after_render(*args, **kwargs):
+        response = actual(*args, **kwargs)
+        WorkspaceMembership.objects.filter(workspace=inbox_account.workspace).delete()
+        return response
+
+    with patch("apps.inbox.views.render", side_effect=revoke_after_render):
+        response = owner_client.get(feed(inbox_account.workspace), {"account": str(uuid4())})
+    assert response.status_code == 404
+    assert inbox_account.account_name not in response.content.decode()

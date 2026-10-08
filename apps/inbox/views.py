@@ -350,9 +350,17 @@ def inbox_feed(request, workspace_id):
         else "dm"
     )
     scope = session_read_scope(request.user, workspace.pk)
+    accounts = [value for value in request.GET.getlist("account") if value]
     try:
         sources = inbox_sources(scope)
         canonical_mode = any(item["source"] != "legacy" for item in sources)
+        known_source_ids = {item["id"] for item in sources}
+        unavailable_legacy_filter = not canonical_mode and any(
+            str(_valid_uuid(value)) not in known_source_ids for value in accounts
+        )
+        # Preserve the legacy UI's unavailable-filter empty state. An explicit
+        # empty scope is not the unfiltered scope, and cannot expose any rows.
+        selected_account_ids = [] if unavailable_legacy_filter else accounts or None
         domain = request.GET.get("domain", inferred if canonical_mode else "")
         if domain not in {"", "dm", "comment", "mention", "review"}:
             return HttpResponse("Unknown inbox section.", status=400)
@@ -362,7 +370,7 @@ def inbox_feed(request, workspace_id):
         selection = (
             selected_inbox_source(
                 scope,
-                social_account_ids=[value for value in request.GET.getlist("account") if value] or None,
+                social_account_ids=selected_account_ids,
                 platforms=[value for value in request.GET.getlist("platform") if value],
             )
             if reads_dm
@@ -392,6 +400,8 @@ def inbox_feed(request, workspace_id):
     qs = exclude_transport_projections(
         InboxMessage.objects.for_workspace(workspace.id).filter(social_account__workspace=workspace)
     )
+    if unavailable_legacy_filter:
+        qs = qs.none()
     canonical_accounts = [item["id"] for item in sources if item["source"] != "legacy"]
     qs = qs.exclude(message_type="dm", social_account_id__in=canonical_accounts)
     if domain:
@@ -409,7 +419,6 @@ def inbox_feed(request, workspace_id):
     if platforms:
         qs = qs.filter(social_account__platform__in=platforms)
 
-    accounts = [value for value in request.GET.getlist("account") if value]
     if accounts:
         account_ids = [_valid_uuid(value) for value in accounts]
         qs = qs.filter(social_account_id__in=account_ids) if all(account_ids) else qs.none()
@@ -515,7 +524,7 @@ def inbox_feed(request, workspace_id):
             recheck_inbox_source(
                 scope,
                 selection,
-                social_account_ids=accounts or None,
+                social_account_ids=selected_account_ids,
                 platforms=platforms,
             )
     except CanonicalReadError as exc:
