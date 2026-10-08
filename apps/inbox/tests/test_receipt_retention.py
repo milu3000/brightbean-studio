@@ -44,7 +44,7 @@ def test_unknown_reply_prevents_instance_and_queryset_cascades(inbox_message, ta
 
 @pytest.mark.django_db
 @pytest.mark.parametrize("status", ["unknown", "failed"])
-def test_unknown_disconnect_is_refused_before_platform_or_cleanup(inbox_message, user, org_owner, client, status):
+def test_unknown_disconnect_preserves_receipt_and_stops_connection(inbox_message, user, org_owner, client, status):
     account = inbox_message.social_account
     inbox_message.message_type = "dm"
     inbox_message.save(update_fields=["message_type"])
@@ -61,10 +61,10 @@ def test_unknown_disconnect_is_refused_before_platform_or_cleanup(inbox_message,
             ),
             secure=True,
         )
-    assert response.status_code == 409
-    unsubscribe.assert_not_called()
-    provider.assert_not_called()
-    assert SocialAccount.objects.filter(pk=account.pk).exists()
+    assert response.status_code == 302
+    unsubscribe.assert_called_once()
+    provider.assert_called_once()
+    assert SocialAccount.objects.filter(pk=account.pk, connection_status="disconnected").exists()
     assert InboxReply.objects.filter(inbox_message=inbox_message, status=status).exists()
 
 

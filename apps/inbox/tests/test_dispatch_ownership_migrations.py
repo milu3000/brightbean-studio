@@ -137,6 +137,8 @@ def test_reverse_refuses_dispatch_links_even_if_no_ownership_row_survives(inbox_
     assert not DMConversationOwnership.objects.exists()
     with pytest.raises(RuntimeError, match="Cannot reverse"):
         MigrationExecutor(connection).migrate(PREVIOUS)
-    operation.refresh_from_db()
-    assert operation.status == "outcome_unknown"
+    # Later unused migrations may reverse before the ownership guard raises.
+    # Read the protected historical column without asking the current model
+    # for fields already removed by that legitimate partial schema reversal.
+    assert SendOperation.objects.values_list("status", flat=True).get(pk=operation.pk) == "outcome_unknown"
     assert InboxReply.objects.values_list("status", flat=True).get(pk=reply.pk) == "unknown"

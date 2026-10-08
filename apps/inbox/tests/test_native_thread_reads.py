@@ -1466,7 +1466,86 @@ def test_initial_unknown_pagination_keeps_valid_rows_but_cannot_advance(dm, faul
     assert result["older_history_status"] == "unavailable" and result["older_continuation"] is None
 
 
-@pytest.mark.parametrize("platform", ["facebook", "instagram_login"])
+def test_instagram_version_compatibility_keeps_all_requests_on_configured_routes(dm):
+    dm.account.platform = "instagram_login"
+    dm.account.save(update_fields=["platform"])
+    first_data = paged_payload(dm, count=21)
+    older_data = paged_payload(dm, page=1, count=13)
+    for data in (first_data, older_data):
+        data["messages"]["paging"]["next"] = data["messages"]["paging"]["next"].replace("/v25.0/", "/v26.0/")
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        assert request.method == "GET" and request.url.host == "graph.instagram.com"
+        assert "access_token" not in request.url.params and "PRIVATE_NEXT_TOKEN" not in str(request.url)
+        if len(requests) <= 2:
+            assert request.url.path == "/v25.0/conversation-1"
+            assert (
+                request.url.params["fields"] == "id,participants{id},messages.limit(20){" + reads._MESSAGE_FIELDS + "}"
+            )
+            return httpx.Response(200, json=first_data)
+        if len(requests) == 3:
+            assert request.url.path == "/v25.0/conversation-1"
+            assert dict(request.url.params) == {"fields": "id,participants{id}"}
+            return httpx.Response(200, json={"id": older_data["id"], "participants": older_data["participants"]})
+        assert len(requests) == 4 and request.url.path == "/v25.0/conversation-1/messages"
+        assert dict(request.url.params) == {"fields": reads._MESSAGE_FIELDS, "limit": "20", "after": "older-page-1"}
+        return httpx.Response(200, json=older_data["messages"])
+
+    clients = [httpx.Client(transport=httpx.MockTransport(handle), follow_redirects=False) for _ in range(3)]
+    with patch.object(reads.httpx, "Client", side_effect=clients):
+        first = reads.read_native_thread(dm.message, authorization=reads.session_read_authorization(dm.user))
+        assert first["status"] == "observed" and first["older_history_status"] == "available"
+        remainder = reads.read_native_thread(
+            dm.message,
+            authorization=reads.session_read_authorization(dm.user),
+            continuation=first["older_continuation"],
+        )
+        assert remainder["status"] == "observed" and remainder["older_history_status"] == "available"
+        decoded = signing.loads(remainder["older_continuation"], salt=reads.CONTINUATION_SALT)
+        assert decoded["after"] == "older-page-1" and "PRIVATE_NEXT_TOKEN" not in json.dumps(decoded)
+        older = reads.read_native_thread(
+            dm.message,
+            authorization=reads.session_read_authorization(dm.user),
+            continuation=remainder["older_continuation"],
+        )
+    assert len(requests) == 4
+    assert [len(result["items"]) for result in (first, remainder, older)] == [20, 1, 13]
+    observed = [item["platform_message_id"] for result in (first, remainder, older) for item in result["items"]]
+    assert len(observed) == len(set(observed)) == 34
+    assert older["status"] == "observed" and older["older_history_status"] == "available"
+    assert {item["platform_message_id"] for item in older["items"]} == {
+        row["id"] for row in older_data["messages"]["data"]
+    }
+
+
+@pytest.mark.parametrize(
+    "platform,configured,advertised",
+    [
+        ("facebook", "v25.0", "v26.0"),
+        ("instagram_login", "v24.0", "v26.0"),
+        ("instagram_login", "v26.0", "v25.0"),
+        ("instagram_login", "v26.0", "v27.0"),
+        ("instagram_login", "v25.0", "v24.0"),
+        ("instagram_login", "v25.0", "v27.0"),
+    ],
+)
+def test_other_platform_or_version_pairs_do_not_gain_cursor_compatibility(dm, platform, configured, advertised):
+    dm.account.platform = platform
+    host = "graph.facebook.com" if platform == "facebook" else "graph.instagram.com"
+    paging = {
+        "cursors": {"after": "older-page-1"},
+        "next": f"https://{host}/{advertised}/conversation-1/messages?after=older-page-1",
+    }
+    with patch.object(reads, "_native_api_base", return_value=f"https://{host}/{configured}"):
+        assert reads._supported_older_cursor(paging, dm.account, "conversation-1") is None
+
+
+@pytest.mark.parametrize(
+    "platform,advertised_version",
+    [("facebook", "v25.0"), ("instagram_login", "v25.0"), ("instagram_login", "v26.0")],
+)
 @pytest.mark.parametrize(
     "fault",
     [
@@ -1474,6 +1553,12 @@ def test_initial_unknown_pagination_keeps_valid_rows_but_cannot_advance(dm, faul
         "other_provider_host",
         "wrong_thread",
         "wrong_version",
+        "encoded_thread",
+        "encoded_edge",
+        "encoded_version",
+        "extra_thread",
+        "wrong_edge",
+        "trailing_slash",
         "nested_shape",
         "userinfo",
         "fragment",
@@ -1485,12 +1570,12 @@ def test_initial_unknown_pagination_keeps_valid_rows_but_cannot_advance(dm, faul
         "raw_newline",
     ],
 )
-def test_older_cursor_requires_provider_evidence_of_exact_supported_route(dm, platform, fault):
+def test_older_cursor_requires_provider_evidence_of_exact_supported_route(dm, platform, advertised_version, fault):
     dm.account.platform = platform
     dm.account.save(update_fields=["platform"])
     data = paged_payload(dm)
     host = "graph.facebook.com" if platform == "facebook" else "graph.instagram.com"
-    route = f"https://{host}/v25.0/conversation-1/messages"
+    route = f"https://{host}/{advertised_version}/conversation-1/messages"
     url = route + "?after=older-page-1&access_token=PRIVATE_NEXT_TOKEN"
     if fault == "external_host":
         url = url.replace(host, "evil.example")
@@ -1499,7 +1584,19 @@ def test_older_cursor_requires_provider_evidence_of_exact_supported_route(dm, pl
     elif fault == "wrong_thread":
         url = url.replace("conversation-1/messages", "foreign-thread/messages")
     elif fault == "wrong_version":
-        url = url.replace("v25.0", "v99.0")
+        url = url.replace(advertised_version, "v99.0")
+    elif fault == "encoded_thread":
+        url = url.replace("conversation-1", "%63onversation-1")
+    elif fault == "encoded_edge":
+        url = url.replace("/messages?", "/%6dessages?")
+    elif fault == "encoded_version":
+        url = url.replace("/v", "/%76")
+    elif fault == "extra_thread":
+        url = url.replace("/conversation-1/messages", "/conversation-1/other-thread/messages")
+    elif fault == "wrong_edge":
+        url = url.replace("/messages?", "/comments?")
+    elif fault == "trailing_slash":
+        url = url.replace("/messages?", "/messages/?")
     elif fault == "nested_shape":
         url = url.replace("/messages?", "?fields=messages&")
     elif fault == "userinfo":

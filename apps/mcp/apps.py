@@ -15,7 +15,14 @@ class McpConfig(AppConfig):
         # first. Import-side-effects only.
         from django.db.models.signals import post_migrate
 
-        from apps.mcp import conversation_tools, dispatch_tools, handlers, reply_coordination_tools  # noqa: F401
+        from apps.mcp import (  # noqa: F401
+            composer_tools,
+            conversation_tools,
+            dispatch_tools,
+            events_canonical,
+            handlers,
+            reply_coordination_tools,
+        )
 
         post_migrate.connect(self._register_tasks, sender=self)
 

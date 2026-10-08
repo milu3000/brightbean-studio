@@ -11,6 +11,22 @@ class NotificationsConfig(AppConfig):
 
         post_migrate.connect(self._register_tasks, sender=self)
 
+        from importlib import import_module
+
+        from .inbox import on_canonical_content_restricted, on_canonical_incoming
+
+        for module_name, signal_name, receiver in [
+            ("apps.inbox.conversation_workflow", "canonical_incoming_observed", on_canonical_incoming),
+            ("apps.inbox.sync_observations", "canonical_content_restricted", on_canonical_content_restricted),
+        ]:
+            try:
+                module = import_module(module_name)
+            except ModuleNotFoundError as exc:
+                if exc.name != module_name:
+                    raise
+            else:
+                getattr(module, signal_name).connect(receiver, dispatch_uid=f"notifications.{signal_name}.v1")
+
     @staticmethod
     def _register_tasks(sender, **kwargs):
         from apps.common.background import register_recurring_task

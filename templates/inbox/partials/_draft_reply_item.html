@@ -14,21 +14,21 @@
         <span class="text-[11px] text-stone-500">{% if draft.author %}{{ draft.author.get_short_name|default:draft.author.email }}{% else %}Your team{% endif %}</span>
         <span class="text-[11px] text-stone-400 ml-auto">{{ draft.created_at|timesince }} ago</span>
     </div>
-    {% if draft.is_follow_up or draft.follow_up_of_id %}<p class="text-[10px] text-stone-500 mb-1">{% if draft.follow_up_of_id %}Additional reply after: {{ draft.follow_up_of.body|truncatewords:16 }}{% else %}Additional reply · original sent reply unavailable{% endif %}</p>{% endif %}
-    {% if conversation_view %}<p class="text-[10px] text-stone-500 mb-1">Reply to {{ draft.inbox_message.sender_name }} · {{ draft.inbox_message.received_at|date:"N j, Y g:i A" }} · {{ draft.inbox_message.content_preview|truncatewords:12 }}</p>{% endif %}
-    <p class="text-[13px] text-stone-700 leading-relaxed whitespace-pre-wrap">{{ draft.body }}</p>
-    {% if draft.can_edit %}
+    {% if draft.is_follow_up or draft.follow_up_of_id %}<p class="text-[10px] text-stone-500 mb-1">{% if draft.follow_up_of_id %}Additional reply after: {{ draft.follow_up_of.display_body|truncatewords:16 }}{% else %}Additional reply · original sent reply unavailable{% endif %}</p>{% endif %}
+    {% if conversation_view %}<p class="text-[10px] text-stone-500 mb-1">Reply to {{ draft.inbox_message.sender_name }} · <time datetime="{{ draft.inbox_message.received_at|date:'c' }}">{{ draft.inbox_message.received_at|date:"N j, Y g:i A" }}</time> · {{ draft.display_target.content_preview|truncatewords:12 }}</p>{% endif %}
+    <p class="text-[13px] text-stone-700 leading-relaxed whitespace-pre-wrap">{% if draft.content_expired %}Message content expired{% elif not draft.content_available %}Message unavailable{% else %}{{ draft.display_body }}{% endif %}</p>
+    {% if draft.can_edit and draft.content_available %}
     <form x-show="editing" x-cloak hx-post="{% url 'inbox:update_reply_draft' workspace_id=workspace.id reply_id=draft.id %}"
           hx-target="#inbox-detail-panel" hx-swap="innerHTML" hx-sync="#inbox-detail-panel:drop" class="mt-2">
         {% csrf_token %}<input type="hidden" name="panel_message_id" value="{{ message.id }}">
         <label for="draft-body-{{ draft.id }}" class="text-[11px] text-stone-600">Edit this draft</label>
-        <textarea id="draft-body-{{ draft.id }}" name="body" rows="3" required class="w-full border rounded p-2 text-[13px]">{{ draft.body }}</textarea>
+        <textarea id="draft-body-{{ draft.id }}" name="body" rows="3" required class="w-full border rounded p-2 text-[13px]">{{ draft.display_body }}</textarea>
         <button type="submit" class="text-[12px] font-semibold underline">Save changes</button>
         <button type="button" @click="editing = false; $el.closest('form').reset()" class="text-[12px] ml-3">Cancel</button>
     </form>
     {% endif %}
     {% if draft.status == 'failed' and draft.send_error and not draft.is_unresolved %}
-    <p class="text-[11px] text-red-700 mt-1">Last attempt failed: {{ draft.display_error|default:draft.send_error }}</p>
+    <p class="text-[11px] text-red-700 mt-1">Last attempt failed: {{ draft.display_error }}</p>
     {% endif %}
     {% if draft.status == "unknown" or draft.is_unresolved %}
     <p class="text-[11px] text-red-700 mt-1">{{ draft.send_availability.reason|default:draft.display_error }}</p>
@@ -50,7 +50,7 @@
                 style="background: var(--primary); box-shadow: var(--shadow-primary);">
             {% if draft.status == 'failed' %}Retry send{% else %}Send{% endif %}
         </button>
-        {% if draft.can_edit %}
+        {% if draft.can_edit and draft.content_available %}
         <button type="button" @click="editing = !editing" class="text-[11px] font-medium underline">Edit</button>
         <button hx-post="{% url 'inbox:discard_reply_draft' workspace_id=workspace.id reply_id=draft.id %}"
                 hx-vals='{"panel_message_id": "{{ message.id }}"}' hx-sync="#inbox-detail-panel:drop"

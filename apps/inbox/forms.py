@@ -37,10 +37,6 @@ class StatusForm(forms.Form):
     status = forms.ChoiceField(choices=InboxMessage.Status.choices)
 
 
-class SentimentForm(forms.Form):
-    sentiment = forms.ChoiceField(choices=InboxMessage.Sentiment.choices)
-
-
 class BulkActionForm(forms.Form):
     message_ids = forms.CharField()
     action = forms.ChoiceField(

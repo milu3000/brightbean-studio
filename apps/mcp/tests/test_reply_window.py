@@ -134,8 +134,8 @@ def test_window_rechecked_after_credentials_resolution(context, message):
     assert not InboxReply.objects.filter(status="sent").exists()
 
 
-def test_explicit_human_service_path_keeps_human_agent_behavior(message, context):
-    from apps.inbox.dm_send_gate import session_send_authorization
+def test_explicit_human_service_path_cannot_infer_human_agent_approval(message, context):
+    from apps.inbox.dm_send_gate import DMSendGateError, session_send_authorization
 
     message.received_at = NOW - timedelta(hours=30)
     message.save(update_fields=["received_at"])
@@ -145,13 +145,17 @@ def test_explicit_human_service_path_keeps_human_agent_behavior(message, context
     with (
         patch("apps.inbox.services.timezone.now", return_value=NOW),
         patch("apps.inbox.services.get_provider", return_value=provider),
+        pytest.raises(DMSendGateError) as held,
     ):
         send_reply_now(
             reply,
             actor=context["membership"].user,
             authorization=session_send_authorization(context["membership"].user),
         )
-    assert provider.reply_to_message.call_args.kwargs["human_agent"] is True
+    assert held.value.code == "human_agent_permission_unverified"
+    provider.reply_to_message.assert_not_called()
+    reply.refresh_from_db()
+    assert reply.status == "draft" and reply.send_generation == 0
 
 
 def test_naive_timestamp_is_not_guessed(message):

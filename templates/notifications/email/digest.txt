@@ -1,7 +1,7 @@
 {{ heading }}
 {{ date|date:"N j, Y" }} - {{ total }} item{{ total|pluralize }}
 {% for n in notifications %}
-- {{ n.title }}{% if n.body %}: {{ n.body|truncatewords:20 }}{% endif %} ({{ n.created_at|timesince }} ago)
+- {{ n.title }}{% if n.display_body %}: {{ n.display_body|truncatewords:20 }}{% endif %} ({{ n.created_at|timesince }} ago)
 {% endfor %}{% if overflow %}
 ...and {{ overflow }} more.
 {% endif %}

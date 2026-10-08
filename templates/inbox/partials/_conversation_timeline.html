@@ -5,21 +5,21 @@
 </aside>
 {% endif %}
 {% if history_page.paginator.num_pages > 1 %}
-<noscript>
+{% if not public_thread_view %}<noscript>{% endif %}
 <nav class="flex items-center justify-between gap-3 text-[12px] mb-3" aria-label="Conversation history pages">
     {% if history_page.has_next %}
     <a href="{% url 'inbox:message_detail' workspace_id=workspace.id message_id=message.id %}?history_page={{ history_page.next_page_number }}"
        hx-get="{% url 'inbox:message_detail' workspace_id=workspace.id message_id=message.id %}?history_page={{ history_page.next_page_number }}"
        hx-target="#inbox-thread" hx-sync="#inbox-detail-panel:queue last" class="underline">Older messages</a>
     {% endif %}
-    <span>{{ history_page.start_index }}–{{ history_page.end_index }} of {{ history_page.paginator.count }} stored events, newest first by page</span>
+    <span>{{ history_page.start_index }}–{{ history_page.end_index }} of {{ history_page.paginator.count }} messages</span>
     {% if history_page.has_previous %}
     <a href="{% url 'inbox:message_detail' workspace_id=workspace.id message_id=message.id %}?history_page={{ history_page.previous_page_number }}"
        hx-get="{% url 'inbox:message_detail' workspace_id=workspace.id message_id=message.id %}?history_page={{ history_page.previous_page_number }}"
        hx-target="#inbox-thread" hx-sync="#inbox-detail-panel:queue last" class="underline">Newer messages</a>
     {% endif %}
 </nav>
-</noscript>
+{% if not public_thread_view %}</noscript>{% endif %}
 {% endif %}
 <div data-stored-timeline-events data-timeline-anchor-id="{{ message.id }}"
      data-timeline-page-key="{{ history_page_key|default:'initial' }}"
@@ -32,7 +32,6 @@
      data-event-direction="{{ event.direction }}" data-event-time="{{ event.occurred_at }}"
      data-stored-order="{{ forloop.counter0 }}"
      class="{% if event.direction == 'outbound' %}ml-auto w-[90%] md:w-[85%]{% elif event.direction == 'inbound' %}mr-auto w-[90%] md:w-[85%]{% else %}mx-auto w-full{% endif %}">
-{% ifchanged event.timestamp.date %}<p data-timeline-day-label class="text-[11px] text-stone-500 text-center py-2">{{ event.timestamp|date:"l, N j, Y" }}</p>{% endifchanged %}
 {% if event.kind == "incoming" %}
 {% include "inbox/partials/_incoming_item.html" with incoming=event.item %}
 {% elif event.kind == "reply" %}
@@ -43,4 +42,3 @@
 </div>
 {% endfor %}
 </div>
-<p class="text-[10px] text-stone-400 pt-3">Saved BrightBean history stays here. Platform observations in this view are temporary; earlier or external activity may still be missing.</p>

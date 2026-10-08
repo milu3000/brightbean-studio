@@ -8,6 +8,7 @@ from typing import Any
 from background_task import background
 from django.conf import settings
 from django.db import transaction
+from django.db.models import Q
 from django.utils import timezone
 
 from apps.common import quota
@@ -22,7 +23,6 @@ from providers.meta_inbox_content import is_deleted_content, merge_message_extra
 
 from .locking import lock_dm_account
 from .models import InboxMessage, InboxSLAConfig
-from .sentiment import analyze_sentiment
 
 logger = logging.getLogger(__name__)
 
@@ -166,6 +166,7 @@ def resolve_related_posts(account, messages) -> dict[str, Any]:
         platform_post_id: pk
         for platform_post_id, pk in PlatformPost.objects.filter(
             social_account=account,
+            post__workspace_id=account.workspace_id,
             platform_post_id__in=post_ids,
         ).values_list("platform_post_id", "id")
     }
@@ -181,6 +182,9 @@ class InboxSyncEngine:
         and the recurring ``run_inbox_sync_cycle`` background task, so the two
         never diverge.
         """
+        from .sync_scheduler import run_sync_cycle
+
+        run_sync_cycle()
         self.sync_all()
         self.check_sla()
 
@@ -342,6 +346,7 @@ class InboxSyncEngine:
 
         last_msg = (
             InboxMessage.objects.filter(social_account=account)
+            .exclude(Q(extra__has_key="transport_projection") & Q(extra__transport_projection=True))
             .order_by("-received_at")
             .values_list("received_at", flat=True)
             .first()
@@ -352,7 +357,10 @@ class InboxSyncEngine:
         # arrives at once — and would notify every owner and manager for each
         # one. A type we have never seen before is a backlog by definition.
         seen_types = set(
-            InboxMessage.objects.filter(social_account=account).values_list("message_type", flat=True).distinct()
+            InboxMessage.objects.filter(social_account=account)
+            .exclude(Q(extra__has_key="transport_projection") & Q(extra__transport_projection=True))
+            .values_list("message_type", flat=True)
+            .distinct()
         )
 
         # One tally per account. The provider accumulates, so without this an
@@ -394,7 +402,14 @@ class InboxSyncEngine:
                     elif account.inbox_initial_backfill_cursor:
                         next_page_token = account.inbox_initial_backfill_cursor
             else:
-                messages = provider.get_messages(access_token=account.oauth_access_token, since=since)
+                from .sync_identity import canonical_owns_account
+
+                if canonical_owns_account(account):
+                    from .sync_scheduler import public_messages_only
+
+                    messages = public_messages_only(account, provider, since)
+                else:
+                    messages = provider.get_messages(access_token=account.oauth_access_token, since=since)
         except NotImplementedError:
             finish_sync(
                 account,
@@ -608,14 +623,34 @@ class InboxSyncEngine:
         # ordinary polls may be silent and still observe live inbound work.
         if source not in {"poll", "legacy_backfill"}:
             raise ValueError("Unsupported inbox poll source.")
-        message_id = str(msg.platform_message_id or "").strip()
+        if msg.message_type in {"comment", "mention"}:
+            from .public_threads import public_native_id
+
+            message_id = public_native_id(msg.platform_message_id)
+        else:
+            message_id = str(msg.platform_message_id or "").strip()
         if not message_id:
             return
+        expected_identity = (account.platform, account.account_platform_id, account.webhook_target_id)
+        account = lock_dm_account(account.pk, account.workspace_id)
+        if (
+            account is None
+            or (account.platform, account.account_platform_id, account.webhook_target_id) != expected_identity
+            or account.connection_status != "connected"
+        ):
+            return
         if msg.message_type == InboxMessage.MessageType.DM:
-            expected_platform = account.platform
-            account = lock_dm_account(account.pk, account.workspace_id)
-            if account is None or account.platform != expected_platform:
+            from .sync_identity import canonical_owns_account
+
+            if canonical_owns_account(account):
                 return
+        existing_scope = (
+            InboxMessage.objects.filter(social_account_id=account.pk, platform_message_id=message_id)
+            .values_list("workspace_id", flat=True)
+            .first()
+        )
+        if existing_scope is not None and existing_scope != account.workspace_id:
+            return
         ledger = None
         if msg.message_type == InboxMessage.MessageType.DM:
             from .conversations import link_legacy_message, upsert_conversation_message
@@ -643,10 +678,19 @@ class InboxSyncEngine:
             "extra": msg.extra,
         }
         if related_post_id:
-            defaults["related_post_id"] = related_post_id
+            from apps.composer.models import PlatformPost
+
+            if PlatformPost.objects.filter(
+                pk=related_post_id, social_account=account, post__workspace_id=account.workspace_id
+            ).exists():
+                defaults["related_post_id"] = related_post_id
 
         if msg.message_type == InboxMessage.MessageType.DM:
             previous = InboxMessage.objects.filter(social_account=account, platform_message_id=message_id).first()
+            from .canonical_send_target import is_transport_projection
+
+            if previous is not None and (is_transport_projection(previous) or previous.message_type != "dm"):
+                return
             defaults["extra"] = merge_message_extra(previous.extra if previous else {}, msg.extra)
             if is_deleted_content(defaults["extra"]):
                 if previous is None:
@@ -656,6 +700,10 @@ class InboxSyncEngine:
                 defaults["body"] = ""
             elif previous and not msg.text:
                 defaults["body"] = previous.body
+        if msg.message_type in {"comment", "mention"}:
+            from .public_threads import public_upsert_defaults
+
+            defaults = public_upsert_defaults(None, defaults)
         create_defaults = dict(defaults)
         if msg.message_type == InboxMessage.MessageType.DM:
             # Duplicate polls must not rewrite the original inbound timestamp
@@ -678,23 +726,26 @@ class InboxSyncEngine:
             if not created:
                 if obj.message_type == InboxMessage.MessageType.DM:
                     return
+                if {obj.message_type, msg.message_type} <= {"comment", "mention"}:
+                    from .public_threads import public_upsert_defaults
+
+                    defaults = public_upsert_defaults(obj, defaults)
+                elif obj.message_type != msg.message_type:
+                    return
                 for field, value in defaults.items():
                     setattr(obj, field, value)
                 obj.save(update_fields=list(defaults))
         if msg.message_type == InboxMessage.MessageType.DM:
             link_legacy_message(ledger, obj)
-        if created:
-            obj.sentiment = analyze_sentiment(obj.body)
-            obj.save(update_fields=["sentiment"])
-            if notify:
-                if obj.message_type == InboxMessage.MessageType.DM:
-                    from apps.mcp.events import enqueue_inbox_event
+        if created and notify:
+            if obj.message_type == InboxMessage.MessageType.DM:
+                from apps.mcp.events import enqueue_inbox_event
 
-                    # Persist the outbox in this transaction, not on_commit:
-                    # a failed enqueue must roll back the inbox row too, or a
-                    # retry would see a duplicate and permanently lose its event.
-                    enqueue_inbox_event(obj)
-                self._notify_new_message(obj)
+                # Persist the outbox in this transaction, not on_commit:
+                # a failed enqueue must roll back the inbox row too, or a
+                # retry would see a duplicate and permanently lose its event.
+                enqueue_inbox_event(obj)
+            self._notify_new_message(obj)
 
     def _notify_new_message(self, message):
         """Send notification for a new inbox message."""
@@ -707,10 +758,11 @@ class InboxSyncEngine:
             ).select_related("user")
             users = [m.user for m in memberships]
 
-        for user in users:
+        for user in sorted(users, key=lambda actor: str(actor.pk)):
             notify(
                 user=user,
                 event_type=EventType.NEW_INBOX_MESSAGE,
+                inbox_incoming=True,
                 title=f"New {message.type_display} from {message.sender_name}",
                 body=message.body[:200],
                 data={
@@ -727,11 +779,15 @@ class InboxSyncEngine:
 
         for config in configs:
             threshold = timezone.now() - timedelta(minutes=config.target_response_minutes)
-            overdue_messages = InboxMessage.objects.filter(
-                workspace=config.workspace,
-                status__in=[InboxMessage.Status.UNREAD, InboxMessage.Status.OPEN],
-                received_at__lte=threshold,
-            ).exclude(extra__has_key="sla_notified")
+            overdue_messages = (
+                InboxMessage.objects.filter(
+                    workspace=config.workspace,
+                    status__in=[InboxMessage.Status.UNREAD, InboxMessage.Status.OPEN],
+                    received_at__lte=threshold,
+                )
+                .exclude(extra__has_key="sla_notified")
+                .exclude(Q(extra__has_key="transport_projection") & Q(extra__transport_projection=True))
+            )
 
             for message in overdue_messages:
                 self._notify_sla_overdue(message, config)

@@ -1,0 +1,7 @@
+<div class="canonical-panel" data-inbox-panel data-canonical-panel data-source="canonical" data-conversation-id="{{ canonical_conversation.id }}" data-read-ack-url="{% url 'inbox:conversation_read_ack' workspace_id=workspace.id conversation_id=canonical_conversation.id %}">
+<a href="{% url 'inbox:feed' workspace_id=workspace.id %}" data-inbox-back data-canonical-back class="md:hidden px-4 py-2 text-sm border-b">Back to inbox</a>
+{% include "inbox/partials/_canonical_header.html" %}
+<div class="px-4 py-1 text-[11px] flex gap-3"><button type="button" data-canonical-refresh>Refresh</button><button type="button" data-canonical-latest hidden>Latest</button></div>
+<div class="canonical-scroller" data-canonical-scroll><p data-canonical-history-status role="status" aria-live="polite"></p><button type="button" data-canonical-load="dated" {% if not canonical_older_url %}hidden{% endif %}>Earlier messages</button>{% include "inbox/partials/_canonical_history.html" %}<button type="button" data-canonical-load="undated" {% if not canonical_undated_url %}hidden{% endif %}>More messages without a time</button></div>
+{% include "inbox/partials/_canonical_composer.html" %}
+</div>

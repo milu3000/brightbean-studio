@@ -78,11 +78,23 @@ def sidebar_context(request):
     # Unread inbox count for sidebar badge
     sidebar_unread_inbox_count = 0
     if workspace:
+        from apps.inbox.canonical_compat import hold_legacy_fallback
+        from apps.inbox.canonical_reads import CanonicalReadError, session_read_scope, unread_conversation_count
+        from apps.inbox.canonical_send_target import exclude_transport_projections
+        from apps.inbox.canonical_views import enabled as canonical_enabled
         from apps.inbox.models import InboxMessage
 
-        sidebar_unread_inbox_count = (
-            InboxMessage.objects.for_workspace(workspace.id).filter(status=InboxMessage.Status.UNREAD).count()
-        )
+        try:
+            scope = session_read_scope(request.user, workspace.pk)
+            if canonical_enabled():
+                sidebar_unread_inbox_count = unread_conversation_count(scope)
+            else:
+                hold_legacy_fallback(scope)
+                sidebar_unread_inbox_count = exclude_transport_projections(
+                    InboxMessage.objects.for_workspace(workspace.id).filter(status=InboxMessage.Status.UNREAD)
+                ).count()
+        except CanonicalReadError:
+            sidebar_unread_inbox_count = 0
 
     # Pending approval count for badge
     sidebar_pending_approvals = 0

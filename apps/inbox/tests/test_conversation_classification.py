@@ -367,4 +367,9 @@ def test_classification_reverse_refuses_existing_ownership(owned, restore_migrat
         MigrationExecutor(connection).migrate(
             [("inbox", "0008_dmsendattempt_operation_sendoperation_attempt_and_more")]
         )
-    assert InboxConversation.objects.get(pk=owned.row.conversation_id).conversation_type == "direct"
+    # A refused reverse can already have reversed later additive migrations.
+    # Read only the historical column whose preservation this test asserts.
+    assert (
+        InboxConversation.objects.filter(pk=owned.row.conversation_id).values_list("conversation_type", flat=True).get()
+        == "direct"
+    )

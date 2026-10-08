@@ -1,6 +1,6 @@
 {{ notification.title }}
 
-{{ notification.body }}
+{{ notification.display_body }}
 
 {% if notification.data.action_url %}View details: {{ notification.data.action_url }}{% endif %}
 

@@ -37,6 +37,7 @@ class Element {
         return '<' + this.tagName + attrs + (this.hidden ? ' hidden' : '') + '>' + this.innerHTML + '</' + this.tagName + '>';
     }
     getAttribute(name) { return this[name === 'datetime' ? 'dateTime' : name] || null; }
+    setAttribute(name, value) { this[name] = value; }
     get firstChild() { return this.children[0] || null; }
     get parentNode() { return this.parent; }
     replaceChild(replacement, previous) { this.insertBefore(replacement, previous); previous.remove(); }
@@ -238,9 +239,9 @@ test('opening reads once, scrolls latest, and repeated lifecycle events never du
     assert.equal(app.scroller.scrollTop, app.scroller.scrollHeight);
     assert.equal(app.root.querySelector('[data-native-thread-items]'), null, 'No parallel message list');
     assert.equal(nativeCards(app).length, 1); assert.equal(app.button.hidden, true);
-    assert.match(app.status.textContent, /not saved.*incomplete or already out of date/);
-    assert.match(app.status.textContent, /does not establish who sent/);
-    assert.match(app.warning.textContent, /newer account-side/);
+    assert.doesNotMatch(app.status.textContent, /not saved|temporary|Read at/);
+    assert.doesNotMatch(app.status.textContent, /does not establish who sent/);
+    assert.match(app.warning.textContent, /Newer account activity/);
 });
 
 test('one chronological timeline keeps inbound left and account-side right, including newest native beyond old stored page', async () => {
@@ -257,7 +258,7 @@ test('one chronological timeline keeps inbound left and account-side right, incl
     assert.match(nativeCards(app)[1].parent.className, /justify-start/);
     assert.match(nativeCards(app)[2].parent.className, /justify-end/);
     assert.equal(app.outside.parent, app.history); assert.equal(app.footer.parent, app.history);
-    assert.match(app.status.textContent, /gaps may remain/);
+    assert.doesNotMatch(app.status.textContent, /gaps may remain/);
 });
 
 test('unique exact provider ID and direction produce one bubble; richer media supplement does not repeat body', async () => {
@@ -267,8 +268,8 @@ test('unique exact provider ID and direction produce one bubble; richer media su
     await resolve(app, 0, snapshot([item]));
     assert.equal(nativeCards(app).length, 0);
     assert.equal(app.timeline.textContent.split('Stored sent reply').length - 1, 1);
-    assert.match(app.timeline.textContent, /Also observed on platform · same message ID/);
-    assert.match(app.timeline.textContent, /Additional media observed on platform/);
+    assert.doesNotMatch(app.timeline.textContent, /Also observed on platform · same message ID/);
+    assert.doesNotMatch(app.timeline.textContent, /Additional media observed on platform/);
     assert.equal(app.timeline.querySelector('a').href, 'https://example.com/photo.jpg');
     assert.equal(eventOrder(app).length, 3);
 });
@@ -360,7 +361,7 @@ test('upward threshold loads one scoped saved page, prepends only events, dedupl
     assert.doesNotMatch(app.timeline.textContent, /Duplicate local row|Do not import/);
     assert.equal(nativeCards(app).length, 1); assert.equal(app.timeline.dataset.olderUrl, '');
     assert.deepEqual(app.timeline.querySelectorAll('[data-timeline-event="stored"]').map(row => row.dataset.storedOrder), ['0', '1', '2', '3']);
-    assert.match(app.pageStatus.textContent, /Beginning of saved history.*Platform history may still be incomplete/);
+    assert.equal(app.pageStatus.textContent, '');
     app.scroll(0); assert.equal(app.requests.length, 2);
 });
 
@@ -369,7 +370,7 @@ test('a newly loaded saved exact match merges an existing native card without du
     assert.equal(nativeCards(app).length, 1); app.scroll(50);
     await resolve(app, 1, app.page([stored('older', 'outbound', '2026-10-05T08:00:00Z', 'Old platform answer')]));
     assert.equal(nativeCards(app).length, 0); assert.equal(app.timeline.textContent.split('Old platform answer').length - 1, 1);
-    assert.match(app.timeline.textContent, /Also observed on platform/);
+    assert.doesNotMatch(app.timeline.textContent, /Also observed on platform/);
 });
 
 test('loading the uniquely identified selected saved incoming removes its outside-history duplicate', async () => {
@@ -493,14 +494,14 @@ test('text and media titles remain literal and unsafe links retain a truthful fa
     await resolve(app, 0, { ...snapshot([item]), more_available: true });
     assert.match(app.timeline.textContent, /<img src=x onerror=alert\(1\)>/); assert.match(app.timeline.textContent, /<script>bad\(\)<\/script>/);
     assert.equal(app.timeline.querySelector('img'), null); assert.equal(app.timeline.querySelector('script'), null);
-    assert.match(app.timeline.textContent, /Media unavailable/); assert.match(app.timeline.textContent, /shortened in this view/);
-    assert.match(app.status.textContent, /no earlier platform page is available/);
+    assert.match(app.timeline.textContent, /Content unavailable/); assert.match(app.timeline.textContent, /shortened in this view/);
+    assert.match(app.status.textContent, /Earlier messages could not be loaded/);
     assert.equal(app.timeline.querySelector('a').rel, 'noopener noreferrer');
 });
 
 test('network errors, invalid source and wrong anchor show no content and preserve drafts with retry', async () => {
     const app = setup(); app.requests[0].reject(new Error('PRIVATE RAW ERROR')); await flush();
-    assert.match(app.status.textContent, /draft and saved history are still here/); assert.doesNotMatch(app.status.textContent, /PRIVATE RAW/);
+    assert.match(app.status.textContent, /Messages could not be loaded/); assert.doesNotMatch(app.status.textContent, /PRIVATE RAW/);
     assert.equal(app.button.hidden, false); app.click(app.button);
     await resolve(app, 1, { ...snapshot(), anchor_message_id: 'wrong' }); assert.equal(nativeCards(app).length, 0);
     app.click(app.button); const item = native('bad', 'Unverified contents'); delete item.source;
@@ -518,7 +519,7 @@ test('auth revocation and unavailable results show clear reasons without platfor
 
 test('empty result never claims no reply exists, and empty body/media stays unverified', async () => {
     const app = setup(); await resolve(app, 0, { ...snapshot([]), newer_outbound_observed: false });
-    assert.match(app.status.textContent, /does not mean no reply exists/); assert.equal(app.warning.hidden, true);
+    assert.match(app.status.textContent, /No messages were returned/); assert.equal(app.warning.hidden, true);
     app.click(app.button); await resolve(app, 1, snapshot([native('empty', '')]));
     assert.match(app.timeline.textContent, /original content has not been verified/);
 });
@@ -606,7 +607,7 @@ test('repeated native page keys, repeated cursor and no-progress observations st
         app.scroll(20);
         await resolve(app, 1, { ...snapshot(mode === 'items' ? undefined : [native('older', 'Older answer')]),
             page_key: mode === 'key' ? 'page-1' : 'page-2', older_continuation: mode === 'cursor' ? 'cursor-2' : 'cursor-3' });
-        assert.match(app.nativeStatus.textContent, /did not advance/);
+        assert.match(app.nativeStatus.textContent, /Earlier messages could not be loaded/);
         app.scroll(250); app.scroll(20); assert.equal(app.requests.length, 2, mode);
     }
 });
@@ -640,7 +641,7 @@ test('transient native-page error preserves previous observations with stale not
     const app = setup(); app.timeline.dataset.olderUrl = '';
     await resolve(app, 0, { ...snapshot(), older_continuation: 'cursor-2' }); app.scroll(20);
     await resolve(app, 1, { ...snapshot([]), status: 'unavailable', reason_code: 'rate_limited' }, false);
-    assert.equal(nativeCards(app).length, 1); assert.match(app.nativeStatus.textContent, /stale or incomplete/);
+    assert.equal(nativeCards(app).length, 1); assert.match(app.nativeStatus.textContent, /Earlier messages could not be loaded/);
     assert.equal(app.nativeRetry.hidden, false); app.click(app.nativeRetry);
     assert.equal(app.requests[2].options.body, 'continuation=cursor-2');
     await resolve(app, 2, { ...snapshot([native('older', 'Recovered older platform answer')]), page_key: 'page-2' });
@@ -692,7 +693,7 @@ test('stored, native and header times use the same browser-zone formatter and re
     const observedTime = nativeCards(app)[0].querySelector('time');
     assert.equal(time.textContent, observedTime.textContent);
     assert.equal(observedTime.dateTime, time.dateTime);
-    assert.match(app.status.textContent, /Times use your browser timezone/);
+    assert.doesNotMatch(app.status.textContent, /Times use your browser timezone/);
 });
 
 test('a visible stored anchor stays fixed when native arrivals insert above or below it', async () => {
@@ -1065,12 +1066,11 @@ test('saved pagination stops at exactly 500 rows and does not partly import an o
         if (amount === 3) {
             assert.equal(app.timeline.outerHTML.replace('data-older-url=""', 'data-older-url="/inbox/anchor-a/?history_before=cursor-1"'), before);
             assert.equal(app.scroller.scrollTop, top);
-            assert.match(app.pageStatus.textContent, /additional page was not displayed/);
+            assert.match(app.pageStatus.textContent, /Message limit reached/);
         } else assert.equal(app.timeline.querySelectorAll('[data-timeline-event="stored"]').length, 500);
         app.scroll(0);
         assert.equal(app.requests.length, 2, 'The bound prevents another page request');
-        assert.match(app.pageStatus.textContent, /500 messages/);
-        assert.match(app.pageStatus.textContent, /Earlier|earlier/);
+        assert.match(app.pageStatus.textContent, /Message limit reached/);
         assert.equal(app.composer.value, 'My interrupted unsaved reply');
     }
 });
@@ -1087,7 +1087,7 @@ test('saved pagination stops after 25 pages without dropping already displayed r
     assert.equal(app.requests.length, 25);
     assert.equal(count, 27);
     assert.equal(app.timeline.querySelectorAll('[data-timeline-event="stored"]').length, count);
-    assert.match(app.pageStatus.textContent, /25 pages.*Earlier saved activity may remain/);
+    assert.match(app.pageStatus.textContent, /Message limit reached/);
 });
 
 test('unknown fresh timestamps refuse old-row restoration and explain that the fresh page is shown', async () => {
@@ -1102,7 +1102,7 @@ test('unknown fresh timestamps refuse old-row restoration and explain that the f
     app.document.emit('htmx:afterSwap', { detail: { ...detail, xhr: { status: 200 } } });
     assert.doesNotMatch(fresh.textContent, /Unverified outside boundary/);
     const status = fresh.querySelector('[data-stored-history-status]').textContent;
-    assert.match(status, /fresh saved page is shown; scroll up/);
+    assert.match(status, /History changed/);
     assert.doesNotMatch(status, /preserved|position retained|anchor retained/);
     assert.equal(fresh.querySelector('textarea').value, 'My interrupted unsaved reply');
 });
@@ -1125,7 +1125,7 @@ test('a wholly new first page keeps its fresh cursor instead of skipping an unse
     app.document.emit('htmx:afterSwap', { detail: { ...detail, xhr: { status: 200 } } });
     assert.doesNotMatch(timeline.textContent, /Cached row before unseen gap|Stored incoming|Stored sent reply/);
     assert.equal(timeline.dataset.olderUrl, '/inbox/anchor-a/?history_before=fresh-gap');
-    assert.match(fresh.querySelector('[data-stored-history-status]').textContent, /fresh saved page is shown/);
+    assert.match(fresh.querySelector('[data-stored-history-status]').textContent, /History changed/);
     const scroller = fresh.querySelector('[data-inbox-scroll]'); scroller.scrollTop = 20; scroller.emit('scroll');
     assert.equal(app.requests[2].url, 'https://example.com/inbox/anchor-a/?history_before=fresh-gap');
     assert.equal(fresh.querySelector('textarea').value, 'My interrupted unsaved reply');
@@ -1247,4 +1247,17 @@ test('changed same-page response clears its continuation and explicit reload sta
     app.scroller.scrollTop = 200; app.scroller.emit('scroll'); app.scroll(20);
     assert.equal(app.requests[3].options.body, 'continuation=fresh-position');
     assert.equal(app.composer.value, 'My interrupted unsaved reply');
+});
+
+test('native share opens the actual post and keeps image enlargement separate', async () => {
+    const app = setup(); const item = native('shared-post', '');
+    const post = 'https://www.instagram.com/p/synthetic-post/';
+    const preview = 'https://scontent.cdninstagram.com/synthetic.jpg';
+    item.attachments = [{type: 'share', url: post, preview_url: preview, availability: 'available'}];
+    await resolve(app, 0, snapshot([item]));
+    const links = app.timeline.querySelectorAll('a');
+    assert.ok(links.some(link => link.href === post && link.textContent === 'Open original post'));
+    assert.ok(links.some(link => link.href === preview && link.textContent === 'View image'));
+    assert.equal(app.timeline.querySelector('img').parent.href, post);
+    assert.doesNotMatch(app.timeline.textContent, /may expire|require sign-in/);
 });

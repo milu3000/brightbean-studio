@@ -20,6 +20,7 @@ from ninja.openapi.docs import Swagger
 from apps.api.auth import ApiKeyAuth, McpAuth
 from apps.api.routers.accounts import router as accounts_router
 from apps.api.routers.analytics import router as analytics_router
+from apps.api.routers.canonical_inbox import router as canonical_inbox_router
 from apps.api.routers.conversation_dispatch import router as conversation_dispatch_router
 from apps.api.routers.inbox import router as inbox_router
 from apps.api.routers.me import router as me_router
@@ -94,6 +95,7 @@ api.add_router("/posts", posts_router)
 api.add_router("/media", media_router)
 api.add_router("/analytics", analytics_router)
 api.add_router("/inbox", inbox_router)
+api.add_router("/inbox-conversations", canonical_inbox_router)
 api.add_router("/conversation-replies", conversation_dispatch_router)
 # MCP Streamable HTTP transport. Same audit + rate limits as REST, but a
 # wider auth class: ``McpAuth`` accepts both bb_studio_ keys AND OAuth 2.1
@@ -119,7 +121,12 @@ def _http_error_handler(request: HttpRequest, exc: HttpError) -> HttpResponse:
             {},
         )
     )
+    canonical_data = getattr(exc, "canonical_data", None)
+    if isinstance(canonical_data, dict):
+        body.update(canonical_data)
     response = JsonResponse(body, status=exc.status_code)
+    if getattr(exc, "canonical_data", None):
+        response["Cache-Control"] = "private, no-store"
     for k, v in headers.items():
         response[k] = v
     _audit_failed_request(request, status_code=exc.status_code)

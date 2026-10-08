@@ -1177,6 +1177,7 @@ class FacebookProvider(SocialProvider):
         extra: dict | None = None,
         *,
         human_agent: bool = False,
+        reply_to_message_id: str | None = None,
     ) -> ReplyResult:
         """Send a Messenger reply from the Page via the Send API.
 
@@ -1192,7 +1193,7 @@ class FacebookProvider(SocialProvider):
             )
 
         page_id = self.credentials.get("page_id", "me")
-        payload = build_send_payload(psid, text, human_agent=human_agent)
+        payload = build_send_payload(psid, text, human_agent=human_agent, reply_to_message_id=reply_to_message_id)
 
         resp = self._request(
             "POST",

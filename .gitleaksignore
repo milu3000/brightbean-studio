@@ -1,0 +1,4 @@
+# Verified false positive: notification migration 0007 assigns a conversation
+# primary-key expression, not a credential. Suppress only this historical
+# finding; all default rules and every other finding remain enabled.
+5865603015f16b4839ff5350188b1efe007426aa:apps/notifications/migrations/0007_group_existing_inbox_notifications.py:generic-api-key:32

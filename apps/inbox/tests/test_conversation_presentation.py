@@ -194,7 +194,7 @@ def test_detail_shows_history_but_marks_only_selected_message_read(owner_client,
     selected.refresh_from_db()
     latest.refresh_from_db()
     assert selected.status == "open" and latest.status == "unread"
-    assert "Status and assignment above apply only" in html
+    assert "Status and assignment above apply only" not in html
     assert InboxConversation.objects.count() == ConversationMessage.objects.count() == 0
 
 
@@ -419,8 +419,8 @@ def test_share_and_unavailable_content_render_in_stored_timeline(owner_client, i
     incoming(inbox_account, "unknown-media", body="", extra={"conversation_id": "thread"})
     response = owner_client.get(detail_url(first), HTTP_HX_REQUEST="true")
     html = response.content.decode()
-    assert "Saved post" in html and "Open shared content" in html
-    assert "original content has not been verified" in html
+    assert "Saved post" in html and "Open original post" in html
+    assert "Content unavailable." in html
 
 
 def test_foreign_selection_id_cannot_retarget_panel(owner_client, inbox_account, organization):

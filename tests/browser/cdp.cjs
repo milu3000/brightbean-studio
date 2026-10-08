@@ -1,0 +1,63 @@
+/* Dependency-free CDP pipe transport for an already installed Chromium. */
+'use strict';
+const {spawn}=require('node:child_process');
+class Browser {
+    constructor(binary, profile) {
+        this.sequence=0;this.pending=new Map();this.handlers=new Map();this.errors=[];this.stderr='';this.closed=false;
+        this.process=spawn(binary,[
+            '--headless=new','--no-sandbox','--disable-dev-shm-usage','--remote-debugging-pipe',
+            '--no-first-run','--no-default-browser-check','--disable-background-networking','--disable-component-update',
+            '--disable-sync','--disable-extensions','--disable-default-apps','--metrics-recording-only','--mute-audio',
+            '--proxy-server=http://127.0.0.1:9',
+            '--host-resolver-rules=MAP * ~NOTFOUND','--user-data-dir='+profile,'about:blank'
+        ],{stdio:['ignore','ignore','pipe','pipe','pipe']});
+        this.finished=new Promise(resolve=>this.process.once('close',()=>{this.streamsClosed=true;resolve();}));
+        this.process.stderr.setEncoding('utf8').on('data',text=>{this.stderr+=text;});
+        let buffer='';
+        this.process.stdio[4].setEncoding('utf8').on('data',text=>{
+            buffer+=text;let end;
+            while((end=buffer.indexOf('\0'))>=0){
+                const message=JSON.parse(buffer.slice(0,end));buffer=buffer.slice(end+1);
+                if(message.id){const pending=this.pending.get(message.id);if(!pending)continue;
+                    clearTimeout(pending.timer);this.pending.delete(message.id);
+                    if(message.error)pending.reject(new Error(JSON.stringify(message.error)));else pending.resolve(message.result);
+                }else for(const callback of this.handlers.get(message.method)||[])Promise.resolve(callback(message.params,message.sessionId)).catch(error=>this.errors.push(error.stack));
+            }
+        });
+        this.process.stdio[3].on('error',()=>{});
+        const stopped=error=>{this.closed=true;for(const pending of this.pending.values()){clearTimeout(pending.timer);pending.reject(error);}this.pending.clear();};
+        this.process.once('error',stopped);this.process.once('exit',(code,signal)=>stopped(new Error(`Chrome exited (${code}, ${signal})`)));
+    }
+    on(name,callback){if(!this.handlers.has(name))this.handlers.set(name,[]);this.handlers.get(name).push(callback);}
+    command(method,params={},sessionId,timeout=8000){
+        if(this.closed)return Promise.reject(new Error('Chrome is closed'));const id=++this.sequence;
+        return new Promise((resolve,reject)=>{const timer=setTimeout(()=>{this.pending.delete(id);reject(new Error('CDP timeout: '+method));},timeout);
+            this.pending.set(id,{resolve,reject,timer});this.process.stdio[3].write(JSON.stringify({id,method,params,...(sessionId?{sessionId}:{})})+'\0');});
+    }
+    async close(){
+        if(this.streamsClosed)return;
+        let timer;
+        const finished=new Promise((resolve,reject)=>{
+            timer=setTimeout(()=>{this.process.kill('SIGKILL');reject(new Error('Chromium shutdown timed out'));},8000);
+            this.finished.then(resolve);
+        });
+        // CDP shutdown lets Chromium stop its profile writers. Node's close
+        // event additionally waits for inherited stdio; exit alone does not.
+        const graceful=this.closed?Promise.resolve():this.command('Browser.close').catch(error=>{
+            if(!this.closed){this.process.kill('SIGKILL');throw error;}
+        });
+        try { await Promise.all([graceful,finished]); } finally { clearTimeout(timer); }
+    }
+}
+async function withCleanup(operation, cleanup) {
+    let result, failure;
+    try { result = await operation(); } catch (error) { failure = error; }
+    try { await cleanup(); } catch (error) {
+        if (failure) throw new AggregateError([failure, error],
+            `Original failure:\n${failure.stack || failure}\nCleanup failure:\n${error.stack || error}`);
+        throw error;
+    }
+    if (failure) throw failure;
+    return result;
+}
+module.exports={Browser,withCleanup};

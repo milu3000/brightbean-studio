@@ -52,11 +52,18 @@ def test_reverse_cannot_erase_delivery_safety_metadata(inbox_message, restore_mi
     else:
         values["send_generation"] = 1
     reply = InboxReply.objects.create(**values)
-    before = list(InboxReply.objects.order_by("pk").values())
+    # Later unused schema additions may reverse before this guard raises.
+    # Read the protected historical columns rather than the latest ORM fields.
+    historical_reply = (
+        MigrationExecutor(connection)
+        .loader.project_state([("inbox", "0010_inboxreply_follow_up_of")])
+        .apps.get_model("inbox", "InboxReply")
+    )
+    before = list(historical_reply.objects.order_by("pk").values())
     with pytest.raises(RuntimeError, match="Cannot reverse reply delivery metadata"):
         MigrationExecutor(connection).migrate([("inbox", "0009_conversation_classification")])
-    assert list(InboxReply.objects.order_by("pk").values()) == before
-    reply.refresh_from_db()
+    assert list(historical_reply.objects.order_by("pk").values()) == before
+    reply = historical_reply.objects.get(pk=reply.pk)
     assert (reply.is_follow_up, bool(reply.follow_up_of_id), reply.not_sent_verified) == (
         metadata == "orphan_intent",
         metadata == "parent_link",

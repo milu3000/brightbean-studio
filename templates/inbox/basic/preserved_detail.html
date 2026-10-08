@@ -1,0 +1,3 @@
+{% extends "inbox/basic/base.html" %}{% block content %}<h2>Preserved history</h2>{% include "inbox/basic/preserved_message.html" %}
+<h3>BrightBean replies and drafts</h3>{% include "inbox/basic/related_list.html" with page=replies %}
+<h3>Internal notes</h3>{% include "inbox/basic/related_list.html" with page=notes %}{% endblock %}

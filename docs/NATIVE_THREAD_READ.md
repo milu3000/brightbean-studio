@@ -54,7 +54,12 @@ Its full ordered identity/time/direction digest must still match; a changed page
 stops with a reload notice. Only after every chunk has been shown can the reader
 advance to another provider page, and only when the provider's next-page
 metadata confirms the expected host, API version, thread, messages edge, and
-cursor. Unsupported shapes stop pagination with an incomplete-history notice.
+cursor. Instagram Login has one narrow compatibility exception: a configured
+`v25.0` reader accepts advertised `v26.0` pagination evidence when the rest of the
+path matches exactly. Requests still use the configured `v25.0` endpoints; the
+advertised URL and its credentials are never followed or reused. Other version
+pairs and Facebook version mismatches remain unsupported. Unsupported shapes
+stop pagination with an incomplete-history notice.
 Meta's generic cursor contract is
 implemented in its [official SDK](https://github.com/facebook/facebook-python-business-sdk/blob/main/facebook_business/api.py).
 

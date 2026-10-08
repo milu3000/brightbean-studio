@@ -9,11 +9,11 @@ class InboxMessageAdmin(admin.ModelAdmin):
         "sender_name",
         "message_type",
         "status",
-        "sentiment",
         "social_account",
         "received_at",
     ]
-    list_filter = ["message_type", "status", "sentiment"]
+    list_filter = ["message_type", "status"]
+    exclude = ["sentiment", "sentiment_source"]
     search_fields = ["sender_name", "sender_handle", "body"]
     raw_id_fields = ["workspace", "social_account", "assigned_to", "parent_message", "related_post"]
 

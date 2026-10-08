@@ -26,6 +26,7 @@ from apps.workspaces.models import Workspace
 
 from . import presentation
 from . import services as inbox_services
+from .canonical_send_target import canonical_projection_view, exclude_transport_projections
 from .dm_send_gate import DMSendGateError, dm_send_status, session_send_authorization
 from .forms import (
     AssignForm,
@@ -33,7 +34,6 @@ from .forms import (
     InternalNoteForm,
     ReplyForm,
     SavedReplyForm,
-    SentimentForm,
     SLAConfigForm,
     StatusForm,
 )
@@ -44,6 +44,7 @@ from .models import (
     InternalNote,
     SavedReply,
 )
+from .public_threads import PUBLIC_TYPES, public_thread_key, public_type_filter
 from .reply_safety import is_unresolved_reply
 
 logger = logging.getLogger(__name__)
@@ -68,17 +69,25 @@ def _detail_context(workspace, message, request=None, *, history_before=None):
         workspace=workspace,
     ).select_related("user")
     conversation_view = presentation.enabled() and message.message_type == InboxMessage.MessageType.DM
+    public_thread_view = (
+        presentation.enabled() and message.message_type in PUBLIC_TYPES and bool(public_thread_key(message))
+    )
+    timeline_view = conversation_view or public_thread_view
     stored_messages = presentation.stored_thread_messages(message)
-    if not conversation_view:
+    if not timeline_view:
         stored_messages = stored_messages.filter(pk=message.pk)
     reply_query = InboxReply.objects.filter(inbox_message__in=stored_messages)
-    if conversation_view:
+    if timeline_view:
         reply_query = reply_query.exclude(status=InboxReply.Status.SENT)
     replies = list(
         reply_query.select_related("author", "inbox_message", "inbox_message__social_account", "follow_up_of")
     )
-    notes = list(message.internal_notes.select_related("author")) if not conversation_view else []
-    reply_target = stored_messages.select_related("social_account").order_by("-received_at", "-pk").first() or message
+    notes = list(message.internal_notes.select_related("author")) if not timeline_view else []
+    reply_target = (
+        (stored_messages.select_related("social_account").order_by("-received_at", "-pk").first() or message)
+        if conversation_view
+        else message
+    )
     follow_up_id = request.GET.get("follow_up_reply_id", "") if request and request.method == "GET" else ""
     if follow_up_id:
         reply_target = message
@@ -89,9 +98,11 @@ def _detail_context(workspace, message, request=None, *, history_before=None):
         permissions.get(key, False) for key in ("use_inbox", "manage_workspace_settings", "reply_from_inbox")
     )
     for reply in replies:
+        _reply_presentation(reply)
         if reply.status != InboxReply.Status.SENT:
             reply.send_availability = _send_availability(reply.inbox_message, reply=reply)
-            reply.display_error = _display_send_reason(reply.send_error)
+            if not reply.content_available:
+                reply.send_availability = {"allowed": False, "reason": "Message unavailable."}
             reply.is_unresolved = is_unresolved_reply(reply)
             reply.can_edit = (
                 reply.status in {InboxReply.Status.DRAFT, InboxReply.Status.FAILED}
@@ -99,6 +110,8 @@ def _detail_context(workspace, message, request=None, *, history_before=None):
                 and not (reply.is_follow_up and not reply.follow_up_of_id)
                 and not reply.dm_send_attempts.exists()
                 and not hasattr(reply, "send_operation")
+                and reply.conversation_id is None
+                and reply.content_available
             )
     # Sent replies sit in the chronological thread; drafts (and failed
     # sends awaiting a retry) are pending work, surfaced by the composer.
@@ -120,16 +133,38 @@ def _detail_context(workspace, message, request=None, *, history_before=None):
             1 if history_before else request.GET.get("history_page", 1) if request else 1,
             before=history_before,
         )
-        if conversation_view
+        if timeline_view
         else None
     )
     if history is not None:
         thread = history.object_list
+    thread = [
+        (
+            kind,
+            canonical_projection_view(item)
+            if kind == "incoming"
+            else _reply_presentation(item)
+            if kind == "reply"
+            else item,
+            stamp,
+        )
+        for kind, item, stamp in thread
+    ]
+    visible_message = canonical_projection_view(message)
+    if getattr(visible_message, "canonical_content_available", True) is False:
+        composer["send_availability"] = {
+            "allowed": False,
+            "code": "content_unavailable",
+            "reason": "Message unavailable.",
+        }
+        composer["can_save_draft"] = False
     return {
         "workspace": workspace,
-        "message": message,
+        "message": visible_message,
         **composer,
         "conversation_view": conversation_view,
+        "public_thread_view": public_thread_view,
+        "timeline_view": timeline_view,
         "has_native_thread": bool(presentation.thread_id(message)),
         "native_view_scope": (
             presentation.native_view_scope(message, request.user.pk)
@@ -152,7 +187,7 @@ def _detail_context(workspace, message, request=None, *, history_before=None):
         "thread": thread,
         "draft_replies": draft_replies,
         "can_review_delivery": can_review_delivery,
-        "child_messages": child_messages,
+        "child_messages": [canonical_projection_view(child) for child in child_messages],
         "sla_config": sla_config,
         "saved_replies": saved_replies,
         "team_members": team_members,
@@ -160,6 +195,20 @@ def _detail_context(workspace, message, request=None, *, history_before=None):
         "note_form": InternalNoteForm(),
         "status_choices": InboxMessage.Status.choices,
     }
+
+
+def _reply_presentation(reply):
+    from .receipt_compaction import reply_display_content
+
+    content = reply_display_content(reply)
+    reply.display_body = content["body"]
+    reply.display_error = _display_send_reason(content["send_error"])
+    reply.content_available = content["available"]
+    reply.content_expired = content["is_expired"]
+    reply.display_target = canonical_projection_view(reply.inbox_message)
+    if reply.follow_up_of_id:
+        reply.follow_up_of.display_body = reply_display_content(reply.follow_up_of)["body"]
+    return reply
 
 
 def _send_availability(message, *, reply=None, follow_up_of=None):
@@ -197,7 +246,7 @@ def _composer_context(target, follow_up_id=""):
     parent = None
     try:
         if follow_up_id:
-            parent = _follow_up_parent(target, follow_up_id)
+            parent = _reply_presentation(_follow_up_parent(target, follow_up_id))
         availability = _send_availability(target, follow_up_of=parent)
         if follow_up_id and availability["allowed"] and availability.get("existing_reply_id"):
             availability.update(
@@ -257,6 +306,7 @@ def _render_panel(request, workspace, target, **extra):
 def _list_query(request):
     params = request.GET.copy()
     params.pop("page", None)
+    params["read_source"] = "legacy"
     return params.urlencode()
 
 
@@ -289,8 +339,73 @@ def _get_workspace(request, workspace_id):
 def inbox_feed(request, workspace_id):
     """Main inbox feed with filtering, pagination, and split-panel layout."""
     workspace = _get_workspace(request, workspace_id)
+    from . import canonical_views
+    from .canonical_compat import inbox_sources, recheck_inbox_source, selected_inbox_source
+    from .canonical_reads import CanonicalReadError, session_read_scope
 
-    qs = InboxMessage.objects.for_workspace(workspace.id).filter(social_account__workspace=workspace)
+    requested_types = {value for value in request.GET.getlist("type") if value}
+    inferred = (
+        next(iter(requested_types))
+        if len(requested_types) == 1 and requested_types <= {"comment", "mention", "review"}
+        else "dm"
+    )
+    scope = session_read_scope(request.user, workspace.pk)
+    accounts = [value for value in request.GET.getlist("account") if value]
+    try:
+        sources = inbox_sources(scope)
+        canonical_mode = any(item["source"] != "legacy" for item in sources)
+        known_source_ids = {item["id"] for item in sources}
+        unavailable_legacy_filter = not canonical_mode and any(
+            str(_valid_uuid(value)) not in known_source_ids for value in accounts
+        )
+        # Preserve the legacy UI's unavailable-filter empty state. An explicit
+        # empty scope is not the unfiltered scope, and cannot expose any rows.
+        selected_account_ids = [] if unavailable_legacy_filter else accounts or None
+        domain = request.GET.get("domain", inferred if canonical_mode else "")
+        if domain not in {"", "dm", "comment", "mention", "review"}:
+            return HttpResponse("Unknown inbox section.", status=400)
+        reads_dm = domain in {"", "dm"} and not (
+            requested_types and requested_types <= {"comment", "mention", "review"}
+        )
+        selection = (
+            selected_inbox_source(
+                scope,
+                social_account_ids=selected_account_ids,
+                platforms=[value for value in request.GET.getlist("platform") if value],
+            )
+            if reads_dm
+            else {"source": "legacy"}
+        )
+    except CanonicalReadError as exc:
+        return canonical_views.source_directory(request, workspace, exc)
+    read_source = selection["source"]
+    previous_source = request.GET.get("read_source")
+    if request.htmx and previous_source and previous_source != read_source:
+        # A list fragment cannot replace the other reader's filters/composer.
+        # Reload the actual selected-account route; never swap incompatible DOM.
+        params = request.GET.copy()
+        for key in ("read_source", "cursor", "page"):
+            params.pop(key, None)
+        response = HttpResponse()
+        response["HX-Redirect"] = request.path + ("?" + params.urlencode() if params else "")
+        response["Cache-Control"] = "private, no-store"
+        return response
+    if read_source == "canonical":
+        return canonical_views.feed(request, workspace)
+    if any(value.strip() for value in request.GET.getlist("sentiment")):
+        return HttpResponse(
+            "Sentiment filtering has been retired. Remove the sentiment filter to continue.", status=400
+        )
+
+    qs = exclude_transport_projections(
+        InboxMessage.objects.for_workspace(workspace.id).filter(social_account__workspace=workspace)
+    )
+    if unavailable_legacy_filter:
+        qs = qs.none()
+    canonical_accounts = [item["id"] for item in sources if item["source"] != "legacy"]
+    qs = qs.exclude(message_type="dm", social_account_id__in=canonical_accounts)
+    if domain:
+        qs = qs.filter(public_type_filter(domain))
 
     # View shortcuts
     view = request.GET.get("view", "all")
@@ -304,14 +419,16 @@ def inbox_feed(request, workspace_id):
     if platforms:
         qs = qs.filter(social_account__platform__in=platforms)
 
-    accounts = [value for value in request.GET.getlist("account") if value]
     if accounts:
         account_ids = [_valid_uuid(value) for value in accounts]
         qs = qs.filter(social_account_id__in=account_ids) if all(account_ids) else qs.none()
 
     types = [value for value in request.GET.getlist("type") if value]
     if types:
-        qs = qs.filter(message_type__in=types)
+        type_query = Q(pk__in=[])
+        for value in types:
+            type_query |= public_type_filter(value)
+        qs = qs.filter(type_query)
 
     statuses = [value for value in request.GET.getlist("status") if value]
     if statuses:
@@ -325,10 +442,6 @@ def inbox_feed(request, workspace_id):
             assigned_id = _valid_uuid(assigned)
             qs = qs.filter(assigned_to_id=assigned_id) if assigned_id else qs.none()
 
-    sentiments = [value for value in request.GET.getlist("sentiment") if value]
-    if sentiments:
-        qs = qs.filter(sentiment__in=sentiments)
-
     date_from = request.GET.get("date_from")
     date_to = request.GET.get("date_to")
     for value, lookup in ((date_from, "received_at__date__gte"), (date_to, "received_at__date__lte")):
@@ -341,9 +454,14 @@ def inbox_feed(request, workspace_id):
 
     q = request.GET.get("q", "").strip()
     if q:
-        qs = qs.filter(Q(body__icontains=q) | Q(sender_name__icontains=q) | Q(sender_handle__icontains=q))
+        from .canonical_compat import legacy_body_search_query
+
+        qs = qs.filter(legacy_body_search_query(q) | Q(sender_name__icontains=q) | Q(sender_handle__icontains=q))
 
     page = presentation.inbox_page(qs, request.GET.get("page", 1), per_page=MESSAGES_PER_PAGE)
+
+    for row in page:
+        row.message = canonical_projection_view(row.message)
 
     # SLA config for countdown display
     sla_config = InboxSLAConfig.objects.filter(workspace=workspace, is_active=True).first()
@@ -359,8 +477,26 @@ def inbox_feed(request, workspace_id):
         connection_status=SocialAccount.ConnectionStatus.CONNECTED,
     )
 
+    social_accounts = list(social_accounts.order_by("platform", "account_name", "pk"))
+    available_platforms = {account.platform for account in social_accounts} | set(platforms)
+    labels = dict(SocialAccount._meta.get_field("platform").choices)
+    platform_choices = [(code, labels.get(code, "Unavailable platform")) for code in sorted(available_platforms)]
+    known_accounts = {str(account.pk) for account in social_accounts}
+
+    shortcut_params = request.GET.copy()
+    for key in list(shortcut_params):
+        if key not in {"account", "domain"}:
+            shortcut_params.pop(key, None)
+    shortcut_query = shortcut_params.urlencode()
+
     context = {
         "workspace": workspace,
+        "canonical_mode": canonical_mode,
+        "account_sources": sources,
+        "shortcut_query": shortcut_query,
+        "inbox_domain": domain,
+        "platform_choices": platform_choices,
+        "unavailable_account_filters": [value for value in accounts if value not in known_accounts],
         "inbox_messages": [row.message for row in page],
         "inbox_rows": page.object_list,
         "inbox_page": page,
@@ -376,16 +512,24 @@ def inbox_feed(request, workspace_id):
             "type": types,
             "status": statuses,
             "assigned": assigned,
-            "sentiment": sentiments,
             "date_from": date_from,
             "date_to": date_to,
             "q": q,
         },
     }
 
-    if request.htmx:
-        return render(request, "inbox/partials/_message_list.html", context)
-    return render(request, "inbox/feed.html", context)
+    response = render(request, "inbox/partials/_message_list.html" if request.htmx else "inbox/feed.html", context)
+    try:
+        if reads_dm:
+            recheck_inbox_source(
+                scope,
+                selection,
+                social_account_ids=selected_account_ids,
+                platforms=platforms,
+            )
+    except CanonicalReadError as exc:
+        return canonical_views._error(exc)
+    return response
 
 
 # --- Message Detail ---
@@ -403,6 +547,11 @@ def message_detail(request, workspace_id, message_id):
         social_account__workspace=workspace,
     )
 
+    from .canonical_views import legacy_detail
+
+    canonical = legacy_detail(request, workspace, message)
+    if canonical is not None:
+        return canonical
     history_before = None
     if "history_before" in request.GET:
         try:
@@ -423,7 +572,7 @@ def message_detail(request, workspace_id, message_id):
     context = _detail_context(workspace, message, request, history_before=history_before)
 
     if request.htmx:
-        if request.headers.get("HX-Target") == "inbox-thread" and context["conversation_view"]:
+        if request.headers.get("HX-Target") == "inbox-thread" and context["timeline_view"]:
             return render(request, "inbox/partials/_conversation_timeline.html", context)
         response = render(request, "inbox/partials/_message_panel.html", context)
         if marked_read:
@@ -447,6 +596,12 @@ def native_thread_refresh(request, workspace_id, message_id):
         workspace=workspace,
         social_account__workspace=workspace,
     )
+
+    from .canonical_views import hold_legacy_action
+
+    hold = hold_legacy_action(request, workspace, message)
+    if hold is not None:
+        return hold
     try:
         continuation = request.POST.get("continuation")
         if len(request.POST.getlist("continuation")) > 1:
@@ -645,6 +800,12 @@ def send_reply(request, workspace_id, message_id):
     workspace = _get_workspace(request, workspace_id)
     message = get_object_or_404(InboxMessage, id=message_id, workspace=workspace, social_account__workspace=workspace)
 
+    from .canonical_views import hold_legacy_action
+
+    hold = hold_legacy_action(request, workspace, message)
+    if hold is not None:
+        return hold
+
     form = ReplyForm(request.POST)
     if not form.is_valid():
         return HttpResponse("Invalid reply.", status=400)
@@ -703,6 +864,12 @@ def save_reply_draft(request, workspace_id, message_id):
     workspace = _get_workspace(request, workspace_id)
     message = get_object_or_404(InboxMessage, id=message_id, workspace=workspace, social_account__workspace=workspace)
 
+    from .canonical_views import hold_legacy_action
+
+    hold = hold_legacy_action(request, workspace, message)
+    if hold is not None:
+        return hold
+
     form = ReplyForm(request.POST)
     if not form.is_valid():
         return HttpResponse("Invalid reply.", status=400)
@@ -739,6 +906,11 @@ def update_reply_draft(request, workspace_id, reply_id):
     """Edit the existing draft body without changing its original message."""
     workspace = _get_workspace(request, workspace_id)
     reply = _get_workspace_reply(workspace, reply_id)
+    from .canonical_views import hold_legacy_action
+
+    hold = hold_legacy_action(request, workspace, reply.inbox_message)
+    if hold is not None:
+        return hold
     form = ReplyForm(request.POST)
     if not form.is_valid():
         return HttpResponse("Invalid reply.", status=400)
@@ -764,6 +936,11 @@ def send_reply_draft(request, workspace_id, reply_id):
     """Deliver an existing draft reply to the platform."""
     workspace = _get_workspace(request, workspace_id)
     reply = _get_workspace_reply(workspace, reply_id)
+    from .canonical_views import hold_legacy_action
+
+    hold = hold_legacy_action(request, workspace, reply.inbox_message)
+    if hold is not None:
+        return hold
     message = reply.inbox_message
 
     failed = False
@@ -798,6 +975,11 @@ def discard_reply_draft(request, workspace_id, reply_id):
     """Delete a draft (or failed) reply."""
     workspace = _get_workspace(request, workspace_id)
     reply = _get_workspace_reply(workspace, reply_id)
+    from .canonical_views import hold_legacy_action
+
+    hold = hold_legacy_action(request, workspace, reply.inbox_message)
+    if hold is not None:
+        return hold
     message = reply.inbox_message
 
     try:
@@ -819,6 +1001,12 @@ def add_note(request, workspace_id, message_id):
     """Add an internal note to a message."""
     workspace = _get_workspace(request, workspace_id)
     message = get_object_or_404(InboxMessage, id=message_id, workspace=workspace, social_account__workspace=workspace)
+
+    from .canonical_views import hold_legacy_action
+
+    hold = hold_legacy_action(request, workspace, message)
+    if hold is not None:
+        return hold
 
     form = InternalNoteForm(request.POST)
     if not form.is_valid():
@@ -843,6 +1031,12 @@ def assign_message(request, workspace_id, message_id):
     """Assign a message to a team member."""
     workspace = _get_workspace(request, workspace_id)
     message = get_object_or_404(InboxMessage, id=message_id, workspace=workspace, social_account__workspace=workspace)
+
+    from .canonical_views import hold_legacy_action
+
+    hold = hold_legacy_action(request, workspace, message)
+    if hold is not None:
+        return hold
 
     form = AssignForm(request.POST)
     if not form.is_valid():
@@ -891,6 +1085,12 @@ def change_status(request, workspace_id, message_id):
     workspace = _get_workspace(request, workspace_id)
     message = get_object_or_404(InboxMessage, id=message_id, workspace=workspace, social_account__workspace=workspace)
 
+    from .canonical_views import hold_legacy_action
+
+    hold = hold_legacy_action(request, workspace, message)
+    if hold is not None:
+        return hold
+
     form = StatusForm(request.POST)
     if not form.is_valid():
         return HttpResponse("Invalid status.", status=400)
@@ -908,20 +1108,10 @@ def change_status(request, workspace_id, message_id):
 @require_permission("reply_from_inbox")
 @require_POST
 def change_sentiment(request, workspace_id, message_id):
-    """Override sentiment manually."""
+    """Compatibility tombstone; historical values remain unchanged."""
     workspace = _get_workspace(request, workspace_id)
-    message = get_object_or_404(InboxMessage, id=message_id, workspace=workspace, social_account__workspace=workspace)
-
-    form = SentimentForm(request.POST)
-    if not form.is_valid():
-        return HttpResponse("Invalid sentiment.", status=400)
-
-    message.sentiment = form.cleaned_data["sentiment"]
-    message.sentiment_source = InboxMessage.SentimentSource.MANUAL
-    message.save(update_fields=["sentiment", "sentiment_source"])
-
-    context = {"message": message, "workspace": workspace}
-    return render(request, "inbox/partials/_sentiment_badge.html", context)
+    get_object_or_404(InboxMessage, id=message_id, workspace=workspace, social_account__workspace=workspace)
+    return HttpResponse("Sentiment labels have been retired.", status=410)
 
 
 # --- Bulk Actions ---
@@ -942,8 +1132,15 @@ def bulk_action(request, workspace_id):
     action = form.cleaned_data["action"]
     value = form.cleaned_data.get("value", "")
 
-    qs = InboxMessage.objects.filter(id__in=message_ids, workspace=workspace)
+    qs = exclude_transport_projections(
+        InboxMessage.objects.filter(id__in=message_ids, workspace=workspace, social_account__workspace=workspace)
+    )
+    from .canonical_views import hold_legacy_action
 
+    for message in qs.filter(message_type="dm").select_related("social_account"):
+        hold = hold_legacy_action(request, workspace, message)
+        if hold is not None:
+            return hold
     if action == "mark_read":
         qs.filter(status=InboxMessage.Status.UNREAD).update(status=InboxMessage.Status.OPEN)
     elif action == "resolve":

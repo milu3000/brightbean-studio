@@ -2,7 +2,6 @@
 
 import json
 import uuid
-from types import SimpleNamespace
 
 import pytest
 from django.test import Client
@@ -29,37 +28,28 @@ def _attachment(**overrides):
     return data
 
 
-def _message_stub(**overrides):
-    return SimpleNamespace(
-        **{
-            "id": uuid.uuid4(),
-            "workspace_id": uuid.uuid4(),
-            "social_account_id": uuid.uuid4(),
-            "social_account": SimpleNamespace(platform="instagram"),
-            "message_type": "dm",
-            "conversation_type": "unknown",
-            "classification_reason": "participants_missing",
-            "type_display": "Message · type unconfirmed",
-            "status": "unread",
-            "sentiment": "neutral",
-            "sender_name": "Ada",
-            "sender_handle": "ada",
-            "body": "",
-            "content_type": "attachment",
-            "content_preview": "Shared content",
-            "attachments": [_attachment()],
-            "related_post_id": None,
-            "received_at": timezone.now(),
-            "created_at": timezone.now(),
-            "extra": {"access_token": "private-provider-token"},
-            **overrides,
-        }
+def _stored_message(account, *, attachments=None):
+    return InboxMessage.objects.create(
+        workspace=account.workspace,
+        social_account=account,
+        platform_message_id=str(uuid.uuid4()),
+        message_type="dm",
+        sender_name="Ada",
+        sender_handle="ada",
+        body="",
+        received_at=timezone.now(),
+        extra={
+            "inbox_attachments": attachments if attachments is not None else [_attachment()],
+            "access_token": "private-provider-token",
+        },
     )
 
 
-def test_schema_exposes_only_typed_attachment_metadata():
+def test_schema_exposes_only_typed_attachment_metadata(attachment_account):
     attachment = _attachment(id="internal-id", raw={"access_token": "private-provider-token"})
-    data = InboxMessageResponse.from_message(_message_stub(attachments=[attachment])).model_dump(mode="json")
+    data = InboxMessageResponse.from_message(_stored_message(attachment_account, attachments=[attachment])).model_dump(
+        mode="json"
+    )
 
     assert data["body"] == ""
     assert data["content_type"] == "attachment"
@@ -70,8 +60,8 @@ def test_schema_exposes_only_typed_attachment_metadata():
     assert "internal-id" not in json.dumps(data)
 
 
-def test_schema_new_fields_have_backward_compatible_defaults():
-    old_payload = InboxMessageResponse.from_message(_message_stub()).model_dump()
+def test_schema_new_fields_have_backward_compatible_defaults(attachment_account):
+    old_payload = InboxMessageResponse.from_message(_stored_message(attachment_account)).model_dump()
     for field in (
         "attachments",
         "content_type",

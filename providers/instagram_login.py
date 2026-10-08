@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import time
+from dataclasses import replace
 from datetime import datetime
 from urllib.parse import urlencode
 
@@ -29,10 +30,12 @@ from .meta_comments import (
 from .meta_inbox_content import (
     BASIC_MESSAGE_FIELDS,
     CONTENT_MESSAGE_FIELDS,
+    merge_message_extra,
     polled_conversation_classification,
     polled_message_extra,
     request_with_content_fields,
 )
+from .meta_inbox_paging import InboxRequestBudget, is_page_size_rejection, segmented_conversations
 from .meta_insights import fetch_insights_safe
 from .meta_messaging import build_send_payload, resolve_recipient_id
 from .types import (
@@ -605,23 +608,39 @@ class InstagramLoginProvider(SocialProvider):
         params: dict = {"fields": f"id,participants,messages{{{CONTENT_MESSAGE_FIELDS}{identity_fields}}}"}
         if since:
             params["since"] = int(since.timestamp())
+        budgeted_request = InboxRequestBudget(self._request, platform=self.platform_name)
 
         def request_messages(*args, **kwargs):
             # A field-compatibility retry must also honor enrollment revocation.
             if not provider_capture_allowed(self.credentials, platform="instagram_login"):
                 kwargs["params"] = {**kwargs["params"], "fields": kwargs["params"]["fields"].replace(",to", "")}
-            return self._request(*args, **kwargs)
+            return budgeted_request(*args, **kwargs)
 
         content_fallback: list[str] = []
-        resp = request_with_content_fields(
-            request_messages,
-            f"{API_BASE}/me/conversations",
-            access_token=access_token,
-            params=params,
-            basic_fields=f"id,participants,messages{{{BASIC_MESSAGE_FIELDS}{identity_fields}}}",
-            on_fallback=content_fallback.append,
-        )
-        conversations = resp.json().get("data", [])
+        try:
+            resp = request_with_content_fields(
+                request_messages,
+                f"{API_BASE}/me/conversations",
+                access_token=access_token,
+                params=params,
+                basic_fields=f"id,participants,messages{{{BASIC_MESSAGE_FIELDS}{identity_fields}}}",
+                on_fallback=content_fallback.append,
+            )
+            conversations = resp.json().get("data", [])
+        except APIError as exc:
+            error = exc.raw_response.get("error") if isinstance(exc.raw_response, dict) else None
+            if not is_page_size_rejection(exc.status_code, error):
+                raise
+            conversations = segmented_conversations(
+                request_messages,
+                api_base=API_BASE,
+                access_token=access_token,
+                params=params,
+                message_fields=CONTENT_MESSAGE_FIELDS + identity_fields,
+                basic_fields=BASIC_MESSAGE_FIELDS + identity_fields,
+                platform=self.platform_name,
+                own_id=str(self.credentials.get("ig_user_id") or ""),
+            )
         # Do not retain outbound history or identity enrichment if enrollment
         # was revoked while the request was in flight.
         conversation_v2 = provider_capture_allowed(self.credentials, platform="instagram_login")
@@ -654,14 +673,30 @@ class InstagramLoginProvider(SocialProvider):
                             sender_id=sender_id,
                             own_id=str(self.credentials.get("ig_user_id") or "") if conversation_v2 else None,
                             participant_ids=convo.get("participants") if conversation_v2 else None,
-                            content_fetch_status=content_fallback[-1] if content_fallback else "fields_requested",
+                            content_fetch_status=convo.get("_content_fetch_status")
+                            or (content_fallback[-1] if content_fallback else "fields_requested"),
                             classification_summary=polled_conversation_classification(
                                 msg, own_id=own_id, sender_id=sender_id, participant_ids=convo.get("participants")
                             ),
                         ),
                     )
                 )
-        return messages
+        # Page overlap is normal. Rich content from an earlier page must survive
+        # a later basic-field compatibility response for the same message.
+        unique: dict[tuple[str, str], InboxMessage] = {}
+        for message in messages:
+            key = (message.extra["conversation_id"], message.platform_message_id)
+            previous = unique.get(key)
+            unique[key] = (
+                replace(
+                    message,
+                    text=message.text or previous.text,
+                    extra=merge_message_extra(previous.extra, message.extra),
+                )
+                if previous is not None
+                else message
+            )
+        return list(unique.values())
 
     def reply_to_message(
         self,
@@ -671,6 +706,7 @@ class InstagramLoginProvider(SocialProvider):
         extra: dict | None = None,
         *,
         human_agent: bool = False,
+        reply_to_message_id: str | None = None,
     ) -> ReplyResult:
         """Send a DM reply addressed to the sender's IGSID."""
         igsid = resolve_recipient_id(extra)
@@ -681,7 +717,7 @@ class InstagramLoginProvider(SocialProvider):
                 platform=self.platform_name,
             )
 
-        payload = build_send_payload(igsid, text, human_agent=human_agent)
+        payload = build_send_payload(igsid, text, human_agent=human_agent, reply_to_message_id=reply_to_message_id)
 
         resp = self._request(
             "POST",

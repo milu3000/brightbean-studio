@@ -1,0 +1,1 @@
+{% extends "inbox/basic/base.html" %}{% block content %}<h2>{{ message.conversation_type|capfirst }} message</h2><p>{{ message.account_name }} · {{ message.platform }} · Native conversation unavailable · Read only</p>{% include "inbox/basic/message.html" %}{% endblock %}

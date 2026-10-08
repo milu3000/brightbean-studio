@@ -1,0 +1,4 @@
+{% extends "base.html" %}{% load static %}
+{% block title %}Inbox - {{ workspace.name }} - BrightBean{% endblock %}
+{% block extra_head %}{% include "inbox/partials/_canonical_styles.html" %}<script src="{% static 'js/inbox-media.js' %}" defer></script><script src="{% static 'js/inbox-navigation.js' %}" defer></script><script src="{% static 'js/inbox-composer.js' %}" defer></script><script src="{% static 'js/inbox-quote.js' %}" defer></script><script src="{% static 'js/inbox-message-details.js' %}" defer></script><script src="{% static 'js/inbox-canonical.js' %}" defer></script>{% endblock %}
+{% block content %}<div class="canonical-shell canonical-standalone" hx-history="false"><a href="{% url 'inbox:feed' workspace_id=workspace.id %}" class="px-5 py-3 text-sm border-b">Back to inbox</a><div id="inbox-detail-panel" class="canonical-detail-pane">{% include "inbox/partials/_canonical_panel.html" %}</div></div>{% endblock %}

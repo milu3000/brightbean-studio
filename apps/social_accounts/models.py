@@ -9,6 +9,12 @@ from apps.credentials.models import PlatformCredential
 
 
 class SocialAccount(models.Model):
+    @property
+    def preserves_inbox_history_on_disconnect(self):
+        from apps.inbox.account_disconnect import has_retained_inbox
+
+        return has_retained_inbox(self)
+
     class ConnectionStatus(models.TextChoices):
         CONNECTED = "connected", "Connected"
         TOKEN_EXPIRING = "token_expiring", "Token Expiring"
@@ -195,6 +201,10 @@ class SocialAccount(models.Model):
         from django.db import transaction
         from django.utils import timezone
 
+        from apps.inbox.durable_sync import auth_fingerprint
+        from apps.inbox.sync_credentials import trusted_refresh_completed
+
+        previous_sync_fingerprint = auth_fingerprint(self)
         observed_generation = self.analytics_auth_updated_at
         new_tokens = provider.refresh_token(self.oauth_refresh_token)
         self.oauth_access_token = new_tokens.access_token
@@ -231,6 +241,7 @@ class SocialAccount(models.Model):
                     self.save(update_fields=update_fields)
                 finally:
                     del self._skip_analytics_backfill
+            trusted_refresh_completed(self, previous_fingerprint=previous_sync_fingerprint)
         return new_tokens.access_token
 
     # Platform character limits

@@ -83,7 +83,7 @@ def _apply_classification(account, conversation, peer_id, kind, reason):
         conversation.peer_id,
         conversation.peer_ambiguous,
     )
-    if kind == "direct" and conversation.peer_id and peer_id != conversation.peer_id:
+    if kind == "direct" and conversation.peer_id and peer_id and peer_id != conversation.peer_id:
         kind, reason = "unknown", "identity_conflict"
     kind, reason = merge_conversation_classification(
         conversation.conversation_type, conversation.classification_reason, kind, reason
@@ -114,7 +114,7 @@ def _apply_classification(account, conversation, peer_id, kind, reason):
     if kind != "direct":
         ConversationMessage.objects.filter(
             **_scope(account), conversation=conversation, conversation_attribution="verified_peer"
-        ).update(conversation=None, conversation_attribution="", updated_at=timezone.now())
+        ).update(conversation=None, conversation_attribution="", incoming_generation=None, updated_at=timezone.now())
         from .reply_coordination import invalidate_conversations
 
         invalidate_conversations(account, [conversation.pk])
@@ -129,7 +129,7 @@ def _clear_ambiguous_peer_links(account, peer_id):
         **_scope(account), conversation__in=conversations, conversation_attribution="verified_peer"
     )
     affected = list(inferred.values_list("conversation_id", flat=True).distinct())
-    inferred.update(conversation=None, conversation_attribution="", updated_at=timezone.now())
+    inferred.update(conversation=None, conversation_attribution="", incoming_generation=None, updated_at=timezone.now())
     conversations.filter(pk__in=affected).update(revision=F("revision") + 1, updated_at=timezone.now())
     from .reply_coordination import invalidate_conversations
 
@@ -161,7 +161,7 @@ def _conversation(account, provider_id, peer_id, *, kind="unknown", reason="part
                     fallback.send_operations.exists() or hasattr(fallback, "reply_work_state")
                 ):
                     moved = ConversationMessage.objects.filter(**_scope(account), conversation=fallback).update(
-                        conversation=conversation, updated_at=timezone.now()
+                        conversation=conversation, incoming_generation=None, updated_at=timezone.now()
                     )
                     if moved:
                         scoped.filter(pk=conversation.pk).update(revision=F("revision") + 1, updated_at=timezone.now())
@@ -228,6 +228,8 @@ def upsert_conversation_message(
     legacy_message=None,
     legacy_reply=None,
     direction=None,
+    content_authority=None,
+    suppress_work=False,
 ):
     """Persist an observation, returning its canonical row (or None if disabled).
 
@@ -241,6 +243,15 @@ def upsert_conversation_message(
     account = lock_dm_account(account.pk, account.workspace_id)
     if account is None or account.platform != expected_platform or not capture_allowed(account):
         return None
+    from .sync_identity import SyncError, canonical_owns_account, canonical_read_connection
+
+    if canonical_owns_account(account):
+        try:
+            canonical_read_connection(account)
+        except SyncError:
+            return None
+        if content_authority is None and source != "app_send":
+            return None  # A claimed durable owner never reopens old writers.
     extra = _dict(extra)
     provider_id = _id(platform_message_id)
     if legacy_message is not None and (
@@ -397,7 +408,11 @@ def upsert_conversation_message(
     # Polls are fresh provider snapshots; webhooks may be delayed/replayed.
     # Neither app intent nor historical local copies can overwrite native text.
     source_rank = {"legacy_backfill": 0, "app_send": 1, "webhook": 2, "poll": 3}
-    authoritative = source_rank[source] >= max((source_rank.get(item, -1) for item in row.sources), default=-1)
+    authoritative = (
+        content_authority
+        if isinstance(content_authority, bool)
+        else source_rank[source] >= max((source_rank.get(item, -1) for item in row.sources), default=-1)
+    )
     own_ids = {_id(account.account_platform_id), _id(account.webhook_target_id)} - {""}
     if (
         sender_id
@@ -419,9 +434,11 @@ def upsert_conversation_message(
         row.body = ""
         row.attachments = []
     else:
-        if isinstance(body, str) and body and (not row.body or authoritative):
+        if isinstance(body, str) and (body or content_authority is True) and (not row.body or authoritative):
             row.body = body
-        projection = merge_message_extra({"inbox_attachments": row.attachments}, extra)
+        projection = (
+            extra if content_authority is True else merge_message_extra({"inbox_attachments": row.attachments}, extra)
+        )
         row.attachments = normalize_attachments(projection)
     row.content_status = merged_content_status(
         row.content_status, extra, body=row.body, attachments=row.attachments, deleted=row.is_deleted
@@ -442,6 +459,8 @@ def upsert_conversation_message(
         row.legacy_message = legacy_message
     if legacy_reply:
         row.legacy_reply = legacy_reply
+    if previous_conversation_id and row.conversation_id != previous_conversation_id:
+        row.incoming_generation = None
     row.save()
     changed = bool(
         removed_conversation_id
@@ -461,17 +480,18 @@ def upsert_conversation_message(
     # Historical identity changes cannot erase uncertain outcomes either.
     # Quarantine is a safety hold with no due time, not queued inbound work.
     quarantine_transferred_uncertainty(account, old_conversation_ids, row.conversation_id)
-    if source != "legacy_backfill":
+    if source != "legacy_backfill" and not suppress_work:
         invalidate_conversations(account, old_conversation_ids)
-    observe_message(
-        row.pk,
-        source=source,
-        is_new=previous is None,
-        previous_direction=previous["direction"] if previous else None,
-        previous_conversation_id=previous_conversation_id,
-        previous_attribution=previous["conversation_attribution"] if previous else "",
-        changed=changed,
-    )
+    if not suppress_work:
+        observe_message(
+            row.pk,
+            source=source,
+            is_new=previous is None,
+            previous_direction=previous["direction"] if previous else None,
+            previous_conversation_id=previous_conversation_id,
+            previous_attribution=previous["conversation_attribution"] if previous else "",
+            changed=changed,
+        )
     return row
 
 
@@ -506,6 +526,7 @@ def link_legacy_message(row, message):
         ).update(conversation_revision=F("conversation_revision") + 1, updated_at=timezone.now())
 
 
+@transaction.atomic
 def record_reply(reply, *, source="app_send"):
     """Mirror a legacy send without upgrading unsupported/local delivery claims."""
     if not capture_allowed(reply.inbox_message.social_account) or reply.status != InboxReply.Status.SENT:
@@ -516,7 +537,11 @@ def record_reply(reply, *, source="app_send"):
     account = message.social_account
     extra = _dict(message.extra)
     # These are provider-scoped addressing IDs, never a display handle fallback.
-    peer_id = _id(extra.get("sender_id")) or _id(_dict(extra.get("sender")).get("id"))
+    peer_id = (
+        (_id(reply.recipient_id) if reply.conversation_id else "")
+        or _id(extra.get("sender_id"))
+        or _id(_dict(extra.get("sender")).get("id"))
+    )
     outbound_extra = {"message_recipient_id": peer_id, "direction": "outbound"}
     # The send result contains a message ID, not a conversation ID. A legacy
     # parent thread is not proof that the provider placed this reply in it.
@@ -525,7 +550,7 @@ def record_reply(reply, *, source="app_send"):
     for key in ("participant_ids", "participants", "conversation_type", "classification_reason"):
         if key in extra:
             outbound_extra[key] = extra[key]
-    return upsert_conversation_message(
+    row = upsert_conversation_message(
         account,
         platform_message_id=reply.platform_reply_id,
         sender_id=account.account_platform_id,
@@ -536,6 +561,13 @@ def record_reply(reply, *, source="app_send"):
         source=source,
         legacy_reply=reply,
     )
+    from .conversation_workflow import record_composer_outcome
+    from .sync_observations import record_app_send_provenance
+
+    record_app_send_provenance(row, reply)
+    if reply.conversation_id:
+        record_composer_outcome(reply)
+    return row
 
 
 @transaction.atomic

@@ -717,6 +717,9 @@ MCP_EVENTS_SUBSCRIPTION_TTL_SECONDS = env.int("MCP_EVENTS_SUBSCRIPTION_TTL_SECON
 
 # Additive, read-only conversation history rollout; legacy inbox stays unchanged.
 INBOX_CONVERSATION_V2_ENABLED = env.bool("INBOX_CONVERSATION_V2_ENABLED", default=False)
+INBOX_CONVERSATION_COMPOSER_ENABLED = env.bool("INBOX_CONVERSATION_COMPOSER_ENABLED", default=False)
+INBOX_CONVERSATION_WORKFLOW_ENABLED = env.bool("INBOX_CONVERSATION_WORKFLOW_ENABLED", default=False)
+INBOX_CANONICAL_READ_ENABLED = env.bool("INBOX_CANONICAL_READ_ENABLED", default=False)
 # Raw JSON is validated by conversation_policy; malformed enrollment fails
 # closed without making the rest of the legacy inbox unavailable at startup.
 INBOX_CONVERSATION_V2_CAPTURE_ACCOUNTS = os.environ.get("INBOX_CONVERSATION_V2_CAPTURE_ACCOUNTS", "[]")
@@ -729,3 +732,6 @@ INBOX_REPLY_DISPATCH_ENABLED = env.bool("INBOX_REPLY_DISPATCH_ENABLED", default=
 INBOX_CONVERSATION_PRESENTATION_ENABLED = env.bool("INBOX_CONVERSATION_PRESENTATION_ENABLED", default=True)
 # Emergency hold only; never clears uncertain delivery or enrollment history.
 INBOX_DM_SENDS_ENABLED = env.bool("INBOX_DM_SENDS_ENABLED", default=True)
+
+# Durable synchronization requires explicit persisted enrollment; default off.
+INBOX_DURABLE_SYNC_ENABLED = env.bool("INBOX_DURABLE_SYNC_ENABLED", default=False)

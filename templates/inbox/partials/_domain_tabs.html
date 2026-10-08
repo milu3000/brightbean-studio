@@ -1,0 +1,6 @@
+<nav aria-label="Inbox sections" class="flex gap-3 text-sm">
+<a href="{% url 'inbox:feed' workspace_id=workspace.id %}?domain=dm" {% if inbox_domain == 'dm' %}aria-current="page"{% endif %}>DMs</a>
+<a href="{% url 'inbox:feed' workspace_id=workspace.id %}?domain=comment" {% if inbox_domain == 'comment' %}aria-current="page"{% endif %}>Comments</a>
+<a href="{% url 'inbox:feed' workspace_id=workspace.id %}?domain=mention" {% if inbox_domain == 'mention' %}aria-current="page"{% endif %}>Mentions</a>
+<a href="{% url 'inbox:feed' workspace_id=workspace.id %}?domain=review" {% if inbox_domain == 'review' %}aria-current="page"{% endif %}>Reviews</a>
+</nav>

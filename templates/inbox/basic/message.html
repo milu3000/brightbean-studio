@@ -1,0 +1,8 @@
+<article>
+<p><strong>{{ message.direction|capfirst }}</strong> · {{ message.sender_name }}{% if message.occurred_at %} · <time>{{ message.occurred_at }}</time>{% else %} · Time unavailable{% endif %}</p>
+{% if message.is_expired %}<p>Content expired</p>{% elif message.is_deleted %}<p>Message withdrawn</p>{% elif message.content_status == "unavailable" %}<p>Content unavailable</p>{% else %}
+<p>{{ message.body|linebreaksbr }}</p>
+{% for attachment in message.attachments %}<p>{% if attachment.url %}<a href="{{ attachment.url }}" target="_blank" rel="noopener noreferrer">{{ attachment.title|default:"Attachment" }}</a>{% else %}Attachment unavailable{% endif %}</p>{% endfor %}
+{% endif %}
+{% if message.body_truncated or message.attachments_truncated %}<p>Preview shortened{% if message.body_url %} · <a href="{{ message.body_url }}">Read full text</a>{% endif %}{% if message.attachments_url %} · <a href="{{ message.attachments_url }}">All attachments</a>{% endif %}</p>{% endif %}
+</article>

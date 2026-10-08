@@ -468,10 +468,18 @@ def _supported_older_cursor(paging, account, native_id):
     try:
         expected = urlsplit(f"{_native_api_base(account)}/{quote(native_id, safe='')}/messages")
         candidate = urlsplit(next_url)
+        # IG Login can advertise v26.0 paging for a configured v25.0 request.
+        # Match only that version pair and the exact remaining path; requests
+        # still use _native_api_base and never follow the advertised URL.
+        path_matches = candidate.path == expected.path or (
+            account.platform == "instagram_login"
+            and expected.path.startswith("/v25.0/")
+            and candidate.path == "/v26.0/" + expected.path.removeprefix("/v25.0/")
+        )
         if (
             candidate.scheme != "https"
             or candidate.netloc != expected.netloc
-            or candidate.path != expected.path
+            or not path_matches
             or candidate.username is not None
             or candidate.password is not None
             or candidate.fragment

@@ -79,21 +79,47 @@
     }
     function renderAttachments(parent, attachments) {
         attachments.forEach(function (attachment) {
-            const media = node(parent, 'div', '', 'border-t border-stone-200 mt-2 pt-2');
+            const media = node(parent, 'div', '', 'inbox-attachment border-t border-stone-200 mt-2 pt-2');
             const types = { image: 'Photo', video: 'Video', audio: 'Audio', file: 'File', share: 'Shared content' };
             node(media, 'p', types[attachment.type] || 'Attachment', 'text-[12px] font-semibold text-stone-600');
             if (typeof attachment.title === 'string') node(media, 'p', attachment.title, 'text-[12px] break-words');
             const url = attachment.availability === 'available' && attachmentLink(attachment.url);
-            if (url) {
-                const link = node(media, 'a', 'Open attachment', 'text-[12px] text-orange-700 underline');
-                link.href = url;
-                link.target = '_blank';
-                link.rel = 'noopener noreferrer';
-                link.referrerPolicy = 'no-referrer';
-                node(media, 'p', 'Platform links may expire or require sign-in.', 'text-[11px] text-stone-500');
-            } else {
-                node(media, 'p', 'Media unavailable. The platform supplied no safe usable link.', 'text-[12px] text-stone-500');
+            let post = false, preview = '';
+            if (url && attachment.type === 'share') {
+                const parts = new URL(url), host = parts.hostname.toLowerCase(), path = parts.pathname;
+                post = (['instagram.com', 'www.instagram.com'].includes(host) && /^\/(p|reel|reels|tv|stories)\/[^/]+/.test(path)) ||
+                    (['facebook.com', 'www.facebook.com', 'm.facebook.com', 'mbasic.facebook.com'].includes(host) &&
+                        (/\/(posts|photos|videos|reel|share)\/[^/]+/.test(path) ||
+                            (['/permalink.php', '/story.php', '/photo.php', '/watch/'].includes(path) && !!parts.search))) ||
+                    (['threads.net', 'www.threads.net', 'threads.com', 'www.threads.com'].includes(host) && /^\/@[^/]+\/post\/[^/]+/.test(path)) ||
+                    (host === 'fb.watch' && !!path.replaceAll('/', ''));
             }
+            const candidate = attachmentLink(attachment.preview_url);
+            if (candidate) {
+                const host = new URL(candidate).hostname.toLowerCase();
+                if (['fbcdn.net', 'cdninstagram.com', 'fbsbx.com'].some(domain => host === domain || host.endsWith('.' + domain))) preview = candidate;
+            }
+            function link(label, target) {
+                const anchor = node(media, 'a', label, 'text-[12px] text-orange-700 underline mr-3');
+                anchor.href = target; anchor.target = '_blank';
+                anchor.rel = 'noopener noreferrer'; anchor.referrerPolicy = 'no-referrer';
+                return anchor;
+            }
+            if (preview) {
+                const imageLink = link('', post ? url : preview);
+                imageLink.setAttribute('aria-label', post ? 'Open original post' : 'View image');
+                const img = node(imageLink, 'img', '', 'max-w-full max-h-64 rounded-md object-contain mt-2');
+                img.src = preview; img.alt = 'Attachment preview'; img.loading = 'lazy'; img.referrerPolicy = 'no-referrer';
+                img.dataset.inboxPreview = '';
+                const fallback = node(media, 'p', 'Preview unavailable.', 'text-[12px] text-stone-500');
+                fallback.dataset.inboxPreviewFallback = ''; fallback.hidden = true;
+            }
+            if (url) {
+                link(post ? 'Open original post' : attachment.type === 'image' ? 'View image' : 'Open attachment', url);
+            } else if (!preview) {
+                node(media, 'p', 'Content unavailable.', 'text-[12px] text-stone-500');
+            }
+            if (preview && preview !== url) link('View image', preview);
         });
     }
     function partial(item) {
@@ -110,7 +136,7 @@
         card.dataset.nativeThreadItem = '';
         card.style.maxWidth = '85%';
         const direction = item.direction === 'outbound' ? 'Account-side message' : item.direction === 'inbound' ? 'Incoming message' : 'Direction unverified';
-        node(card, 'p', direction + ' · observed on platform', 'text-[11px] font-semibold text-stone-600');
+        node(card, 'p', direction, 'text-[11px] font-semibold text-stone-600');
         const time = node(card, 'time', stamp(item.occurred_at) || 'Time unavailable · chronological position unverified', 'text-[11px] text-stone-500 mt-1');
         if (eventTime(item.occurred_at) !== null) time.dateTime = item.occurred_at;
         if (explanation) node(card, 'p', explanation, 'text-[11px] text-amber-800 mt-1');
@@ -207,10 +233,6 @@
     function supplement(stored, item) {
         const bubble = stored.querySelector('[data-stored-event-bubble]') || stored;
         const evidence = transient(node(bubble, 'div', '', 'text-[11px] text-stone-500 mt-2'));
-        node(evidence, 'p', 'Also observed on platform · same message ID');
-        if (eventTime(stored.dataset.eventTime) !== eventTime(item.occurred_at)) {
-            node(evidence, 'p', 'Platform time: ' + stamp(item.occurred_at) + '. Saved event time is unchanged.');
-        }
         const body = stored.querySelector('[data-stored-event-body]');
         if ((!body || !body.textContent) && typeof item.body === 'string' && item.body) {
             node(evidence, 'p', item.body, 'text-[13px] text-stone-800 whitespace-pre-wrap break-words mt-2');
@@ -223,7 +245,6 @@
             return !url || !existing.has(url);
         });
         if (extra.length) {
-            node(evidence, 'p', 'Additional media observed on platform');
             renderAttachments(evidence, extra);
         }
         if (partial(item)) node(evidence, 'p', 'The platform observation is partial; saved content is retained.');
@@ -277,7 +298,7 @@
                 if (!unpositioned) {
                     unpositioned = transient(node(state.timeline, 'section', '', 'space-y-3 border-t border-amber-200 pt-3'));
                     unpositioned.dataset.nativeUnpositioned = '';
-                    node(unpositioned, 'p', 'Platform observations · chronological position unverified', 'text-[12px] text-amber-800');
+                    node(unpositioned, 'p', 'Time unavailable', 'text-[12px] text-amber-800');
                 }
                 renderItem(unpositioned, record.item, record.explanation);
             } else {
@@ -385,7 +406,7 @@
             if (result.anchor_message_id !== state.anchor) throw new Error('mismatched_anchor');
             readMetadata(state.root, result);
             if (result.status !== 'observed' || !response.ok) {
-                status.textContent = reasons[result.reason_code] || 'The conversation could not be read. Saved history is still available.';
+                status.textContent = reasons[result.reason_code] || 'Messages could not be loaded. Try again.';
                 return;
             }
             if (!Array.isArray(result.items) || result.items.some(item => !item || item.source !== 'platform_observed')) throw new Error('invalid_items');
@@ -397,19 +418,14 @@
             const beforeHeight = state.scroller.scrollHeight;
             const beforeTop = state.scroller.scrollTop;
             merge(state, state.items);
-            const checked = stamp(result.checked_at);
-            status.textContent = (checked ? 'Read at ' + checked + '. ' : '') +
-                'Platform observations are temporary, not saved, and may be incomplete or already out of date. ' +
-                'Only loaded history is shown; gaps may remain. ' +
-                'Times use your browser timezone (' + Intl.DateTimeFormat().resolvedOptions().timeZone + '). ' +
-                'This does not establish who sent a message or confirm delivery of a BrightBean reply.';
-            if (!result.items.length) status.textContent += ' No messages were returned; this does not mean no reply exists.';
-            if (result.more_available || (result.coverage && result.coverage.truncated)) status.textContent += state.nativeCursor ? ' Scroll up to load earlier platform messages.' : ' Additional platform messages may exist; no earlier platform page is available in this read.';
+            const partial = Boolean(result.more_available || (result.coverage && result.coverage.truncated));
+            status.textContent = partial && !state.nativeCursor ? 'Earlier messages could not be loaded.' :
+                result.items.length ? '' : 'No messages were returned.';
             if (result.newer_outbound_observed) {
-                warning.textContent = 'A newer account-side message was observed. Review it before deciding whether to reply.';
+                warning.textContent = 'Newer account activity is available.';
                 warning.hidden = false;
             }
-            succeeded = true;
+            succeeded = !partial || Boolean(state.nativeCursor);
             if (state.userScrolledUp && anchor) keepAnchor(state, anchor, beforeHeight, beforeTop);
             else if (!state.userScrolledUp) bottom(state);
         } catch (_) {
@@ -418,7 +434,7 @@
                 restoreTimeline(state.timeline);
                 state.items = null;
                 warning.hidden = true;
-                status.textContent = 'The platform conversation could not be read. Your draft and saved history are still here. You can retry.';
+                status.textContent = 'Messages could not be loaded. Try again.';
             }
         } finally {
             if (valid()) { state.loading = false; button.disabled = false; button.hidden = succeeded; }
@@ -468,7 +484,7 @@
         const cursor = state.nativeCursor;
         if (state.nativeCursors.has(cursor)) {
             state.nativeCursor = '';
-            status.textContent = 'Earlier platform history did not advance. Older activity may remain.';
+            status.textContent = 'Earlier messages could not be loaded. Try again.';
             return;
         }
         const controller = new AbortController();
@@ -510,7 +526,7 @@
                 !Array.isArray(result.items) || result.items.some(item => !item || item.source !== 'platform_observed')) throw new Error('native_page_invalid');
             if (typeof result.page_key === 'string' && result.page_key && state.nativePageKeys.has(result.page_key)) {
                 state.nativeCursor = '';
-                status.textContent = 'Earlier platform history did not advance. Older activity may remain.';
+                status.textContent = 'Earlier messages could not be loaded. Try again.';
                 return;
             }
             const combined = combinePages(state.items, result.items);
@@ -531,13 +547,13 @@
             state.nativeCursor = next && !state.nativeCursors.has(next) && advanced ? next : '';
             merge(state, state.items);
             status.textContent = !advanced || (next && !state.nativeCursor) ?
-                'Earlier platform history did not advance. Older activity may remain.' : state.nativeCursor ?
-                'Earlier platform messages loaded. Scroll up to load more; this view may still be incomplete.' :
-                'No further platform page is available from this read. Missing or unavailable platform history may still exist.';
+                'Earlier messages could not be loaded. Try again.' : state.nativeCursor ?
+                '' :
+                '';
             keepAnchor(state, anchor, beforeHeight, beforeTop);
         } catch (_) {
             if (valid()) {
-                status.textContent = 'Earlier platform messages could not be loaded. Already observed messages may be stale or incomplete; your draft is still here.';
+                status.textContent = 'Earlier messages could not be loaded. Try again.';
                 retry.hidden = false;
             }
         } finally { if (valid()) state.nativePageController = null; }
@@ -642,7 +658,7 @@
         const retry = state.root.querySelector('[data-stored-history-retry]');
         if (storedEvents(state.timeline).length >= savedRowLimit || state.savedPages >= savedPageLimit) {
             state.timeline.dataset.olderUrl = '';
-            status.textContent = 'Saved history view limit reached (500 messages or 25 pages). Earlier saved activity may remain.';
+            status.textContent = 'Message limit reached.';
             retry.hidden = true;
             state.pageController = null;
             return;
@@ -687,7 +703,7 @@
             const newIds = new Set(earlier.map(element => element.dataset.eventId).filter(id => !knownIds.has(id)));
             if (storedEvents(state.timeline).length + newIds.size > savedRowLimit) {
                 state.timeline.dataset.olderUrl = '';
-                status.textContent = 'Saved history view limit reached (500 messages). This additional page was not displayed; earlier saved activity may remain.';
+                status.textContent = 'Message limit reached.';
                 return;
             }
             const anchor = scrollAnchor(state);
@@ -713,10 +729,10 @@
             removeLoadedSelectedAside(state);
             localTimes(state.panel);
             if (state.items) merge(state, state.items);
-            status.textContent = olderUrl ? 'Earlier saved messages loaded. Scroll up to load more.' : 'Beginning of saved history reached. Platform history may still be incomplete.';
+            status.textContent = '';
             keepAnchor(state, anchor, beforeHeight, beforeTop);
         } catch (_) {
-            if (valid()) { status.textContent = 'Earlier saved messages could not be loaded. Your current view and draft are still here.'; retry.hidden = false; }
+            if (valid()) { status.textContent = 'Earlier messages could not be loaded. Try again.'; retry.hidden = false; }
         } finally { if (valid()) state.pageController = null; }
     }
     function initialize(options) {
@@ -760,7 +776,7 @@
         }
         if (saved && !retainSavedHistory(state, saved)) {
             root.querySelector('[data-stored-history-status]').textContent =
-                'Saved history changed or exceeds this view’s limit. The fresh saved page is shown; scroll up to load earlier messages again.';
+                'History changed. Load earlier messages again.';
         }
         localTimes(panel);
         if (recovering) {

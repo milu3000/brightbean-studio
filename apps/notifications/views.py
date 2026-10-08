@@ -1,103 +1,137 @@
 from django.contrib.auth.decorators import login_required
-from django.http import JsonResponse
+from django.core import signing
+from django.db import transaction
+from django.http import HttpResponse, JsonResponse
 from django.shortcuts import redirect, render
-from django.utils import timezone
 from django.views.decorators.http import require_GET, require_POST
 
 from .models import (
     Channel,
     EventType,
-    Notification,
     NotificationPreference,
     QuietHours,
 )
+from .state import apply_snapshot, snapshot, snapshot_for_rows, snapshot_rows, visible_notifications
+
+
+def _visible(request, *, lock=False):
+    return visible_notifications(request.user, getattr(request, "workspace", None), lock_memberships=lock)
+
+
+def _present(request, notifications):
+    for item in notifications:
+        item.read_snapshot = snapshot_for_rows(request, [(item.pk, item.revision)])
+    return notifications
+
+
+def _drawer_context(request):
+    qs = _visible(request).filter(dismissed_at__isnull=True)
+    token = snapshot(request, qs)
+    rows = list(
+        qs.select_related("inbox_message__social_account", "conversation").order_by("-last_event_at", "-created_at")[
+            :50
+        ]
+    )
+    return {"notifications": _present(request, rows), "notification_snapshot": token}
+
+
+def _history_context(request):
+    params = request.POST if request.method == "POST" else request.GET
+    kind, status = params.get("event_type", ""), params.get("read_status", "")
+    qs = _visible(request)
+    token = snapshot(request, qs.filter(dismissed_at__isnull=True))
+    qs = qs.filter(dismissed_at__isnull=status != "dismissed")
+    if kind:
+        qs = qs.filter(event_type=kind)
+    if status in {"read", "unread"}:
+        qs = qs.filter(is_read=status == "read")
+    try:
+        page = max(1, int(params.get("page", 1)))
+    except (ValueError, TypeError):
+        page = 1
+    total = qs.count()
+    page = min(page, max(1, (total + 29) // 30))
+    offset = (page - 1) * 30
+    rows = list(
+        qs.select_related("inbox_message__social_account", "conversation").order_by("-last_event_at", "-created_at")[
+            offset : offset + 30
+        ]
+    )
+    return {
+        "notifications": _present(request, rows),
+        "notification_snapshot": token,
+        "event_types": EventType.choices,
+        "selected_event_type": kind,
+        "selected_read_status": status,
+        "page": page,
+        "total": total,
+        "has_next": total > offset + 30,
+        "has_prev": page > 1,
+        "update_notification_total": bool(request.htmx),
+    }
 
 
 @login_required
 @require_GET
 def notification_drawer(request):
-    """HTMX partial: renders the 50 most recent notifications for the drawer."""
-    notifications = Notification.objects.filter(user=request.user).order_by("-created_at")[:50]
-    return render(
-        request,
-        "notifications/partials/drawer.html",
-        {
-            "notifications": notifications,
-        },
-    )
+    return render(request, "notifications/partials/drawer.html", _drawer_context(request))
 
 
 @login_required
 @require_GET
 def notification_list(request):
-    """Full notification history page with filtering."""
-    event_type = request.GET.get("event_type", "")
-    read_status = request.GET.get("read_status", "")
+    return render(
+        request,
+        "notifications/partials/history_list.html" if request.htmx else "notifications/history.html",
+        _history_context(request),
+    )
 
-    qs = Notification.objects.filter(user=request.user)
 
-    if event_type:
-        qs = qs.filter(event_type=event_type)
-    if read_status == "read":
-        qs = qs.filter(is_read=True)
-    elif read_status == "unread":
-        qs = qs.filter(is_read=False)
-
-    # Pagination
-    page = int(request.GET.get("page", 1))
-    per_page = 30
-    offset = (page - 1) * per_page
-    notifications = qs[offset : offset + per_page]
-    total = qs.count()
-    has_next = total > offset + per_page
-    has_prev = page > 1
-
-    context = {
-        "notifications": notifications,
-        "event_types": EventType.choices,
-        "selected_event_type": event_type,
-        "selected_read_status": read_status,
-        "page": page,
-        "has_next": has_next,
-        "has_prev": has_prev,
-        "total": total,
-    }
-
-    if request.htmx:
-        return render(request, "notifications/partials/history_list.html", context)
-    return render(request, "notifications/history.html", context)
+@transaction.atomic
+def _mutate(request, *, notification_id=None, dismiss=False):
+    qs = _visible(request, lock=True)
+    if notification_id:
+        qs = qs.filter(pk=notification_id)
+    try:
+        rows = snapshot_rows(request, request.POST.get("snapshot", ""), qs)
+    except signing.BadSignature:
+        error = "This notification view has expired or changed. Refresh and try again."
+        return (
+            HttpResponse(error, status=409) if request.htmx else JsonResponse({"ok": False, "error": error}, status=409)
+        )
+    updated = apply_snapshot(qs, rows, dismiss=dismiss)
+    if not request.htmx:
+        return JsonResponse({"ok": True, "updated": updated})
+    if request.POST.get("surface") == "history" or request.headers.get("HX-Target") == "notification-history-list":
+        response = render(request, "notifications/partials/history_list.html", _history_context(request))
+    else:
+        response = render(request, "notifications/partials/drawer.html", _drawer_context(request))
+    response["HX-Trigger"] = "notificationsChanged"
+    return response
 
 
 @login_required
 @require_POST
 def mark_as_read(request, notification_id):
-    """Mark a single notification as read."""
-    Notification.objects.filter(id=notification_id, user=request.user, is_read=False).update(
-        is_read=True, read_at=timezone.now()
-    )
-
-    if request.htmx:
-        return render(request, "notifications/partials/empty.html")
-    return JsonResponse({"ok": True})
+    return _mutate(request, notification_id=notification_id)
 
 
 @login_required
 @require_POST
 def mark_all_read(request):
-    """Mark all notifications as read."""
-    Notification.objects.filter(user=request.user, is_read=False).update(is_read=True, read_at=timezone.now())
+    return _mutate(request)
 
-    if request.htmx:
-        return notification_drawer(request)
-    return JsonResponse({"ok": True})
+
+@login_required
+@require_POST
+def dismiss_notification(request, notification_id):
+    return _mutate(request, notification_id=notification_id, dismiss=True)
 
 
 @login_required
 @require_GET
 def unread_count(request):
-    """JSON endpoint for polling unread badge count."""
-    count = Notification.objects.filter(user=request.user, is_read=False).count()
-    return JsonResponse({"count": count})
+    return JsonResponse({"count": _visible(request).filter(is_read=False, dismissed_at__isnull=True).count()})
 
 
 @login_required

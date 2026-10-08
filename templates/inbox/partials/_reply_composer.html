@@ -49,6 +49,7 @@
         {% endif %}
     </div>
 
+    {% if public_thread_view %}<p class="text-[11px] text-stone-500 mb-2">Replying to {{ reply_target.sender_name }} · {{ reply_target.content_preview|truncatewords:16 }}</p>{% endif %}
     <!-- Reply form -->
     <div x-show="mode === 'reply'" x-transition>
         {% if follow_up_reply_id %}
@@ -60,18 +61,13 @@
                    hx-target="#inbox-detail-panel" hx-sync="#inbox-detail-panel:queue last"
                    data-inbox-open-message="{{ reply_target.id }}" class="text-[11px] underline">Cancel additional reply</a>
             </div>
-            {% if follow_up_parent %}<p class="text-[11px] text-stone-600 mt-1">After your sent reply from {{ follow_up_parent.sent_at|date:"N j, Y g:i A" }}: {{ follow_up_parent.body|truncatewords:20 }}</p>{% endif %}
-            <p class="text-[10px] text-stone-500 mt-1">This sends a new message after the selected reply.</p>
+            {% if follow_up_parent %}<p class="text-[11px] text-stone-600 mt-1">After your sent reply from <time datetime="{{ follow_up_parent.sent_at|date:'c' }}">{{ follow_up_parent.sent_at|date:"N j, Y g:i A" }}</time>: {{ follow_up_parent.display_body|truncatewords:20 }}</p>{% endif %}
         </div>
-        {% endif %}
-        {% if conversation_view or follow_up_reply_id %}
-        <p class="text-[11px] text-stone-600 mb-1" data-reply-target-id="{{ reply_target.id }}">Reply target: {{ reply_target.sender_name }} · {{ reply_target.received_at|date:"N j, Y g:i A" }} · {{ reply_target.content_preview|truncatewords:16 }}</p>
-        <p class="text-[10px] text-stone-500 mb-2">This reply stays attached to that message. Refresh to review newer incoming messages.</p>
         {% endif %}
         {% if send_availability and not send_availability.allowed %}
         <p id="reply-hold-reason" role="status" class="text-[12px] text-amber-800 mb-2">{{ send_availability.reason }}</p>
         {% endif %}
-        <form hx-post="{% url 'inbox:send_reply' workspace_id=workspace.id message_id=reply_target.id %}"
+        <form data-inbox-reply-form data-reply-target-id="{{ reply_target.id }}" hx-post="{% url 'inbox:send_reply' workspace_id=workspace.id message_id=reply_target.id %}"
               hx-target="#inbox-detail-panel" hx-swap="innerHTML" hx-disabled-elt="find button"
               hx-sync="#inbox-detail-panel:drop">
             {% csrf_token %}
@@ -86,7 +82,7 @@
                       class="w-full px-3 py-2 text-[13px] bg-white border border-stone-200 rounded-lg resize-none focus:outline-none focus:border-orange-400 focus:ring-2 focus:ring-orange-100 transition-all"
                       required></textarea>
             <div class="flex items-center justify-between mt-2">
-                <p class="text-[10px] text-stone-400">Reply will be posted on {{ message.social_account.get_platform_display|default:message.social_account.platform|title }}</p>
+                <div class="text-[11px] text-stone-500"><label class="inline-flex items-center gap-1.5"><input type="checkbox" data-inbox-enter-send>Enter to send</label><span data-inbox-shortcut-hint class="block text-[10px]">Ctrl+Enter to send</span></div>
                 <div class="flex items-center gap-2">
                     <button type="button"
                             hx-post="{% url 'inbox:save_reply_draft' workspace_id=workspace.id message_id=reply_target.id %}"
@@ -96,7 +92,7 @@
                             class="inline-flex items-center gap-1.5 px-4 py-1.5 text-[12px] font-semibold text-stone-600 rounded-full border border-stone-200 hover:bg-stone-50 transition-all duration-150 cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed">
                         Save as draft
                     </button>
-                    <button type="submit"
+                    <button type="submit" data-inbox-send-button
                             {% if send_availability and not send_availability.allowed %}disabled aria-describedby="reply-hold-reason"{% endif %}
                             class="btn-primary-hover inline-flex items-center gap-1.5 px-4 py-1.5 text-[12px] font-semibold text-white rounded-full transition-all duration-150 cursor-pointer"
                             style="background: var(--primary); box-shadow: var(--shadow-primary);" {% if send_availability and not send_availability.allowed %}aria-disabled="true"{% endif %}>
