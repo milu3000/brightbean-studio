@@ -110,6 +110,10 @@ resolve or send. Existing `get_reply_context` continues truthfully reporting
 
 ## Activation gates and remaining work
 
+The [synthetic dispatcher experiment](CONVERSATION_V2_SYNTHETIC_DISPATCH.md)
+exercises the durable attempt contract in disposable tests only. It does not
+implement or enable the production dispatcher required below.
+
 1. Validate PostgreSQL row locks, simultaneous claims, pause/ingestion races,
    uniqueness, failure recovery and migration behavior in an isolated database.
    SQLite validates sequential functional contracts only.
