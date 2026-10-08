@@ -10,7 +10,7 @@ from apps.members.decorators import require_permission
 from providers.meta_inbox_content import safe_attachment_url
 
 from . import canonical_reads as reader
-from .canonical_access import digest
+from .canonical_access import digest, narrow_scope
 from .models import ConversationMessage, InboxConversation
 
 SALT = "brightbean.internal-withdrawn-view.v1"
@@ -40,6 +40,8 @@ def retained_capabilities(scope, conversation_id, identifiers):
     """Capability lookup selects identity metadata only; archive text never enters the page."""
     from .sync_observations import withdrawn_content_available_for_internal_review
 
+    if conversation_id is not None:
+        scope = narrow_scope(scope, target=(InboxConversation, conversation_id))
     rows, _, stamp = _scoped(scope, conversation_id)
     ids = {
         str(row.pk)
@@ -55,6 +57,8 @@ def retained_capabilities(scope, conversation_id, identifiers):
 def _retained_value(scope, conversation_id, message_id):
     from .sync_observations import withdrawn_content_for_internal_review
 
+    if conversation_id is not None:
+        scope = narrow_scope(scope, target=(InboxConversation, conversation_id))
     rows, conversation, stamp = _scoped(scope, conversation_id)
     row = rows.select_related("observation_state").filter(pk=message_id).first()
     if row is None:
@@ -148,7 +152,9 @@ def detail(request, workspace_id, message_id, conversation_id=None):
         return HttpResponse("Not found.", status=404)
     kind, cursor = request.POST.get("kind"), request.POST.get("cursor") or None
     try:
-        scope = reader.session_read_scope(request.user, workspace.pk)
+        scope = narrow_scope(
+            reader.session_read_scope(request.user, workspace.pk), target=(ConversationMessage, message_id)
+        )
         rows, _, stamp = _scoped(scope, conversation_id)
         if not rows.filter(pk=message_id).exists():
             raise reader._denied()

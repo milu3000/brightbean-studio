@@ -130,6 +130,44 @@ def key_read_scope(api_key, request=None):
     )
 
 
+def narrow_scope(scope, *, social_account_ids=None, platforms=None, target=None):
+    """Restrict an existing actor scope without replacing its fresh grants.
+
+    A target is a persisted inbox row. Its account is only a selector: the
+    original scope and every subsequent snapshot still enforce authorization.
+    """
+    if not isinstance(scope, CanonicalReadScope):
+        raise denied()
+    selected = {identifier(value) for value in social_account_ids} if social_account_ids is not None else None
+    if target is not None:
+        model, pk = target
+        account_id = (
+            model.objects.filter(
+                pk=identifier(pk), workspace_id=scope.workspace_id, social_account__workspace_id=scope.workspace_id
+            )
+            .values_list("social_account_id", flat=True)
+            .first()
+        )
+        if account_id is None or (selected is not None and account_id not in selected):
+            raise denied()
+        selected = {account_id}
+    if selected is None and not platforms:
+        return scope
+
+    def refresh():
+        accounts, grants = scope.refresh()
+        accounts = accounts.filter(workspace_id=scope.workspace_id)
+        if selected is not None:
+            accounts = accounts.filter(pk__in=selected)
+            if set(accounts.values_list("pk", flat=True)) != selected:
+                raise denied()
+        if platforms:
+            accounts = accounts.filter(platform__in=platforms)
+        return accounts, grants
+
+    return CanonicalReadScope(scope.workspace_id, scope.principal, refresh, scope.user_id)
+
+
 def archive_identity(account):
     from .models import InboxArchiveIdentity
 

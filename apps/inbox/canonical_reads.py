@@ -17,6 +17,7 @@ from .canonical_access import (
     digest,
     enabled,
     key_read_scope,
+    narrow_scope,
     session_read_scope,
 )
 from .canonical_access import (
@@ -368,6 +369,14 @@ def unread_conversation_count(scope):
 def list_conversations(
     scope, *, social_account_id=None, platform=None, workflow_state=None, search="", cursor=None, limit=30
 ):
+    from .canonical_compat import inbox_sources
+
+    scope = narrow_scope(
+        scope,
+        social_account_ids=[social_account_id] if social_account_id is not None else None,
+        platforms=[platform] if platform else None,
+    )
+    sources = inbox_sources(scope, social_account_ids=[social_account_id] if social_account_id is not None else None)
     _limit(limit)
     if not isinstance(search, str) or len(search) > 500:
         raise CanonicalReadError("invalid_search", "search must be at most 500 characters")
@@ -375,7 +384,12 @@ def list_conversations(
         raise CanonicalReadError("invalid_filter", "This canonical DM adapter does not support that platform.")
     if workflow_state is not None and workflow_state not in {"needs_action", "waiting", "done", "unclassified"}:
         raise CanonicalReadError("invalid_filter", "Unknown workflow state")
-    accounts, token = _snapshot(scope)
+    try:
+        accounts, token = _snapshot(scope)
+    except CanonicalReadError as exc:
+        if exc.code == "canonical_unavailable":
+            exc.data = {**(exc.data or {}), "account_sources": sources}
+        raise
     query = InboxConversation.objects.filter(_scope_filter(scope, accounts))
     if social_account_id is not None:
         social_account_id = _uuid(social_account_id)
@@ -446,9 +460,15 @@ def list_conversations(
         (row.pk, row.revision, row.incoming_generation) for row in consumed
     }:
         raise CanonicalReadError("stale_revision", "Conversation history changed while reading; reload.")
+    if (
+        inbox_sources(scope, social_account_ids=[social_account_id] if social_account_id is not None else None)
+        != sources
+    ):
+        raise CanonicalReadError("stale_scope", "The current inbox sources changed; reload.")
     more = len(rows) > len(consumed)
     return {
         "source": "canonical",
+        "account_sources": sources,
         "persisted": True,
         "conversations": items,
         "items": items,
@@ -476,6 +496,7 @@ def _notifications(scope, conversation, seen_generation):
 
 def read_conversation(scope, conversation_id, *, cursor=None, limit=30):
     _limit(limit)
+    scope = narrow_scope(scope, target=(InboxConversation, conversation_id))
     accounts, token = _snapshot(scope)
     row = InboxConversation.objects.filter(_scope_filter(scope, accounts), pk=_uuid(conversation_id)).first()
     if row is None:
@@ -588,6 +609,7 @@ def read_conversation(scope, conversation_id, *, cursor=None, limit=30):
 def acknowledge_read(scope, conversation_id, read_ack_token):
     from .locking import lock_dm_account
 
+    scope = narrow_scope(scope, target=(InboxConversation, conversation_id))
     accounts, token = _snapshot(scope)
     selected = InboxConversation.objects.filter(_scope_filter(scope, accounts), pk=_uuid(conversation_id)).first()
     if selected is None or lock_dm_account(selected.social_account_id, scope.workspace_id) is None:
@@ -648,6 +670,7 @@ def acknowledge_read(scope, conversation_id, read_ack_token):
 
 
 def resolve_legacy_conversation(scope, message_id):
+    scope = narrow_scope(scope, target=(InboxMessage, message_id))
     accounts, token = _snapshot(scope)
     legacy = InboxMessage.objects.filter(
         pk=_uuid(message_id),
@@ -675,6 +698,7 @@ def resolve_legacy_conversation(scope, message_id):
 
 def read_message_attachments(scope, message_id, *, cursor=None, limit=3, unassigned=False):
     _limit(limit, 10)
+    scope = narrow_scope(scope, target=(ConversationMessage, message_id))
     accounts, token = _snapshot(scope)
     row = ConversationMessage.objects.filter(
         _scope_filter(scope, accounts, messages=True, unassigned=unassigned),
@@ -792,6 +816,14 @@ def list_legacy_dm_adapter(*args, **kwargs):
     from .canonical_compat import list_legacy_dm_adapter as adapter
 
     return adapter(*args, **kwargs)
+
+
+def recheck_legacy_list(scope, expected, *, social_account_id=None):
+    from .canonical_compat import recheck_inbox_source
+
+    return recheck_inbox_source(
+        scope, expected, social_account_ids=[social_account_id] if social_account_id is not None else None
+    )
 
 
 def read_message_body(*args, **kwargs):

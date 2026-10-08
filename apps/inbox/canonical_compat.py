@@ -1,34 +1,134 @@
 """Explicit legacy read contracts without synthetic incoming records or sends."""
 
 from copy import copy
+from urllib.parse import urlencode
 
 from django.db.models import Q
+from django.urls import reverse
 
-from .canonical_access import archive_identity, enabled
+from .canonical_access import archive_identity, enabled, narrow_scope
 from .canonical_content import visible_content
 from .conversation_policy import read_allowed
 from .models import ConversationMessage, InboxConversation, InboxMessage, InboxReply
 
 
-def hold_legacy_fallback(scope, *, social_account_id=None):
-    from .canonical_reads import CanonicalReadError, _uuid
+def inbox_source_snapshot(scope, *, social_account_ids=None):
+    """Fresh account-scoped read entry points shared by session, REST and MCP.
+
+    Held accounts remain canonical-owned. Discovery is metadata only and never
+    grants permission to read their legacy shadows.
+    """
+    from .canonical_access import CanonicalReadError, denied, digest, identifier
     from .sync_identity import canonical_owns_account
 
-    accounts, _grants = scope.refresh()
-    if social_account_id is not None:
-        accounts = accounts.filter(pk=_uuid(social_account_id))
-    for account in accounts.only(
-        "id", "workspace_id", "platform", "account_platform_id", "webhook_target_id", "connection_status"
-    ):
-        if canonical_owns_account(account) and (
-            not enabled() or (not read_allowed(account) and archive_identity(account) is None)
-        ):
-            raise CanonicalReadError(
-                "canonical_unavailable", "This account requires the saved canonical inbox; legacy fallback is held."
+    selected = {identifier(value) for value in social_account_ids} if social_account_ids is not None else None
+
+    def snapshot():
+        allowed, grants = scope.refresh()
+        accounts = allowed.filter(workspace_id=scope.workspace_id)
+        if selected is not None:
+            accounts = accounts.filter(pk__in=selected)
+        accounts = list(
+            accounts.only(
+                "pk",
+                "workspace_id",
+                "platform",
+                "account_platform_id",
+                "webhook_target_id",
+                "account_name",
+                "account_handle",
+                "connection_status",
+            ).order_by("pk")
+        )
+        if selected is not None and {account.pk for account in accounts} != selected:
+            raise denied()
+        result = []
+        for account in accounts:
+            readable = enabled() and (read_allowed(account) or archive_identity(account) is not None)
+            source = "canonical" if readable else "canonical_held" if canonical_owns_account(account) else "legacy"
+            account_id = str(account.pk)
+            canonical = source != "legacy"
+            arguments = {"social_account_id": account_id}
+            if not canonical:
+                arguments["message_type"] = "dm"
+            result.append(
+                {
+                    "id": account_id,
+                    "platform": account.platform,
+                    "account_name": account.account_name,
+                    "account_handle": account.account_handle,
+                    "source": source,
+                    "inbox_url": reverse("inbox:feed", kwargs={"workspace_id": scope.workspace_id})
+                    + "?"
+                    + urlencode({"domain": "dm", "account": account_id}),
+                    "api": ("/api/v1/inbox-conversations/" if canonical else "/api/v1/inbox/")
+                    + "?"
+                    + urlencode(arguments),
+                    "tool": "list_conversations" if canonical else "list_inbox_messages",
+                    "arguments": arguments,
+                }
             )
+        return result, digest(
+            [
+                grants,
+                result,
+                [
+                    [
+                        account.pk,
+                        account.workspace_id,
+                        account.account_platform_id,
+                        account.webhook_target_id,
+                        account.connection_status,
+                    ]
+                    for account in accounts
+                ],
+            ]
+        )
+
+    sources, stamp = snapshot()
+    if snapshot()[1] != stamp:
+        raise CanonicalReadError("stale_scope", "The current inbox grants or account scope changed; reload.")
+    return sources, stamp
 
 
-def _upgrade(*, conversation_id=None, social_account_id=None):
+def inbox_sources(scope, *, social_account_ids=None):
+    return inbox_source_snapshot(scope, social_account_ids=social_account_ids)[0]
+
+
+def selected_inbox_source(scope, *, social_account_ids=None, platforms=None):
+    from .canonical_access import CanonicalReadError
+
+    sources, stamp = inbox_source_snapshot(scope, social_account_ids=social_account_ids)
+    if platforms:
+        sources = [item for item in sources if item["platform"] in platforms]
+    if any(item["source"] == "canonical_held" for item in sources):
+        raise CanonicalReadError(
+            "canonical_unavailable",
+            "This account requires the saved canonical inbox; legacy fallback is held.",
+            data={"account_sources": sources},
+        )
+    return {
+        "source": "canonical" if any(item["source"] == "canonical" for item in sources) else "legacy",
+        "accounts": sources,
+        "stamp": stamp,
+    }
+
+
+def recheck_inbox_source(scope, expected, *, social_account_ids=None, platforms=None):
+    from .canonical_access import CanonicalReadError
+
+    if (
+        expected is not None
+        and selected_inbox_source(scope, social_account_ids=social_account_ids, platforms=platforms) != expected
+    ):
+        raise CanonicalReadError("stale_scope", "The current inbox source or grants changed; reload.")
+
+
+def hold_legacy_fallback(scope, *, social_account_id=None):
+    selected_inbox_source(scope, social_account_ids=[social_account_id] if social_account_id is not None else None)
+
+
+def _upgrade(*, conversation_id=None, social_account_id=None, sources=None):
     from .canonical_reads import CanonicalReadError
 
     uri = f"/api/v1/inbox-conversations/{conversation_id}" if conversation_id else "/api/v1/inbox-conversations/"
@@ -45,26 +145,17 @@ def _upgrade(*, conversation_id=None, social_account_id=None):
             "coverage": "bidirectional_saved_dm",
             "history_complete": False,
             "legacy_public_message_types": ["comment", "mention", "review"],
+            **({"account_sources": sources} if sources is not None else {}),
         },
     )
 
 
 def _is_canonical(scope, message):
-    from .canonical_reads import _denied
-
     if message.message_type != "dm":
         return False
-    allowed, _grants = scope.refresh()
-    account = (
-        allowed.filter(pk=message.social_account_id, workspace_id=scope.workspace_id)
-        .only("id", "workspace_id", "platform", "account_platform_id", "webhook_target_id", "connection_status")
-        .first()
-    )
-    if account is None:
-        raise _denied()
-    if enabled() and (read_allowed(account) or archive_identity(account) is not None):
+    selection = selected_inbox_source(scope, social_account_ids=[message.social_account_id])
+    if selection["source"] == "canonical":
         return True
-    hold_legacy_fallback(scope, social_account_id=account.pk)
     # Even a disabled presentation must not return a blank transport adapter.
     if isinstance(message.extra, dict) and message.extra.get("transport_projection") is True:
         raise _upgrade()
@@ -72,20 +163,14 @@ def _is_canonical(scope, message):
 
 
 def list_legacy_dm_adapter(scope, *, message_type=None, status=None, social_account_id=None, cursor=None, limit=30):
-    from .canonical_reads import _recheck, _snapshot, _uuid
-
     if message_type not in {None, "dm"}:
         return None
-    hold_legacy_fallback(scope, social_account_id=social_account_id)
-    if not enabled():
-        return None
-    accounts, token = _snapshot(scope)
-    if social_account_id:
-        accounts = {pk: value for pk, value in accounts.items() if pk == _uuid(social_account_id)}
-    _recheck(scope, token)
-    if accounts:
-        raise _upgrade(social_account_id=social_account_id)
-    return None
+    selection = selected_inbox_source(
+        scope, social_account_ids=[social_account_id] if social_account_id is not None else None
+    )
+    if selection["source"] == "canonical":
+        raise _upgrade(social_account_id=social_account_id, sources=selection["accounts"])
+    return selection
 
 
 def read_legacy_thread(scope, message, *, cursor=None, limit=30):
@@ -160,6 +245,7 @@ def read_legacy_message(scope, message):
 
     if not _is_canonical(scope, message):
         return None
+    scope = narrow_scope(scope, social_account_ids=[message.social_account_id])
     conversation_id = resolve_legacy_conversation(scope, message.pk)
     accounts, token = _snapshot(scope)
     current = (
@@ -244,6 +330,7 @@ def read_legacy_message(scope, message):
 def read_canonical_incoming_message(scope, message_id):
     from .canonical_reads import _denied, _iso, _scope_filter, _size, _snapshot, _uuid, project_message
 
+    scope = narrow_scope(scope, target=(ConversationMessage, message_id))
     accounts, token = _snapshot(scope)
     row = ConversationMessage.objects.filter(
         _scope_filter(scope, accounts, messages=True),

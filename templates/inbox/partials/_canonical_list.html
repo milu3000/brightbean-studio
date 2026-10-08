@@ -1,3 +1,4 @@
+{% if canonical_unavailable %}<p class="p-5 text-sm" role="status">Some saved DM accounts are unavailable. Open an existing inbox using the account links above.</p>{% else %}
 {% for row in canonical_rows %}
 <a href="{% url 'inbox:conversation_detail' workspace_id=workspace.id conversation_id=row.id %}" hx-get="{% url 'inbox:conversation_detail' workspace_id=workspace.id conversation_id=row.id %}" hx-target="#inbox-detail-panel" hx-sync="#inbox-detail-panel:queue last" data-inbox-open-message="{{ row.id }}" data-canonical-conversation-row="{{ row.id }}" class="block px-4 py-3 border-b border-stone-100 hover:bg-stone-50">
 <div class="flex items-center gap-2"><span class="font-semibold text-sm">{{ row.peer_name }}</span>{% if row.read_state.unread %}<span aria-label="Unread" class="text-orange-600">●</span>{% endif %}{% include "inbox/partials/_canonical_status.html" with conversation=row %}</div>
@@ -6,3 +7,5 @@
 </a>
 {% empty %}<p class="p-5 text-sm text-stone-500">No conversations found</p>{% endfor %}
 {% if canonical_next_url %}<a href="{{ canonical_next_url }}" hx-get="{{ canonical_next_url }}" hx-target="#inbox-message-list" hx-sync="#inbox-message-list:queue last" hx-push-url="true" class="block p-3 text-center text-sm">Older conversations</a>{% endif %}
+
+{% endif %}

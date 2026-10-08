@@ -2,7 +2,7 @@
 
 from django.core import signing
 
-from .canonical_access import digest
+from .canonical_access import digest, narrow_scope
 from .canonical_content import visible_content
 from .models import ConversationMessage, InboxConversation
 
@@ -22,6 +22,7 @@ def read_message_body(scope, message_id, *, cursor=None, limit=2000, unassigned=
     )
 
     _limit(limit, 4000)
+    scope = narrow_scope(scope, target=(ConversationMessage, message_id))
     accounts, stamp = _snapshot(scope)
     row = ConversationMessage.objects.filter(
         _scope_filter(scope, accounts, messages=True, unassigned=unassigned), pk=_uuid(message_id)

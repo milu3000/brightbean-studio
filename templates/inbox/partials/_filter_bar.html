@@ -1,6 +1,7 @@
 {% load humanize %}
 <!-- Filter bar -->
 <form id="inbox-filters" @submit.prevent class="px-4 py-2.5 border-b border-stone-100 flex items-center gap-2 flex-wrap flex-shrink-0" style="background: var(--surface-1);">
+    <input type="hidden" name="read_source" value="legacy">
     {% if inbox_domain %}<input type="hidden" name="domain" value="{{ inbox_domain }}">{% endif %}
     <input type="hidden" name="view" value="{{ current_view|default:'all' }}">
     {% if active_filters.assigned %}<input type="hidden" name="assigned" value="{{ active_filters.assigned }}">{% endif %}

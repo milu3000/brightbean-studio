@@ -129,11 +129,11 @@
         <div class="flex items-center gap-3 sm:gap-4">
             <h1 class="text-base font-semibold text-stone-900" style="letter-spacing: -0.01em;">Inbox</h1>
             <div class="flex items-center gap-1 bg-stone-50 rounded-full p-0.5">
-                <a href="{% url 'inbox:feed' workspace_id=workspace.id %}"
+                <a href="{% url 'inbox:feed' workspace_id=workspace.id %}{% if shortcut_query %}?{{ shortcut_query }}{% endif %}"
                    class="inbox-tab {% if current_view == 'all' %}active{% endif %}">All</a>
-                <a href="{% url 'inbox:feed' workspace_id=workspace.id %}?view=mine"
+                <a href="{% url 'inbox:feed' workspace_id=workspace.id %}?{% if shortcut_query %}{{ shortcut_query }}&amp;{% endif %}view=mine"
                    class="inbox-tab {% if current_view == 'mine' %}active{% endif %}">My Queue</a>
-                <a href="{% url 'inbox:feed' workspace_id=workspace.id %}?view=unassigned"
+                <a href="{% url 'inbox:feed' workspace_id=workspace.id %}?{% if shortcut_query %}{{ shortcut_query }}&amp;{% endif %}view=unassigned"
                    class="inbox-tab {% if current_view == 'unassigned' %}active{% endif %}">Unassigned</a>
             </div>
         </div>

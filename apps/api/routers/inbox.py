@@ -134,7 +134,7 @@ def list_messages(
     if message_type is not None and message_type not in InboxMessage.MessageType.values:
         raise HttpError(422, f"message_type must be one of {', '.join(InboxMessage.MessageType.values)}")
 
-    canonical_invoke(
+    source_guard = canonical_invoke(
         canonical_reader.list_legacy_dm_adapter,
         read_scope(request),
         message_type=message_type,
@@ -169,12 +169,16 @@ def list_messages(
     rows = list(qs[offset : offset + limit + 1])
     has_more = len(rows) > limit
     rows = rows[:limit]
-    log_audit_entry(request, action="inbox.list", target_id=None, status_code=200)
-    return InboxMessagesListResponse(
+    response = InboxMessagesListResponse(
         messages=[InboxMessageResponse.from_message(m, include_replies=True, include_eligibility=True) for m in rows],
         limit=limit,
         next_cursor=encode_offset_cursor(offset + limit) if has_more else None,
     )
+    canonical_invoke(
+        canonical_reader.recheck_legacy_list, read_scope(request), source_guard, social_account_id=social_account_id
+    )
+    log_audit_entry(request, action="inbox.list", target_id=None, status_code=200)
+    return response
 
 
 @router.get("/{message_id}", response=InboxMessageResponse, summary="Read one inbox message")

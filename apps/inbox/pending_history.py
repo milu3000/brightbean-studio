@@ -17,7 +17,9 @@ SALT = "brightbean.pending-conversation-history.v1"
 def page(request, workspace, conversation, *, active=None, cursor=None):
     from .canonical_views import _reply_content
 
-    scope = reader.session_read_scope(request.user, workspace.pk)
+    scope = reader.narrow_scope(
+        reader.session_read_scope(request.user, workspace.pk), social_account_ids=[conversation.social_account_id]
+    )
     _, guard = reader._snapshot(scope)
     binding = [guard, str(conversation.pk), reader._identity(conversation), str(active.pk) if active else ""]
     queryset = (

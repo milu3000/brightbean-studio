@@ -56,7 +56,9 @@ def _timeline_context(workspace, result, request):
         row["retained_available"] = row["id"] in retained
     conversation = result["conversation"]
     reader = _reader()
-    scope = reader.session_read_scope(request.user, workspace.pk)
+    scope = reader.narrow_scope(
+        reader.session_read_scope(request.user, workspace.pk), social_account_ids=[conversation["social_account_id"]]
+    )
     accounts, stamp = reader._snapshot(scope)
     current = InboxConversation.objects.filter(
         reader._scope_filter(scope, accounts), pk=conversation["id"], revision=conversation["revision"]
@@ -109,7 +111,10 @@ def _panel_context(request, workspace, result, *, observation_token=None):
     from .conversation_composer import composer_context, session_read_authorization
 
     reader = _reader()
-    scope = reader.session_read_scope(request.user, workspace.pk)
+    scope = reader.narrow_scope(
+        reader.session_read_scope(request.user, workspace.pk),
+        social_account_ids=[result["conversation"]["social_account_id"]],
+    )
     _, guard = reader._snapshot(scope)
     context = _timeline_context(workspace, result, request)
     if observation_token is None and request.method != "GET":
@@ -197,6 +202,27 @@ def _panel_context(request, workspace, result, *, observation_token=None):
     return context
 
 
+def source_directory(request, workspace, exc):
+    """Keep unrelated account entry points reachable without reading held rows."""
+    sources = (exc.data or {}).get("account_sources", [])
+    if request.htmx or not any(item["source"] == "legacy" for item in sources):
+        return _error(exc)
+    context = {
+        "workspace": workspace,
+        "canonical_mode": True,
+        "inbox_domain": "dm",
+        "canonical_rows": [],
+        "canonical_accounts": sources,
+        "account_sources": sources,
+        "legacy_account_sources": [item for item in sources if item["source"] == "legacy"],
+        "canonical_unavailable": True,
+        "active_account": request.GET.get("account", ""),
+    }
+    response = render(request, "inbox/canonical_feed.html", context, status=409)
+    response["Cache-Control"] = "private, no-store"
+    return response
+
+
 def feed(request, workspace):
     reader = _reader()
     if any(value.strip() for value in request.GET.getlist("sentiment")):
@@ -223,19 +249,24 @@ def feed(request, workspace):
             search=request.GET.get("q", "").strip(),
             cursor=request.GET.get("cursor") or None,
         )
-        accounts = reader.available_accounts(scope)
+        from .canonical_compat import inbox_sources
+
+        accounts = inbox_sources(scope)
     except reader.CanonicalReadError as exc:
         return _error(exc)
     platforms = {account["platform"] for account in accounts}
     params = request.GET.copy()
     params.pop("page", None)
     params["cursor"] = rows["next_cursor"] or ""
+    params["read_source"] = "canonical"
     context = {
         "workspace": workspace,
         "canonical_mode": True,
         "inbox_domain": "dm",
         "canonical_rows": rows["conversations"],
         "canonical_accounts": accounts,
+        "account_sources": accounts,
+        "legacy_account_sources": [item for item in accounts if item["source"] == "legacy"],
         "list_cursor": request.GET.get("cursor", ""),
         "platform_choices": [
             (value, label) for value, label in SocialAccount._meta.get_field("platform").choices if value in platforms
@@ -300,7 +331,13 @@ def acknowledge_read(request, workspace_id, conversation_id):
     try:
         scope = reader.session_read_scope(request.user, workspace.pk)
         result = reader.acknowledge_read(scope, conversation_id, request.POST.get("read_ack_token", ""))
-        result["unread_count"] = reader.unread_conversation_count(scope)
+        try:
+            result["unread_count"] = reader.unread_conversation_count(scope)
+        except reader.CanonicalReadError as exc:
+            if exc.code != "canonical_unavailable":
+                raise
+            # A held sibling makes the aggregate unknown, not the selected
+            # acknowledgement invalid. Never publish a partial workspace count.
     except reader.CanonicalReadError as exc:
         return _error(exc)
     return JsonResponse(result)
@@ -491,14 +528,14 @@ def mark_done(request, workspace_id, conversation_id):
 def legacy_detail(request, workspace, message):
     if message.message_type != "dm":
         return None
-    from .canonical_compat import hold_legacy_fallback
+    from .canonical_compat import selected_inbox_source
     from .canonical_send_target import is_transport_projection
 
     reader = _reader()
     scope = reader.session_read_scope(request.user, workspace.pk)
     try:
-        hold_legacy_fallback(scope, social_account_id=message.social_account_id)
-        if enabled():
+        selection = selected_inbox_source(scope, social_account_ids=[message.social_account_id])
+        if selection["source"] == "canonical":
             identifier = reader.resolve_legacy_conversation(scope, message.pk)
             return detail(request, workspace.pk, identifier)
     except reader.CanonicalReadError as exc:
@@ -511,17 +548,17 @@ def legacy_detail(request, workspace, message):
 def hold_legacy_action(request, workspace, message):
     if message.message_type != "dm":
         return None
-    from .canonical_compat import hold_legacy_fallback
+    from .canonical_compat import selected_inbox_source
     from .canonical_send_target import is_transport_projection
 
     reader = _reader()
     try:
-        hold_legacy_fallback(
-            reader.session_read_scope(request.user, workspace.pk), social_account_id=message.social_account_id
+        selection = selected_inbox_source(
+            reader.session_read_scope(request.user, workspace.pk), social_account_ids=[message.social_account_id]
         )
     except reader.CanonicalReadError as exc:
         return _error(exc)
-    if enabled() or is_transport_projection(message):
+    if selection["source"] == "canonical" or is_transport_projection(message):
         return HttpResponse("Use the conversation controls for this message.", status=409)
     return None
 

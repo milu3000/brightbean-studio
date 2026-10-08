@@ -2,7 +2,7 @@
 
 from django.db.models import Q
 
-from .canonical_access import digest
+from .canonical_access import digest, narrow_scope
 from .models import ConversationMessage
 
 
@@ -72,6 +72,11 @@ def list_unassigned_messages(scope, *, social_account_id=None, platform=None, se
         raise CanonicalReadError("invalid_search", "Search must be at most 500 characters.")
     if platform is not None and platform not in {"facebook", "instagram_login"}:
         raise CanonicalReadError("invalid_filter", "Unsupported private-message platform.")
+    scope = narrow_scope(
+        scope,
+        social_account_ids=[social_account_id] if social_account_id is not None else None,
+        platforms=[platform] if platform else None,
+    )
     accounts, stamp = _snapshot(scope)
     rows = _query(scope, accounts)
     if social_account_id is not None:
@@ -119,6 +124,7 @@ def list_unassigned_messages(scope, *, social_account_id=None, platform=None, se
 def read_unassigned_message(scope, message_id):
     from .canonical_reads import _denied, _snapshot, _uuid
 
+    scope = narrow_scope(scope, target=(ConversationMessage, message_id))
     accounts, stamp = _snapshot(scope)
     row = _query(scope, accounts).filter(pk=_uuid(message_id)).first()
     if row is None:

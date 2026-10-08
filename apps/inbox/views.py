@@ -306,6 +306,7 @@ def _render_panel(request, workspace, target, **extra):
 def _list_query(request):
     params = request.GET.copy()
     params.pop("page", None)
+    params["read_source"] = "legacy"
     return params.urlencode()
 
 
@@ -339,40 +340,60 @@ def inbox_feed(request, workspace_id):
     """Main inbox feed with filtering, pagination, and split-panel layout."""
     workspace = _get_workspace(request, workspace_id)
     from . import canonical_views
+    from .canonical_compat import inbox_sources, recheck_inbox_source, selected_inbox_source
+    from .canonical_reads import CanonicalReadError, session_read_scope
 
-    canonical_mode = canonical_views.enabled()
     requested_types = {value for value in request.GET.getlist("type") if value}
     inferred = (
         next(iter(requested_types))
         if len(requested_types) == 1 and requested_types <= {"comment", "mention", "review"}
         else "dm"
     )
-    domain = request.GET.get("domain", inferred) if canonical_mode else ""
-    if canonical_mode and domain == "dm":
+    scope = session_read_scope(request.user, workspace.pk)
+    try:
+        sources = inbox_sources(scope)
+        canonical_mode = any(item["source"] != "legacy" for item in sources)
+        domain = request.GET.get("domain", inferred if canonical_mode else "")
+        if domain not in {"", "dm", "comment", "mention", "review"}:
+            return HttpResponse("Unknown inbox section.", status=400)
+        reads_dm = domain in {"", "dm"} and not (
+            requested_types and requested_types <= {"comment", "mention", "review"}
+        )
+        selection = (
+            selected_inbox_source(
+                scope,
+                social_account_ids=[value for value in request.GET.getlist("account") if value] or None,
+                platforms=[value for value in request.GET.getlist("platform") if value],
+            )
+            if reads_dm
+            else {"source": "legacy"}
+        )
+    except CanonicalReadError as exc:
+        return canonical_views.source_directory(request, workspace, exc)
+    read_source = selection["source"]
+    previous_source = request.GET.get("read_source")
+    if request.htmx and previous_source and previous_source != read_source:
+        # A list fragment cannot replace the other reader's filters/composer.
+        # Reload the actual selected-account route; never swap incompatible DOM.
+        params = request.GET.copy()
+        for key in ("read_source", "cursor", "page"):
+            params.pop(key, None)
+        response = HttpResponse()
+        response["HX-Redirect"] = request.path + ("?" + params.urlencode() if params else "")
+        response["Cache-Control"] = "private, no-store"
+        return response
+    if read_source == "canonical":
         return canonical_views.feed(request, workspace)
-    if canonical_mode and domain not in {"comment", "mention", "review"}:
-        return HttpResponse("Unknown inbox section.", status=400)
     if any(value.strip() for value in request.GET.getlist("sentiment")):
         return HttpResponse(
             "Sentiment filtering has been retired. Remove the sentiment filter to continue.", status=400
         )
 
-    if not canonical_mode and not (requested_types and requested_types <= {"comment", "mention", "review"}):
-        from .canonical_compat import hold_legacy_fallback
-        from .canonical_reads import CanonicalReadError, session_read_scope
-
-        try:
-            selected_accounts = [value for value in request.GET.getlist("account") if value]
-            if not selected_accounts:
-                hold_legacy_fallback(session_read_scope(request.user, workspace.pk))
-            elif all(_valid_uuid(value) for value in selected_accounts):
-                for identifier in selected_accounts:
-                    hold_legacy_fallback(session_read_scope(request.user, workspace.pk), social_account_id=identifier)
-        except CanonicalReadError as exc:
-            return canonical_views._error(exc)
     qs = exclude_transport_projections(
         InboxMessage.objects.for_workspace(workspace.id).filter(social_account__workspace=workspace)
     )
+    canonical_accounts = [item["id"] for item in sources if item["source"] != "legacy"]
+    qs = qs.exclude(message_type="dm", social_account_id__in=canonical_accounts)
     if domain:
         qs = qs.filter(public_type_filter(domain))
 
@@ -453,9 +474,17 @@ def inbox_feed(request, workspace_id):
     platform_choices = [(code, labels.get(code, "Unavailable platform")) for code in sorted(available_platforms)]
     known_accounts = {str(account.pk) for account in social_accounts}
 
+    shortcut_params = request.GET.copy()
+    for key in list(shortcut_params):
+        if key not in {"account", "domain"}:
+            shortcut_params.pop(key, None)
+    shortcut_query = shortcut_params.urlencode()
+
     context = {
         "workspace": workspace,
         "canonical_mode": canonical_mode,
+        "account_sources": sources,
+        "shortcut_query": shortcut_query,
         "inbox_domain": domain,
         "platform_choices": platform_choices,
         "unavailable_account_filters": [value for value in accounts if value not in known_accounts],
@@ -480,9 +509,18 @@ def inbox_feed(request, workspace_id):
         },
     }
 
-    if request.htmx:
-        return render(request, "inbox/partials/_message_list.html", context)
-    return render(request, "inbox/feed.html", context)
+    response = render(request, "inbox/partials/_message_list.html" if request.htmx else "inbox/feed.html", context)
+    try:
+        if reads_dm:
+            recheck_inbox_source(
+                scope,
+                selection,
+                social_account_ids=accounts or None,
+                platforms=platforms,
+            )
+    except CanonicalReadError as exc:
+        return canonical_views._error(exc)
+    return response
 
 
 # --- Message Detail ---

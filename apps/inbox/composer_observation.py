@@ -2,7 +2,7 @@
 
 from django.core import signing
 
-from .canonical_access import digest
+from .canonical_access import digest, narrow_scope
 
 SALT = "brightbean.inbox.composer-observation.v1"
 
@@ -112,6 +112,7 @@ def verify_composer_observation(scope, conversation_id, token):
     from .canonical_reads import CanonicalReadError, _denied, _identity, _recheck, _scope_filter, _snapshot, _uuid
     from .models import InboxConversation
 
+    scope = narrow_scope(scope, target=(InboxConversation, conversation_id))
     accounts, stamp = _snapshot(scope)
     current = InboxConversation.objects.filter(_scope_filter(scope, accounts), pk=_uuid(conversation_id)).first()
     if current is None:

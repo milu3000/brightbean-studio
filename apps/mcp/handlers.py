@@ -1323,7 +1323,7 @@ def _list_inbox_messages(args: dict, context: dict[str, Any]) -> dict:
     if limit < 1 or limit > _MCP_INBOX_LIMIT_MAX:
         raise JsonRpcError(INVALID_PARAMS, f"limit must be between 1 and {_MCP_INBOX_LIMIT_MAX}")
 
-    invoke(
+    source_guard = invoke(
         reader.list_legacy_dm_adapter,
         scope(context),
         message_type=message_type,
@@ -1360,13 +1360,15 @@ def _list_inbox_messages(args: dict, context: dict[str, Any]) -> dict:
     rows = list(qs[offset : offset + limit + 1])
     has_more = len(rows) > limit
     rows = rows[:limit]
-    return _wrap_text(
+    result = _wrap_text(
         {
             "messages": [_serialize_inbox_message(m) for m in rows],
             "limit": limit,
             "next_cursor": encode_offset_cursor(offset + limit) if has_more else None,
         }
     )
+    invoke(reader.recheck_legacy_list, scope(context), source_guard, social_account_id=sa_id)
+    return result
 
 
 register_tool(

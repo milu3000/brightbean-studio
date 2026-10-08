@@ -132,3 +132,28 @@ test('quote-only changes guard navigation even when hidden defaultValue changes 
     const app = setup([], false, {value:'saved-target',dataset:{inboxQuoteInitial:'saved-target'}});
     const event = confirmationEvent(); app.emit('htmx:confirm', event); assert.equal(event.prevented, false);
 });
+
+
+test('full-page account links and HX-Redirect retain the unsaved-draft unload guard', () => {
+    const field = {value: 'Unsent account reply', defaultValue: 'Saved earlier draft'};
+    const app = setup([field]);
+    for (const navigation of ['account link', 'HX-Redirect']) {
+        const event = {prevented: false, preventDefault() { this.prevented = true; }};
+        app.emit('beforeunload', event);
+        assert.equal(event.prevented, true, navigation);
+        assert.equal(event.returnValue, '', navigation);
+        assert.equal(field.value, 'Unsent account reply');
+        assert.equal(field.defaultValue, 'Saved earlier draft');
+    }
+});
+
+test('source-switch unload is allowed for unchanged saved drafts and held for quote-only edits', () => {
+    const saved = setup([{value: 'Saved draft', defaultValue: 'Saved draft'}]);
+    const allowed = {prevented: false, preventDefault() { this.prevented = true; }};
+    saved.emit('beforeunload', allowed);
+    assert.equal(allowed.prevented, false);
+    const quote = setup([], false, {value: 'new-target', dataset: {inboxQuoteInitial: ''}});
+    const held = {prevented: false, preventDefault() { this.prevented = true; }};
+    quote.emit('beforeunload', held);
+    assert.equal(held.prevented, true);
+});
