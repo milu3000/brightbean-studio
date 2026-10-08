@@ -140,7 +140,7 @@ def _get(client, account, route, params, *, edge=True, optional_content=False):
     return data
 
 
-def _cursor(data, route, platform, stream):
+def _cursor(data, route, platform, stream, params):
     paging = data.get("paging", {})
     if not isinstance(paging, dict):
         raise SyncError("invalid_response")
@@ -175,6 +175,18 @@ def _cursor(data, route, platform, stream):
             raise ValueError
     except (ValueError, UnicodeError):
         raise SyncError("pagination_unverified") from None
+    if (
+        platform == "instagram_login"
+        and stream == "messages"
+        and not data["data"]
+        and params.get("after") == after
+        and len(query) == len(params) == 3
+        and dict(query) == {key: str(value) for key, value in params.items()}
+        and set(params) == {"after", "fields", "limit"}
+    ):
+        # An empty self-cursor is not EOF. Only the exact verified request
+        # shape qualifies for the separately preserved live-head refresh path.
+        raise SyncError("pagination_no_progress")
     return after
 
 
@@ -257,7 +269,7 @@ class MetaSyncAdapter:
                 optional_content=(lease.stream == "messages" and lease.content_fields_mode == "extended"),
             )
         observed = timezone.now()
-        cursor = _cursor(data, route, account.platform, lease.stream)
+        cursor = _cursor(data, route, account.platform, lease.stream, params)
         items = []
         for item in data["data"]:
             if not isinstance(item, dict) or not valid_id(item.get("id")):

@@ -9,7 +9,14 @@ import pytest
 from django.utils import timezone
 
 from apps.inbox.conversation_workflow import canonical_actionable_observed, canonical_incoming_observed
-from apps.inbox.durable_sync import auth_fingerprint, claim_page, commit_page, fail_page, start_scan
+from apps.inbox.durable_sync import (
+    auth_fingerprint,
+    claim_page,
+    commit_page,
+    fail_page,
+    restart_stalled_live_scan,
+    start_scan,
+)
 from apps.inbox.models import ConversationMessage, InboxMessage, InboxSyncConnection
 from apps.inbox.sync_contracts import ConversationObservation, MessageObservation, SyncPage
 from apps.inbox.sync_identity import SyncError, canonical_owns_account
@@ -49,6 +56,219 @@ def message(lease, *, mid="m-1", body="Hello", participants=("page-1", "peer-1")
         timezone.now(),
         **kwargs,
     )
+
+
+def stalled_live_pair(binding, *, now, history_context="bootstrap"):
+    binding.bootstrap_baseline_at = now - timedelta(hours=1)
+    binding.save(update_fields=["bootstrap_baseline_at"])
+    started = now - timedelta(minutes=6)
+    checkpoints = []
+    for context in (history_context, "live"):
+        cp = start_scan(binding.pk, context=context, stream="messages", scope_key="thread-1", now=started)
+        commit_page(claim_page(cp.pk, now=started), SyncPage((), "cursorA", False, started), now=started)
+        lease = claim_page(cp.pk, now=started)
+        checkpoints.append(fail_page(lease, SyncError("pagination_no_progress"), now=started))
+    return checkpoints[1], checkpoints[0], lease
+
+
+@pytest.mark.parametrize("history_context", ["bootstrap", "repair"])
+@pytest.mark.parametrize("historical_error", ["cursor_repeated", "pagination_no_progress"])
+def test_stalled_live_rollover_preserves_history_and_fences_old_results(
+    durable, enroll_conversation_accounts, history_context, historical_error
+):
+    from apps.inbox.tests.test_sync_ingestion_recovery import instagram
+
+    enroll_conversation_accounts(instagram(durable))
+    now = timezone.now()
+    cp, history, stale = stalled_live_pair(durable, now=now, history_context=history_context)
+    type(history).objects.filter(pk=history.pk).update(last_error_code=historical_error)
+    original = type(history).objects.values().get(pk=history.pk)
+    # Discovery may touch updated_at; this must not prevent a due head poll.
+    assert cp.updated_at > now - timedelta(minutes=1)
+    assert restart_stalled_live_scan(cp.pk, now=now) is True
+    cp.refresh_from_db()
+    assert cp.status == "ready" and cp.cursor == "" and cp.coverage == "partial"
+    assert cp.scan_generation == stale.scan_generation + 1 and cp.fence > stale.fence
+    assert restart_stalled_live_scan(cp.pk, now=now) is False
+    assert type(history).objects.values().get(pk=history.pk) == original
+    for operation in (
+        lambda: commit_page(stale, SyncPage(observed_at=now), now=now),
+        lambda: fail_page(stale, SyncError("provider_unavailable"), now=now),
+    ):
+        with pytest.raises(SyncError, match="lease_lost"):
+            operation()
+    lease = claim_page(cp.pk, now=now)
+    assert lease and lease.cursor == "" and claim_page(cp.pk, now=now) is None
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "baseline",
+        "context",
+        "stream",
+        "status",
+        "error",
+        "coverage",
+        "cursor",
+        "generation",
+        "lease",
+        "expired_lease",
+        "retry",
+        "started_recently",
+        "committed_recently",
+        "history_context",
+        "history_missing",
+        "history_connection",
+        "history_cursor",
+        "history_scope",
+        "history_generation",
+        "history_coverage",
+        "history_status",
+        "history_error",
+        "history_lease",
+        "blocked_connection",
+        "retry_connection",
+        "connection_generation",
+        "disabled",
+        "token",
+        "native",
+        "route",
+        "facebook",
+    ],
+)
+def test_stalled_live_rollover_refuses_without_current_independent_gap_proof(
+    durable, enroll_conversation_accounts, mutation
+):
+    from apps.inbox.tests.test_sync_ingestion_recovery import instagram
+
+    account = instagram(durable)
+    enroll_conversation_accounts(account)
+    now = timezone.now()
+    cp, history, _ = stalled_live_pair(durable, now=now)
+    changes = {
+        "context": {"context": "backfill"},
+        "stream": {"stream": "conversations"},
+        "status": {"status": "ready"},
+        "error": {"last_error_code": "cursor_repeated"},
+        "coverage": {"coverage": "unknown"},
+        "cursor": {"cursor": ""},
+        "generation": {"connection_generation": uuid.uuid4()},
+        "lease": {"lease_token": uuid.uuid4(), "lease_expires_at": now + timedelta(seconds=60)},
+        "expired_lease": {"lease_token": uuid.uuid4(), "lease_expires_at": now - timedelta(seconds=1)},
+        "retry": {"retry_at": now + timedelta(minutes=1)},
+        "started_recently": {"scan_started_at": now - timedelta(minutes=4)},
+        "committed_recently": {"last_committed_at": now - timedelta(minutes=4)},
+    }
+    history_changes = {
+        "history_context": {"context": "backfill"},
+        "history_cursor": {"cursor": "different"},
+        "history_scope": {"scope_key": "different-thread"},
+        "history_generation": {"connection_generation": uuid.uuid4()},
+        "history_coverage": {"coverage": "unknown"},
+        "history_status": {"status": "ready"},
+        "history_error": {"last_error_code": "provider_unavailable"},
+        "history_lease": {"lease_token": uuid.uuid4(), "lease_expires_at": now + timedelta(seconds=60)},
+    }
+    connection_changes = {
+        "baseline": {"bootstrap_baseline_at": None},
+        "blocked_connection": {"blocked_reason": "permission_unavailable"},
+        "retry_connection": {"retry_at": now + timedelta(minutes=1)},
+        "connection_generation": {"generation": uuid.uuid4()},
+        "disabled": {"enabled": False},
+        "route": {"route_contract": "unverified-route"},
+    }
+    if mutation in changes:
+        type(cp).objects.filter(pk=cp.pk).update(**changes[mutation])
+    elif mutation in history_changes:
+        type(history).objects.filter(pk=history.pk).update(**history_changes[mutation])
+    elif mutation in connection_changes:
+        type(durable).objects.filter(pk=durable.pk).update(**connection_changes[mutation])
+    elif mutation == "history_missing":
+        history.delete()
+    elif mutation == "history_connection":
+        from apps.social_accounts.models import SocialAccount
+
+        other_account = SocialAccount.objects.create(
+            workspace=account.workspace, platform=account.platform, account_platform_id="other-account"
+        )
+        other_connection = InboxSyncConnection.objects.create(
+            social_account=other_account,
+            workspace=account.workspace,
+            platform=account.platform,
+            account_platform_id=other_account.account_platform_id,
+            auth_fingerprint=auth_fingerprint(other_account),
+            generation=durable.generation,
+        )
+        type(history).objects.filter(pk=history.pk).update(connection=other_connection)
+    elif mutation in {"token", "native"}:
+        if mutation == "token":
+            account.oauth_access_token = "synthetic-new-token"
+        else:
+            account.account_platform_id = "different-native"
+        account.save()
+    else:
+        account.platform = durable.platform = "facebook"
+        account.save()
+        durable.save()
+        enroll_conversation_accounts(account)
+    original = list(type(cp).objects.order_by("pk").values())
+    if mutation in {"disabled", "route", "token", "native"}:
+        with pytest.raises(SyncError, match="enrollment_or_identity_revoked"):
+            restart_stalled_live_scan(cp.pk, now=now)
+    else:
+        assert restart_stalled_live_scan(cp.pk, now=now) is False
+    assert list(type(cp).objects.order_by("pk").values()) == original
+
+
+def test_new_stall_cursor_cannot_replace_the_only_gap_evidence(durable, enroll_conversation_accounts):
+    from apps.inbox.tests.test_sync_ingestion_recovery import instagram
+
+    enroll_conversation_accounts(instagram(durable))
+    now = timezone.now()
+    cp, history, _ = stalled_live_pair(durable, now=now)
+    original = type(history).objects.values().get(pk=history.pk)
+    assert restart_stalled_live_scan(cp.pk, now=now)
+    commit_page(claim_page(cp.pk, now=now), SyncPage((), "new-gap", False, now), now=now)
+    fail_page(claim_page(cp.pk, now=now), SyncError("pagination_no_progress"), now=now)
+    assert restart_stalled_live_scan(cp.pk, now=now + timedelta(minutes=6)) is False
+    cp.refresh_from_db()
+    assert cp.cursor == "new-gap" and cp.status == "blocked" and cp.coverage == "partial"
+    assert type(history).objects.values().get(pk=history.pk) == original
+
+
+@pytest.mark.django_db(transaction=True)
+def test_postgres_concurrent_stalled_rollovers_start_only_one_generation(durable, enroll_conversation_accounts):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    from django.db import close_old_connections, connection
+
+    from apps.inbox.tests.test_sync_ingestion_recovery import instagram
+
+    if connection.vendor != "postgresql":
+        pytest.skip("PostgreSQL row-lock proof requires PostgreSQL CI.")
+    enroll_conversation_accounts(instagram(durable))
+    now = timezone.now()
+    cp, history, _ = stalled_live_pair(durable, now=now)
+    original = type(history).objects.values().get(pk=history.pk)
+    generation = cp.scan_generation
+    barrier = Barrier(2)
+
+    def restart():
+        close_old_connections()
+        barrier.wait(timeout=5)
+        try:
+            return restart_stalled_live_scan(cp.pk, now=now)
+        finally:
+            close_old_connections()
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        outcomes = list(workers.map(lambda _: restart(), range(2)))
+    assert sorted(outcomes) == [False, True]
+    cp.refresh_from_db()
+    assert cp.scan_generation == generation + 1
+    assert type(history).objects.values().get(pk=history.pk) == original
 
 
 def test_crash_rolls_back_whole_page_and_cursor(durable):

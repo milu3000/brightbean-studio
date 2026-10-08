@@ -16,7 +16,15 @@ from django.utils import timezone
 from apps.common import quota
 from apps.publisher.engine import _resolve_publish_credentials
 
-from .durable_sync import LEASE_SECONDS, claim_page, commit_page, fail_page, lock_connection, start_scan
+from .durable_sync import (
+    LEASE_SECONDS,
+    claim_page,
+    commit_page,
+    fail_page,
+    lock_connection,
+    restart_stalled_live_scan,
+    start_scan,
+)
 from .meta_sync_adapter import MetaSyncAdapter
 from .models import InboxSyncBudget, InboxSyncConnection
 from .sync_identity import SyncError
@@ -81,6 +89,10 @@ def prepare_scans(connection, now):
     ):
         start_scan(connection.pk, context=context, now=now)
     if connection.bootstrap_baseline_at:
+        for checkpoint_id in connection.checkpoints.filter(
+            context="live", stream="messages", status="blocked", last_error_code="pagination_no_progress"
+        ).values_list("pk", flat=True):
+            restart_stalled_live_scan(checkpoint_id, now=now)
         repair = connection.checkpoints.filter(context="repair", stream="conversations").first()
         if repair is None or (repair.status == "complete" and repair.scan_started_at <= now - timedelta(days=1)):
             start_scan(connection.pk, context="repair", now=now)

@@ -7,12 +7,14 @@ import httpx
 import pytest
 from django.utils import timezone
 
-from apps.inbox.durable_sync import run_one_page, start_scan
+from apps.inbox.durable_sync import claim_page, commit_page, run_one_page, start_scan
 from apps.inbox.meta_sync_adapter import MetaSyncAdapter
 from apps.inbox.models import ConversationMessage, InboxSyncConnection
+from apps.inbox.sync_contracts import SyncPage
 from apps.inbox.sync_identity import SyncError
-from apps.inbox.tests.test_durable_pages_recovery import checkpoint
+from apps.inbox.tests.test_durable_pages_recovery import checkpoint, message
 from apps.inbox.tests.test_durable_pages_recovery import durable as _durable
+from apps.inbox.tests.test_sync_ingestion_recovery import instagram
 
 durable = _durable
 pytestmark = pytest.mark.django_db
@@ -20,6 +22,92 @@ pytestmark = pytest.mark.django_db
 
 def metadata():
     return {"id": "thread-1", "participants": {"data": [{"id": "page-1"}, {"id": "peer-1"}]}}
+
+
+@pytest.mark.parametrize(
+    "shape,expected",
+    [
+        ("exact", "pagination_no_progress"),
+        ("v26", "pagination_no_progress"),
+        ("basic", "pagination_no_progress"),
+        ("duplicate_after", "pagination_unverified"),
+        ("duplicate_fields", "cursor_repeated"),
+        ("changed_fields", "cursor_repeated"),
+        ("changed_limit", "cursor_repeated"),
+        ("unknown_param", "cursor_repeated"),
+        ("other_route", "pagination_unverified"),
+        ("nonempty", "cursor_repeated"),
+        ("advance", ""),
+        ("end", ""),
+    ],
+)
+def test_instagram_empty_self_cursor_is_a_precise_hold_not_eof(durable, enroll_conversation_accounts, shape, expected):
+    enroll_conversation_accounts(instagram(durable))
+    cp = checkpoint(durable, context="bootstrap")
+    lease = claim_page(cp.pk)
+    commit_page(lease, SyncPage((message(lease, body="Kept original"),), "cursorA", False))
+    if shape == "basic":
+        type(cp).objects.filter(pk=cp.pk).update(content_fields_mode="basic")
+    original = ConversationMessage.objects.values().get()
+    cp.refresh_from_db()
+    before = (cp.pages_committed, cp.scan_generation, cp.last_page_digest, cp.recent_cursor_digests)
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        if request.url.path == "/v25.0/thread-1":
+            return httpx.Response(200, json=metadata())
+        assert request.url.params["after"] == "cursorA"
+        query = list(request.url.params.multi_items())
+        if shape == "duplicate_after":
+            query.append(("after", "cursorA"))
+        elif shape == "duplicate_fields":
+            query.append(("fields", request.url.params["fields"]))
+        elif shape in {"changed_fields", "changed_limit"}:
+            key, value = ("fields", "id") if shape == "changed_fields" else ("limit", "25")
+            query = [(name, value if name == key else old) for name, old in query]
+        elif shape == "unknown_param":
+            query.append(("unverified", "value"))
+        elif shape == "advance":
+            query = [(key, "cursorB" if key == "after" else value) for key, value in query]
+        next_url = request.url.copy_with(params=query)
+        if shape == "v26":
+            next_url = next_url.copy_with(path="/v26.0/thread-1/messages")
+        elif shape == "other_route":
+            next_url = next_url.copy_with(path="/v25.0/another-thread/messages")
+        rows = []
+        if shape == "nonempty":
+            rows = [{"id": "uncommitted-mid", "from": {"id": "peer-1"}, "message": "Must not be committed"}]
+        data = {"data": rows}
+        if shape != "end":
+            data["paging"] = {
+                "cursors": {"after": "cursorB" if shape == "advance" else "cursorA"},
+                "next": str(next_url),
+            }
+        return httpx.Response(200, json=data)
+
+    adapter = MetaSyncAdapter(transport=httpx.MockTransport(respond))
+    result = run_one_page(cp.pk, adapter)
+    assert len(requests) == 2 and result.last_error_code == expected
+    assert ConversationMessage.objects.values().get() == original
+    if expected == "pagination_no_progress":
+        assert result.status == "blocked" and result.coverage == "partial"
+        assert result.cursor == "cursorA" and result.restarts == 0 and result.retry_at is None
+        assert (
+            result.pages_committed,
+            result.scan_generation,
+            result.last_page_digest,
+            result.recent_cursor_digests,
+        ) == before
+        assert run_one_page(cp.pk, adapter) is None and len(requests) == 2
+    elif expected == "cursor_repeated":
+        assert result.status == "retry" and result.restarts == 1 and result.cursor == ""
+    elif expected:
+        assert result.status == "blocked" and result.cursor == "cursorA"
+    elif shape == "advance":
+        assert result.status == "ready" and result.cursor == "cursorB" and result.coverage == "partial"
+    else:
+        assert result.status == "complete" and result.cursor == "" and result.coverage == "provider_edge_ended"
 
 
 def test_real_fixed_message_routes_paginate_without_following_secret_next_url(durable):

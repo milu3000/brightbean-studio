@@ -120,6 +120,69 @@ def start_scan(connection_id, *, context="live", stream="conversations", scope_k
 
 
 @transaction.atomic
+def restart_stalled_live_scan(checkpoint_id, *, now=None):
+    """Refresh the head only when another checkpoint preserves this exact gap."""
+    now = now or timezone.now()
+    identity = InboxSyncCheckpoint.objects.filter(pk=checkpoint_id).values("connection_id").first()
+    if identity is None:
+        raise SyncError("checkpoint_unavailable")
+    account, connection = lock_connection(identity["connection_id"])
+    checkpoint = InboxSyncCheckpoint.objects.select_for_update().get(pk=checkpoint_id)
+    if (
+        account.platform != "instagram_login"
+        or not connection.bootstrap_baseline_at
+        or connection.blocked_reason
+        or (connection.retry_at and connection.retry_at > now)
+        or checkpoint.connection_generation != connection.generation
+        or checkpoint.context != "live"
+        or checkpoint.stream != "messages"
+        or checkpoint.status != "blocked"
+        or checkpoint.last_error_code != "pagination_no_progress"
+        or checkpoint.coverage != "partial"
+        or not checkpoint.cursor
+        or checkpoint.lease_token is not None
+        or checkpoint.lease_expires_at is not None
+        or (checkpoint.retry_at and checkpoint.retry_at > now)
+        or max(checkpoint.scan_started_at, checkpoint.last_committed_at or checkpoint.scan_started_at)
+        > now - timedelta(minutes=5)
+        or InboxSyncCheckpoint.objects.filter(connection=connection, lease_expires_at__gt=now).exists()
+    ):
+        return False
+    history = (
+        InboxSyncCheckpoint.objects.select_for_update()
+        .filter(
+            connection=connection,
+            connection_generation=connection.generation,
+            context__in=["bootstrap", "repair"],
+            stream="messages",
+            scope_key=checkpoint.scope_key,
+            cursor=checkpoint.cursor,
+            status="blocked",
+            coverage="partial",
+            last_error_code__in=["cursor_repeated", "pagination_no_progress"],
+            lease_token__isnull=True,
+            lease_expires_at__isnull=True,
+        )
+        .first()
+    )
+    if history is None:
+        # The only durable evidence of a new/different gap must stay held.
+        return False
+    old_start = checkpoint.scan_started_at
+    checkpoint.scan_generation += 1
+    checkpoint.fence += 1
+    checkpoint.status, checkpoint.cursor = "ready", ""
+    checkpoint.pages_committed = checkpoint.restarts = checkpoint.attempts = 0
+    checkpoint.recent_cursor_digests = []
+    checkpoint.last_error_code, checkpoint.retry_at = "", None
+    checkpoint.scan_started_at = now
+    checkpoint.coverage_from = max(calendar_months(now, -6), old_start - timedelta(hours=6))
+    # Coverage stays partial, and the historical checkpoint is never changed.
+    checkpoint.save()
+    return True
+
+
+@transaction.atomic
 def claim_page(checkpoint_id, *, now=None):
     now = now or timezone.now()
     identity = InboxSyncCheckpoint.objects.filter(pk=checkpoint_id).values("connection_id").first()
@@ -326,6 +389,7 @@ def fail_page(lease, error, *, now=None):
         "duplicate_page_identity",
         "page_too_large",
         "pagination_unverified",
+        "pagination_no_progress",
         "response_too_large",
         "invalid_response",
         "canonical_provenance_unverified",
@@ -336,7 +400,11 @@ def fail_page(lease, error, *, now=None):
     checkpoint.last_error_code = code
     checkpoint.attempts = min(20, checkpoint.attempts + 1)
     checkpoint.lease_token = checkpoint.lease_expires_at = None
-    if code == "content_fields_unavailable" and lease.stream == "messages" and lease.content_fields_mode == "extended":
+    if code == "pagination_no_progress":
+        checkpoint.status, checkpoint.coverage, checkpoint.retry_at = "blocked", "partial", None
+    elif (
+        code == "content_fields_unavailable" and lease.stream == "messages" and lease.content_fields_mode == "extended"
+    ):
         # The failed request already spent its reserved GET. Retry this exact
         # cursor on a later budgeted page; never add an unreserved fallback GET.
         checkpoint.content_fields_mode = "basic"
