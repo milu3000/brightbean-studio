@@ -36,6 +36,8 @@ function validateFixture(fixture) {
     for (const thread of fixture.threads) {
         assert(fixture.routes[thread.detail].includes(`data-conversation-id="${thread.id}"`));
         assert(thread.initialIds.length > 1);
+        assert.equal(new Set(thread.historyIds).size,thread.historyIds.length,'Expected history IDs are unique');
+        assert.deepEqual(thread.initialIds,thread.historyIds.slice(-thread.initialIds.length));
         assert(thread.initialHistory.includes('data-canonical-page'));
     }
     assert(fixture.routes[fixture.freshPath].includes(fixture.freshId));
@@ -404,17 +406,27 @@ async function boundedRefreshScenario(browser, fixture) {
             });
         })()`);
         await page.releaseImages();
-        let previous=''; let rounds=0;
+        const expectedIds=fixture.threads[0].historyIds, seenCursors=new Set();
+        let seenIds=fixture.threads[0].initialIds.slice(), rounds=0;
+        const maxRounds=expectedIds.length-seenIds.length;
         while (await page.evaluate(`!!document.querySelector('[data-canonical-page]').dataset.olderUrl`)) {
             const cursor = await page.evaluate(`document.querySelector('[data-canonical-page]').dataset.olderUrl`);
-            assert.notEqual(cursor,previous,'Cursor must advance beyond bounded visible history'); previous=cursor;
+            assert(!seenCursors.has(cursor),'Cursor must advance beyond bounded visible history'); seenCursors.add(cursor);
             await page.click(selectors.older);
             await page.wait(`document.querySelector('[data-canonical-page]').dataset.olderUrl!==${Q(cursor)}`, 'history continuation advances');
             await page.settle();
-            const count=await page.evaluate(`document.querySelectorAll('${selectors.rows}').length`);
+            const ids=await page.evaluate(`Array.from(document.querySelectorAll('${selectors.rows}'),row=>row.dataset.canonicalMessage)`);
+            const count=ids.length;
             assert(count<=500,`Rendered window stays bounded (${count})`);
-            assert(++rounds<=25,'History continuation terminates');
+            assert.equal(new Set(ids).size,count,'Rendered history has no duplicate messages');
+            const newIds=ids.filter(id=>!seenIds.includes(id));
+            assert(newIds.length>0,'Each history page reaches previously unseen messages');
+            seenIds=newIds.concat(seenIds);
+            assert.deepEqual(ids,seenIds.slice(0,ids.length),'Rendered history stays in chronological order after trimming');
+            assert.deepEqual(seenIds,expectedIds.slice(-seenIds.length),'History advances without gaps or reordering');
+            assert(++rounds<=maxRounds,'History continuation terminates within the remaining fixture rows');
         }
+        assert.deepEqual(seenIds,expectedIds,'Every saved fixture message is reachable exactly once');
         assert(rounds>=16,'Read beyond the old500-row cutoff');
         assert(await page.evaluate(`document.querySelector('[data-canonical-page]').textContent.includes('Synthetic browser message 0539')`),'Oldest saved row remains reachable');
         await page.evaluate(`document.querySelector('${selectors.scroll}').scrollTop=300`);

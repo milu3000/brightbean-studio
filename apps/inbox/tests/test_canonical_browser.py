@@ -218,13 +218,34 @@ def browser_export(client, owner, settings, tmp_path):
         threads = []
         for thread in (composer.conversation, other):
             detail = capture(url("conversation_detail", thread))
+            expected_ids = [
+                str(pk)
+                for pk in ConversationMessage.objects.filter(conversation=thread)
+                .order_by("occurred_at", "pk")
+                .values_list("pk", flat=True)
+            ]
+            seen_ids = [item["id"] for item in detail.context["canonical_messages"]]
+            assert seen_ids and seen_ids == expected_ids[-len(seen_ids) :]
             older = detail.context["canonical_older_url"]
+            seen_cursors = set()
+            # The byte budget may yield fewer than the requested 30 rows. Each
+            # older page must consume at least one previously unseen fixture row.
+            max_older_pages = len(expected_ids) - len(seen_ids)
             pages = 0
             while older:
+                assert older not in seen_cursors, "Synthetic history cursor repeated"
+                assert pages < max_older_pages, "Synthetic history pagination did not terminate"
+                seen_cursors.add(older)
                 page = capture(older)
+                page_ids = [item["id"] for item in page.context["canonical_messages"]]
+                assert page_ids, "Synthetic history page made no progress"
+                assert len(page_ids) == len(set(page_ids)), "Synthetic history page repeated a message"
+                assert not set(page_ids).intersection(seen_ids), "Synthetic history pages overlap"
+                seen_ids = page_ids + seen_ids
+                assert seen_ids == expected_ids[-len(seen_ids) :], "Synthetic history skipped or reordered messages"
                 older = page.context["canonical_older_url"]
                 pages += 1
-                assert pages <= 30, "Synthetic history pagination did not terminate"
+            assert seen_ids == expected_ids, "Synthetic history ended before every fixture message was exported"
             threads.append(
                 {
                     "id": str(thread.pk),
@@ -233,6 +254,7 @@ def browser_export(client, owner, settings, tmp_path):
                     "send": url("conversation_send_reply", thread),
                     "save": url("conversation_save_draft", thread),
                     "initialIds": [item["id"] for item in detail.context["canonical_messages"]],
+                    "historyIds": expected_ids,
                     "composerFields": composer_fields(detail),
                     # Export the actual endpoint, including workspace-bound
                     # content URLs, view scope, header, and observation token.
