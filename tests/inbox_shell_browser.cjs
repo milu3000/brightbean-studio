@@ -87,50 +87,193 @@ async function oldLayoutNegativeControl(page) {
     process.stdout.write('PASS real DOM negative controls: old margins, missing and hidden header fail; candidate recovers\n');
 }
 
+const unifiedFailures = `(() => {
+    const failures=[];
+    if (document.querySelectorAll('[data-unified-shell]').length!==1) failures.push('split-shell');
+    if (document.querySelectorAll('[data-inbox-account]').length!==1 || document.querySelector('[data-canonical-account-switcher]') || /Switch account/.test(document.querySelector('main').innerText)) failures.push('duplicate-account-navigation');
+    for (const row of document.querySelectorAll('[data-unified-sender]')) {
+        if (/^@?\\d{5,}$/.test(row.textContent.trim())) failures.push('numeric-sender');
+    }
+    if (/@\\d{5,}/.test(document.querySelector('main').innerText)) failures.push('numeric-handle');
+    return failures;
+})()`;
+
+async function openLegacy(page,thread) {
+    await page.click(`[data-inbox-open-message="${thread.id}"]`);
+    await page.wait(`document.querySelector('[data-inbox-panel]')?.dataset.selectedMessageId===${JSON.stringify(thread.id)}`,'legacy detail');
+    await page.settle();
+}
+async function chooseType(page,domain) {
+    await page.click(`[data-unified-domain="${domain}"]`);
+    await page.wait(`document.querySelector('[data-unified-domain][aria-current="page"]')?.dataset.unifiedDomain===${JSON.stringify(domain)}`,'selected type');
+    await page.settle();
+    assert.equal(await page.evaluate('document.querySelector("[data-unified-shell]")===window.originalUnifiedShell'),true,'Type switching preserves the exact outer shell node');
+    assert.equal(await page.evaluate('document.querySelector("#inbox-detail-panel")===window.originalDetailPane'),true,'Type switching preserves the exact detail target');
+    assert.deepEqual(await page.evaluate(unifiedFailures),[]);
+}
+async function selectFilter(page,name,value) {
+    await page.evaluate(`(() => { const control=document.querySelector('#inbox-filters [name="${name}"]');control.value=${JSON.stringify(value)};control.dispatchEvent(new Event('change',{bubbles:true})); })()`);
+    await page.wait(`new URL(location.href).searchParams.get(${JSON.stringify(name)})===${JSON.stringify(value)}`,'filter URL');
+    await page.settle();
+}
+
 async function scenario(browser,width,height,collapsed) {
     const page=await createPage(browser,{...fixture,sidebarCollapsed:collapsed},width,height);
     try {
         await page.settle();
-        const name=`shell-${width}-${collapsed?'collapsed':'expanded'}`;
-        await screenshot(page,name);
-        assert.deepEqual(await page.evaluate(clipped),[], 'Visible controls and first conversation must fit all clipping ancestors');
+        await page.evaluate('window.originalUnifiedShell=document.querySelector("[data-unified-shell]");window.originalDetailPane=document.querySelector("#inbox-detail-panel")');
+        await screenshot(page,`unified-shell-${width}-${collapsed?'collapsed':'expanded'}`);
+        assert.deepEqual(await page.evaluate(clipped),[], 'Controls and first row fit every clipping ancestor');
+        assert.deepEqual(await page.evaluate(unifiedFailures),[]);
+        assert.equal(await page.evaluate(`document.querySelector('[data-unified-domain][aria-current="page"]').dataset.unifiedDomain`),'all');
+        assert.deepEqual(await page.evaluate(`Array.from(new Set(Array.from(document.querySelectorAll('[data-unified-row]'),row=>row.dataset.messageType))).sort()`),['comment','dm','mention','review']);
         if (width===1365 && !collapsed) await oldLayoutNegativeControl(page);
         assert(await page.evaluate('document.documentElement.scrollWidth <= innerWidth+1'),'No document horizontal overflow');
-        assert(await page.evaluate(`(() => {const selects=Array.from(document.querySelectorAll('#inbox-filters select'));return selects.length===3&&selects.every(select=>{
+        assert(await page.evaluate(`Array.from(document.querySelectorAll('#inbox-filters select')).every(select=>{
             const style=getComputedStyle(select),canvas=document.createElement('canvas'),context=canvas.getContext('2d');
             context.font=style.fontWeight+' '+style.fontSize+' '+style.fontFamily;
-            return context.measureText(select.selectedOptions[0].textContent).width + parseFloat(style.paddingLeft) + parseFloat(style.paddingRight) + 24 <= select.clientWidth;
-        });})()`),'Default filter labels remain legible with room for their dropdown arrow');
-        assert(await page.evaluate(`document.querySelector('#inbox-message-list').getBoundingClientRect().height > 180`),'Account navigation leaves room for conversations');
-        const directory=await page.evaluate(`(() => { const nav=document.querySelector('[aria-label="Other DM accounts"]'),details=nav.closest('details');return {count:nav.querySelectorAll('a').length,visible:details.getBoundingClientRect().height,open:details.open};})()`);
-        assert.equal(directory.count,10,'All existing account routes remain reachable');
-        const destinations=await page.evaluate(`Array.from(document.querySelectorAll('[aria-label="Other DM accounts"] a'),link=>link.href)`);
-        const accounts=destinations.map(href=>{
-            const url=new URL(href);
-            assert.equal(url.origin,fixture.origin,'Account switch stays on the same application');
-            assert.equal(url.pathname,fixture.feed,'Account switch stays in the selected workspace');
-            assert.deepEqual([...url.searchParams.keys()].sort(),['account','domain'],'Each switch selects one account and DM');
-            assert.equal(url.searchParams.get('domain'),'dm');
-            return url.searchParams.get('account');
-        });
-        assert.deepEqual(accounts.sort(),[...fixture.legacyAccountIds].sort(),'Every account has its own exact destination');
-        assert.equal(directory.open,false,'Other accounts start collapsed');
-        assert(directory.visible<60,'Other accounts are compact before expansion');
-        await page.click('[data-canonical-account-switcher] summary');
-        assert(await page.evaluate(`(() => {const nav=document.querySelector('[aria-label="Other DM accounts"]');return nav.clientHeight<=160 && nav.scrollHeight>nav.clientHeight;})()`),'Expanded account menu has its own bounded scroll');
-        assert(await page.evaluate(`Array.from(document.querySelectorAll('[aria-label="Other DM accounts"] a')).every(link=>/Facebook|Instagram/.test(link.textContent))`),'Repeated brand names identify their platform');
-        await page.click('[data-canonical-account-switcher] summary');
+            return context.measureText(select.selectedOptions[0].textContent).width + parseFloat(style.paddingLeft) + parseFloat(style.paddingRight) + 16 <= select.clientWidth;
+        })`),'Default filter labels fit beside their dropdown arrow');
+        assert(await page.evaluate(`document.querySelector('#inbox-message-list').getBoundingClientRect().height > 180`),'Filters leave room for messages');
+        const ids=await page.evaluate(`Array.from(document.querySelector('[data-inbox-account]').options,option=>option.value).filter(Boolean)`);
+        assert.deepEqual(ids.sort(),[...fixture.legacyAccountIds,fixture.canonicalAccount].sort(),'One selector contains every eligible/historical account');
+        assert(await page.evaluate(`Array.from(document.querySelector('[data-inbox-account]').options).filter(option=>option.value).every(option=>/Facebook|Instagram|threads/.test(option.textContent))`),'Repeated account names include platform labels');
         await page.open(fixture.threads[0]);
-        assert(await page.evaluate(`(() => {const c=document.querySelector('#inbox-canonical-composer').getBoundingClientRect(), h=document.querySelector('#inbox-canonical-header').getBoundingClientRect();return c.bottom<=innerHeight+1&&c.height>40&&h.top>=0;})()`),'Opened conversation keeps header and composer visible');
+        assert(await page.evaluate(`(() => {const c=document.querySelector('#inbox-canonical-composer').getBoundingClientRect(), h=document.querySelector('#inbox-canonical-header').getBoundingClientRect();return c.bottom<=innerHeight+1&&c.height>40&&h.top>=0;})()`),'Canonical header and composer fit');
         assert.equal(await page.evaluate(`!!document.querySelector('.canonical-list-pane').getClientRects().length`),width>=768);
+        if (width<768) await page.click('[data-canonical-back]');
+        await openLegacy(page,fixture.legacyThreads.find(thread=>thread.kind==='dm'));
+        assert(await page.evaluate(`(() => {const p=document.querySelector('[data-inbox-panel]').getBoundingClientRect(),c=document.querySelector('[data-inbox-reply-form]').getBoundingClientRect();return p.top>=0&&c.bottom<=innerHeight+1&&c.height>40;})()`),'Legacy DM uses the same bounded detail pane');
         if (width<768) {
-            await page.click('[data-canonical-back]');
-            assert.equal(await page.evaluate(`document.querySelector('[data-canonical-shell]').dataset.activePanel`),'list');
+            await page.click('[data-inbox-back]');
+            assert.equal(await page.evaluate(`document.querySelector('[data-unified-shell]').dataset.activePanel`),'list');
             assert.deepEqual(await page.evaluate(clipped),[]);
         }
+        await chooseType(page,'comment');
+        await openLegacy(page,fixture.legacyThreads.find(thread=>thread.kind==='comment'));
+        assert(await page.evaluate(`!document.querySelector('[data-inbox-panel]').innerText.includes('@9911223344556677')`),'Legacy detail never renders numeric provider ID as a handle');
+        await screenshot(page,`unified-comment-${width}-${collapsed?'collapsed':'expanded'}`);
+        if (width<768) {await page.click('[data-inbox-back]');assert.deepEqual(await page.evaluate(clipped),[]);}
         await page.clean();
-        process.stdout.write(`PASS actual application shell ${width}x${height}, ${collapsed?'collapsed':'expanded'} sidebar\n`);
+        process.stdout.write(`PASS actual unified shell ${width}x${height}, ${collapsed?'collapsed':'expanded'} sidebar; canonical/legacy DM/comment and mobile back\n`);
     } finally {await page.close();}
+}
+
+async function mixedInteractionScenario(browser) {
+    const page=await createPage(browser,fixture,1365,900);
+    try {
+        await page.evaluate('window.originalUnifiedShell=document.querySelector("[data-unified-shell]");window.originalDetailPane=document.querySelector("#inbox-detail-panel")');
+        const comment=fixture.legacyThreads.find(thread=>thread.kind==='comment');
+        await chooseType(page,'comment');
+        await openLegacy(page,comment);
+        await page.type('Unsaved legacy reply');
+        await chooseType(page,'dm');
+        await page.click(`[data-inbox-open-message="${fixture.threads[0].id}"]`);
+        await page.settle();
+        assert.equal(page.dialogs.length,1,'Cross-source selection asks before discarding legacy draft');
+        assert.equal(await page.evaluate(`document.querySelector('[data-inbox-reply-form] textarea').value`),'Unsaved legacy reply');
+        page.acceptDialogs=true;
+        await page.open(fixture.threads[0]);
+        await page.type('Unsaved canonical reply');
+        await chooseType(page,'comment');
+        page.acceptDialogs=false;
+        await page.click(`[data-inbox-open-message="${comment.id}"]`);
+        await page.settle();
+        assert.equal(await page.evaluate(`document.querySelector('[data-inbox-reply-form] textarea').value`),'Unsaved canonical reply');
+        page.acceptDialogs=true;
+        await openLegacy(page,comment);
+        assert.equal(page.posts.filter(post=>/reply|send/.test(post.route)).length,0,'No real or intercepted send attempted');
+        await chooseType(page,'mention');
+        assert.deepEqual(await page.evaluate(`Array.from(document.querySelectorAll('[data-unified-row]'),row=>row.dataset.messageType)`),['mention']);
+        await chooseType(page,'review');
+        assert(await page.evaluate(`document.querySelector('.unified-notice')?.innerText.includes('Review ingestion is not connected')`),'Review view states its actual ingestion limit');
+        assert.equal(await page.evaluate(`document.querySelector('[data-inbox-account]').options.length`),2,'Review account choices retain only saved review account plus All');
+        await page.clean();
+        process.stdout.write('PASS real mixed type switching, honest Review notice, cross-source unsaved drafts, same shell and detail nodes\n');
+    } finally {await page.close();}
+}
+
+async function filteringScenario(browser) {
+    const page=await createPage(browser,fixture,1365,900);
+    try {
+        await page.evaluate('window.originalUnifiedShell=document.querySelector("[data-unified-shell]");window.originalDetailPane=document.querySelector("#inbox-detail-panel")');
+        assert.deepEqual(await page.evaluate(`Array.from(document.querySelectorAll('[data-unified-row]'),row=>row.dataset.inboxOpenMessage)`),fixture.firstRows);
+        await page.click('[data-unified-next]');
+        await page.wait(`new URL(location.href).searchParams.has('cursor')`,'pagination cursor');
+        await page.settle();
+        assert.deepEqual(await page.evaluate(`Array.from(document.querySelectorAll('[data-unified-row]'),row=>row.dataset.inboxOpenMessage)`),fixture.nextRows,'Actual signed page has no repeats/omissions');
+        await page.evaluate(`(() => {const input=document.querySelector('[data-inbox-search]');input.value='synthetic.visitor';input.dispatchEvent(new Event('input',{bubbles:true}));})()`);
+        await page.wait(`new URL(location.href).searchParams.get('q')==='synthetic.visitor'`,'search from later page');
+        assert.equal(await page.evaluate(`new URL(location.href).searchParams.has('cursor')`),false,'Search resets stale pagination');
+        await page.click('[data-inbox-clear-search]');
+        await page.wait(`!new URL(location.href).searchParams.has('q')`,'clear query');
+        await chooseType(page,'comment');
+        await page.evaluate(`document.querySelector('[name="status"]').value='unread'`);
+        await selectFilter(page,'account',fixture.commentAccount);
+        assert.equal(await page.evaluate(`document.querySelector('[name="status"]').value`),'','Changing account clears source-specific status');
+        await page.evaluate(`(() => {const input=document.querySelector('[data-inbox-search]');input.value='synthetic.visitor';input.dispatchEvent(new Event('input',{bubbles:true}));})()`);
+        await page.wait(`new URL(location.href).searchParams.get('q')==='synthetic.visitor'`,'scoped search');
+        await page.click('[data-inbox-clear-search]');
+        await page.wait(`!new URL(location.href).searchParams.has('q')`,'scoped clear');
+        assert.equal(await page.evaluate(`document.querySelector('[data-inbox-account]').value`),fixture.commentAccount,'Clear preserves selected account');
+        assert.equal(await page.evaluate(`document.querySelector('[data-unified-domain][aria-current]').dataset.unifiedDomain`),'comment','Clear preserves type');
+        await page.clean();
+        process.stdout.write('PASS actual mixed keyset pagination, search reset, one scoped account selector and search clearing\n');
+    } finally {await page.close();}
+}
+
+async function mixedRaceScenario(browser) {
+    for (const delayed of [fixture.threads[0],fixture.legacyThreads.find(thread=>thread.kind==='dm')]) {
+        const page=await createPage(browser,fixture,1365,900);
+        try {
+            const newer=fixture.legacyThreads.find(thread=>thread.kind==='comment');
+            page.delays.set(delayed.detail,450);
+            await page.click(`[data-inbox-open-message="${delayed.id}"]`);
+            await page.wait(`true`,'request started');
+            await page.evaluate(`window.seenPanels=[];window.panelObserver=new MutationObserver(()=>{const panel=document.querySelector('[data-inbox-panel]');if(panel)window.seenPanels.push(panel.dataset.conversationId||panel.dataset.selectedMessageId);});window.panelObserver.observe(document.querySelector('#inbox-detail-panel'),{childList:true,subtree:true});`);
+            await openLegacy(page,newer);
+            assert.equal(await page.evaluate(`window.seenPanels.includes(${JSON.stringify(delayed.id)})`),false,'Delayed superseded source never flashes into detail');
+            assert.equal(page.posts.some(post=>post.route===fixture.threads[0].read),false,'A stale canonical detail is never acknowledged');
+            await page.clean();
+        } finally {await page.close();}
+    }
+    const page=await createPage(browser,fixture,1365,900);
+    try {
+        page.delays.set(fixture.feed+'?domain=comment',450);
+        await page.click('[data-unified-domain="comment"]');
+        await page.evaluate(`window.seenTypes=[];window.typeObserver=new MutationObserver(()=>window.seenTypes.push(document.querySelector('[data-unified-domain][aria-current]')?.dataset.unifiedDomain));window.typeObserver.observe(document.querySelector('#inbox-list-content'),{childList:true,subtree:true});`);
+        await page.click('[data-unified-domain="mention"]');
+        await page.evaluate(`htmx.trigger(document.querySelector('[data-unified-filters]'),'inbox:refresh-list')`);
+        await page.wait(`document.querySelector('[data-unified-domain][aria-current]')?.dataset.unifiedDomain==='mention'`,'latest type after old automatic refresh');
+        await page.settle();
+        assert.equal(await page.evaluate(`window.seenTypes.includes('comment')`),false,'Stale type list never flashes');
+        assert.equal(await page.evaluate(`document.querySelector('[data-unified-domain][aria-current]').dataset.unifiedDomain`),'mention','Old read refresh cannot override the user type');
+        await page.clean();
+    } finally {await page.close();}
+    process.stdout.write('PASS stale canonical/legacy detail and list responses cannot replace newer selection\n');
+}
+
+async function reportedBugNegativeControls(browser) {
+    for (const [index,route] of fixture.negativeRoutes.entries()) {
+        const page=await createPage(browser,{...fixture,feed:route},1365,900);
+        try {
+            await page.settle();
+            const failures=await page.evaluate(unifiedFailures);
+            assert(failures.includes(index===0?'split-shell':'duplicate-account-navigation'),'Exact old legacy split/canonical duplicate layout is rejected');
+            await screenshot(page,index===0?'regression-legacy-split-shell':'regression-duplicate-account-selector');
+            await page.clean();
+        } finally {await page.close();}
+    }
+    const page=await createPage(browser,fixture,1365,900);
+    try {
+        assert.deepEqual(await page.evaluate(unifiedFailures),[]);
+        await page.evaluate(`document.querySelector('[data-unified-sender]').textContent='9911887766554433';const handle=document.createElement('span');handle.textContent='@9911223344556677';document.querySelector('[data-unified-row]').append(handle)`);
+        const failures=await page.evaluate(unifiedFailures);
+        assert(failures.includes('numeric-sender')&&failures.includes('numeric-handle'),'Reported raw provider name and @numeric handle regressions are caught');
+        await screenshot(page,'regression-raw-provider-identity');
+        await page.clean();
+    } finally {await page.close();}
+    process.stdout.write('PASS genuine old split and duplicate markup plus reported raw identity negative controls\n');
 }
 
 async function main() {
@@ -141,6 +284,10 @@ async function main() {
         for (const [width,height,collapsed] of [[1365,900,false],[1052,1344,true],[1024,768,false],[768,900,false],[390,844,false]]) {
             await scenario(browser,width,height,collapsed);
         }
+        await mixedInteractionScenario(browser);
+        await filteringScenario(browser);
+        await mixedRaceScenario(browser);
+        await reportedBugNegativeControls(browser);
         for (const width of [1365,390]) {
             const standalone={...fixture,feed:fixture.threads[0].detail+'?standalone=1'};
             const page=await createPage(browser,standalone,width,844);

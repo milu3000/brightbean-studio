@@ -20,6 +20,7 @@ from django.db.models import F
 from django.urls import reverse
 from django.utils import timezone
 
+from apps.inbox import canonical_views
 from apps.inbox.models import (
     ConversationMessage,
     ConversationObservationState,
@@ -194,6 +195,10 @@ def browser_export(client, owner, settings, tmp_path):
 
     def capture(path, *, htmx=True):
         response = client.get(path, **({"HTTP_HX_REQUEST": "true"} if htmx else {}))
+        if path == url("feed"):
+            # Isolate the existing canonical reader/controller fixture; the
+            # actual public mixed route is covered by the full-shell gate.
+            response = canonical_views.feed(response.wsgi_request, composer.account.workspace)
         assert response.status_code == 200, (path, response.status_code, response.content[:500])
         routes[path] = response.content.decode()
         return response
@@ -213,6 +218,7 @@ def browser_export(client, owner, settings, tmp_path):
     ):
         capture(url("feed"), htmx=False)
         list_response = client.get(url("feed"), HTTP_HX_REQUEST="true")
+        list_response = canonical_views.feed(list_response.wsgi_request, composer.account.workspace)
         assert list_response.status_code == 200
         list_html = list_response.content.decode()
         threads = []

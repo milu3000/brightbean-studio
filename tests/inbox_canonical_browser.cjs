@@ -137,6 +137,10 @@ class Page {
         }
         if (url.pathname === '/favicon.ico') return this.fulfill(event, '', 'image/x-icon', 204);
         if (event.request.method === 'POST') {
+            if (Object.hasOwn(this.fixture.postResponses || {}, url.pathname)) {
+                this.posts.push({route,body:event.request.postData || ''});
+                return this.fulfill(event, JSON.stringify(this.fixture.postResponses[url.pathname]), 'application/json');
+            }
             if (Object.hasOwn(this.fixture.contentRoutes,url.pathname)) {
                 const body=new URLSearchParams(event.request.postData||'');
                 const pages=this.fixture.contentRoutes[url.pathname][body.get('kind')];
@@ -157,7 +161,22 @@ class Page {
             // an external message, run an app send route, or invent a receipt.
             return this.fulfill(event, '', 'text/plain', 204);
         }
-        if (url.pathname === this.fixture.feed && Object.entries(event.request.headers).some(([name,value])=>name.toLowerCase()==='hx-request'&&value==='true')) return this.fulfill(event, this.fixture.listHtml);
+        if (url.pathname === this.fixture.feed && Object.entries(event.request.headers).some(([name,value])=>name.toLowerCase()==='hx-request'&&value==='true')) {
+            if (this.fixture.listRoutes) {
+                const normalized = value => {
+                    const parsed = new URL(value, this.fixture.origin);
+                    for (const [key, item] of Array.from(parsed.searchParams)) {
+                        if (!item || (key === 'domain' && item === 'all')) parsed.searchParams.delete(key);
+                    }
+                    parsed.searchParams.sort(); return parsed.pathname + parsed.search;
+                };
+                const entry = Object.entries(this.fixture.listRoutes).find(([key]) => normalized(key) === normalized(route));
+                if (entry) return this.fulfill(event, entry[1]);
+                this.unexpected.push(`Unknown filtered GET ${route}`);
+                return this.fulfill(event, 'Unknown fixture filter', 'text/plain', 404);
+            }
+            return this.fulfill(event, this.fixture.listHtml);
+        }
         if (url.searchParams.get('fragment') === 'history' && !url.searchParams.get('cursor')) {
             const thread = this.fixture.threads.find(item => item.detail === url.pathname);
             if (thread) return this.fulfill(event, this.conflict && thread === this.fixture.threads[0] ? this.fixture.conflictHistory : this.fresh && thread === this.fixture.threads[0] ? this.fixture.routes[this.fixture.freshPath] : thread.initialHistory);

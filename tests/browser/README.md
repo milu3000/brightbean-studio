@@ -55,3 +55,19 @@ The separate fixture-export test still runs when the local DOM gate is blocked.
 Its Node `--validate-fixtures` mode validates data and dependencies only, and
 explicitly reports that browser assertions did not run. Controller VM unit tests
 in `tests/inbox_canonical_test.cjs` are also separate from real browser evidence.
+
+The actual-shell gate now uses the default unified inbox route. Its real Django
+exports mix canonical DMs with saved legacy DMs, comments, mentions and a
+historical review, plus enough independent roots to exercise signed keyset
+pagination. Each type/account/search request resolves to its own exported
+fragment, rather than a shared canned response. It checks the same shell and
+detail DOM nodes survive type changes; one capability-aware account selector;
+mobile back for both detail controllers; cross-source unsaved draft decisions;
+stale canonical/legacy responses; and an explicit no-ingestion Review notice.
+Native fallback reads return a synthetic unavailable response and cannot contact
+a provider. The real old legacy split template and old duplicate-account
+canonical template are exported as failing negative controls, alongside the
+reported raw numeric sender/handle regression. The history-heavy canonical
+fixture deliberately calls the internal canonical feed renderer directly so its
+existing controller/history tests remain focused; public routing is exercised
+by the actual-shell gate.

@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% load static %}
+{% block title %}Inbox - {{ workspace.name }} - BrightBean{% endblock %}
+{% block extra_head %}
+{% include "inbox/partials/_canonical_styles.html" %}
+<link rel="stylesheet" href="{% static 'css/inbox-unified.css' %}">
+<script src="{% static 'js/inbox-media.js' %}" defer></script>
+<script src="{% static 'js/inbox-navigation.js' %}" defer></script>
+<script src="{% static 'js/inbox-composer.js' %}" defer></script>
+<script src="{% static 'js/inbox-filters.js' %}" defer></script>
+<script src="{% static 'js/inbox-quote.js' %}" defer></script>
+<script src="{% static 'js/inbox-message-details.js' %}" defer></script>
+<script src="{% static 'js/inbox-canonical.js' %}" defer></script>
+<script src="{% static 'js/inbox-native-thread.js' %}" defer></script>
+<script src="{% static 'js/inbox-unified.js' %}" defer></script>
+{% endblock %}
+{% block content %}
+<div class="canonical-shell unified-shell" data-canonical-shell data-unified-shell data-active-panel="list" hx-history="false">
+    <header class="unified-header">
+        <h1>Inbox</h1>
+        <nav aria-label="Inbox tools">
+            <a href="{% url 'inbox:saved_replies' workspace_id=workspace.id %}">Saved Replies</a>
+            <a href="{% url 'inbox:unassigned_feed' workspace_id=workspace.id %}">待辨識</a>
+        </nav>
+    </header>
+    <div class="canonical-split">
+        <section id="inbox-list-content" class="canonical-list-pane" aria-label="Inbox conversations" hx-sync="this:queue last">
+            {% include "inbox/partials/_unified_list_pane.html" %}
+        </section>
+        <section id="inbox-detail-panel" class="canonical-detail-pane" aria-label="Selected conversation">
+            <div class="unified-empty-detail"><p>Select a message to view details</p></div>
+        </section>
+    </div>
+</div>
+{% endblock %}

@@ -37,6 +37,7 @@ from .canonical_access import (
 )
 from .canonical_content import WITHDRAWN_STATUSES, visible_content
 from .models import ConversationMessage, ConversationReadState, ConversationSyncState, InboxConversation, InboxMessage
+from .sender_display import sender_display
 
 __all__ = [
     "CanonicalReadError",
@@ -151,6 +152,7 @@ def _classification(row):
 def project_message(row):
     """Internal projection: row must come from the exact shared scoped query."""
     content = visible_content(row, provenance_checked=True)
+    sender = sender_display(row)
     body, raw_attachments = content["body"], content["attachments"]
     attachments = []
     for item in raw_attachments[:3]:
@@ -180,7 +182,9 @@ def project_message(row):
         "updated_at": _iso(row.updated_at),
         "direction": row.direction,
         "incoming_generation": row.incoming_generation,
-        "sender_name": row.sender_name[:255],
+        "sender_name": sender["label"],
+        "sender_handle": sender["handle"],
+        "sender_native_id": sender["native_id"],
         "body": body[:4000],
         "body_truncated": len(body) > 4000,
         "attachments": attachments,
@@ -252,12 +256,6 @@ def _conversation(scope, accounts, row):
     messages = _messages(scope, accounts, row)
     latest = messages.filter(occurred_at__isnull=False).order_by("-occurred_at", "-pk").first()
     inbound = messages.filter(_visible_content_query(), direction="inbound")
-    name = (
-        inbound.exclude(sender_name="")
-        .order_by(F("occurred_at").desc(nulls_last=True), "-pk")
-        .values_list("sender_name", flat=True)
-        .first()
-    )
     anchor = (
         inbound.filter(legacy_message__isnull=False)
         .order_by(F("occurred_at").desc(nulls_last=True), "-pk")
@@ -265,8 +263,25 @@ def _conversation(scope, accounts, row):
         .first()
     )
     classification = _classification(row)
+    peer = sender_display({"sender_id": row.peer_id, "platform": row.platform})
+    if classification["conversation_type"] == "direct" and row.peer_id:
+        # A name belongs only to this exact sender in the already proven native
+        # thread. Bound legacy-placeholder recovery; never borrow another peer's
+        # identity, even when it appears on the newest inbound message.
+        candidates = (
+            inbound.filter(sender_id=row.peer_id)
+            .exclude(sender_name="")
+            .exclude(sender_name=F("sender_id"))
+            .order_by(F("occurred_at").desc(nulls_last=True), "-pk")
+            .values("sender_name", "sender_id", "platform")[:20]
+        )
+        for candidate in candidates:
+            display = sender_display(candidate)
+            if display["name"] or display["handle"]:
+                peer = display
+                break
     peer_name = (
-        (name or row.peer_id)
+        peer["label"]
         if classification["conversation_type"] == "direct"
         else "Group conversation"
         if classification["conversation_type"] == "group"
@@ -286,6 +301,8 @@ def _conversation(scope, accounts, row):
         "account_name": account.account_name,
         "account_handle": account.account_handle,
         "peer_name": peer_name,
+        "peer_handle": peer["handle"] if classification["conversation_type"] == "direct" else "",
+        "peer_native_id": peer["native_id"] if classification["conversation_type"] == "direct" else "",
         **classification,
         "sync": _coverage(account),
         "revision": row.revision,

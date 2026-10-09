@@ -1,7 +1,7 @@
 {% extends "base.html" %}
-{% load humanize static %}
+{% load humanize static inbox_identity %}
 
-{% block title %}{{ message.sender_name }} - Inbox - {{ workspace.name }} - Brightbean{% endblock %}
+{% block title %}{% inbox_sender message message.social_account.platform as sender %}{{ sender.label }} - Inbox - {{ workspace.name }} - Brightbean{% endblock %}
 
 {% block extra_head %}
 <style>

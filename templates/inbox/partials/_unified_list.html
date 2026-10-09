@@ -1,0 +1,14 @@
+{% for row in unified_rows %}
+<a href="{{ row.detail_url }}" hx-get="{{ row.detail_url }}" hx-target="#inbox-detail-panel" hx-sync="#inbox-detail-panel:queue last" data-inbox-open-message="{{ row.id }}" data-unified-row data-message-source="{{ row.source }}" data-message-type="{{ row.message_type }}" {% if row.source == 'canonical' %}data-canonical-conversation-row="{{ row.id }}"{% endif %} class="unified-row{% if row.unread %} is-unread{% endif %}">
+    <div class="unified-row-top"><span class="unified-sender" data-unified-sender>{{ row.sender_name }}</span>{% if row.unread %}<span class="unified-unread" aria-label="Unread">●</span>{% endif %}</div>
+    {% with display_handle="@"|add:row.sender_handle %}{% if row.sender_handle and row.sender_name != display_handle %}<p class="unified-handle" data-unified-handle>{{ display_handle }}</p>{% endif %}{% endwith %}
+    <p class="unified-account">{{ row.account_name }}{% if row.account_handle %} · @{{ row.account_handle }}{% endif %} · {% if row.platform == "facebook" %}Facebook{% elif row.platform == "instagram" or row.platform == "instagram_login" %}Instagram{% else %}{{ row.platform }}{% endif %}</p>
+    <p class="unified-preview">{{ row.preview|truncatechars:140 }}</p>
+    <div class="unified-row-meta">
+        <span class="unified-type">{% if row.message_type == 'dm' %}DM{% elif row.message_type == 'comment' %}Comment{% elif row.message_type == 'mention' %}Mention{% elif row.message_type == 'review' %}Review{% endif %}</span>
+        {% if row.source == 'canonical' %}{% include "inbox/partials/_canonical_status.html" with conversation=row.canonical %}{% elif row.status %}<span class="unified-status">{{ row.status|capfirst }}</span>{% endif %}
+        {% if row.timestamp %}<time datetime="{{ row.timestamp }}">{{ row.timestamp }}</time>{% endif %}
+    </div>
+</a>
+{% empty %}<p class="unified-empty-list" role="status">No messages match these filters.</p>{% endfor %}
+{% if unified_next_url %}<a href="{{ unified_next_url }}" hx-get="{{ unified_next_url }}" hx-target="#inbox-list-content" hx-sync="#inbox-list-content:queue last" hx-push-url="true" class="unified-pagination" data-unified-next>Older messages</a>{% endif %}

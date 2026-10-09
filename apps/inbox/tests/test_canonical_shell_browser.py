@@ -1,15 +1,19 @@
-"""Render the actual application shell and compiled CSS in offline Chromium."""
+"""Render the real unified application shell and compiled CSS in offline Chromium."""
 
 import json
 import os
 import subprocess
+from datetime import timedelta
 from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import urlencode
 
 import pytest
+from django.test import override_settings
 from django.urls import reverse
 
-from apps.inbox.models import ConversationMessage
+from apps.inbox import canonical_views
+from apps.inbox.models import ConversationMessage, InboxMessage
 from apps.inbox.tests.test_canonical_browser import require_browser
 from apps.inbox.tests.test_canonical_reads_rebuilt import proof
 from apps.inbox.tests.test_owned_composer_bridge import clock as clock
@@ -26,41 +30,133 @@ def shell_export(client, owner, tmp_path):
     assert css.is_file(), "Build actual CSS first: cd theme/static_src && npm ci && npm run build"
     client.force_login(owner.user)
     OnboardingChecklist.objects.create(user=owner.user, workspace=owner.account.workspace, is_dismissed=True)
+    ConversationMessage.objects.filter(conversation=owner.conversation).update(sender_name="9911887766554433")
     for message in ConversationMessage.objects.filter(conversation=owner.conversation):
         proof(owner, message)
-    legacy_accounts = []
+    accounts = []
     for index in range(10):
-        account = SocialAccount.objects.create(
-            workspace=owner.account.workspace,
-            platform="facebook" if index % 2 else "instagram_login",
-            account_platform_id=f"synthetic-shell-account-{index}",
-            account_name=f"Synthetic brand {index // 2}",
-            account_handle=f"synthetic.brand.{index // 2}",
+        accounts.append(
+            SocialAccount.objects.create(
+                workspace=owner.account.workspace,
+                platform="facebook" if index % 2 else "instagram_login",
+                account_platform_id=f"synthetic-shell-account-{index}",
+                account_name=f"Synthetic brand {index // 2}",
+                account_handle=f"synthetic.brand.{index // 2}",
+            )
         )
-        legacy_accounts.append(str(account.pk))
-    routes = {}
+    historical = SocialAccount.objects.create(
+        workspace=owner.account.workspace,
+        platform="threads",
+        account_platform_id="synthetic-historic-account",
+        account_name="Synthetic historical brand",
+        account_handle="historic.brand",
+    )
+    legacy = []
+    for index, (kind, account, name, handle) in enumerate(
+        (
+            ("dm", accounts[1], "合成訪客", "9988776655443322"),
+            ("comment", accounts[0], "synthetic.visitor", "9911223344556677"),
+            ("mention", accounts[1], "Synthetic Reader", "synthetic.reader"),
+            ("review", historical, "Historic reviewer", "reviewer"),
+        )
+    ):
+        legacy.append(
+            InboxMessage.objects.create(
+                workspace=owner.account.workspace,
+                social_account=account,
+                platform_message_id=f"synthetic-shell-{kind}",
+                message_type=kind,
+                sender_name=name,
+                sender_handle=handle,
+                body=f"Synthetic {kind} message",
+                received_at=owner.clock.now - timedelta(minutes=index + 1),
+                extra={"conversation_id": "synthetic-legacy-thread"} if kind == "dm" else {},
+            )
+        )
+    for index in range(55):
+        InboxMessage.objects.create(
+            workspace=owner.account.workspace,
+            social_account=accounts[0],
+            platform_message_id=f"synthetic-older-comment-{index}",
+            message_type="comment",
+            sender_name=f"Synthetic older sender {index}",
+            body=f"Older saved comment {index}",
+            received_at=owner.clock.now - timedelta(days=index + 1),
+        )
+    routes, list_routes = {}, {}
     feed = reverse("inbox:feed", kwargs={"workspace_id": owner.account.workspace_id})
     detail = reverse(
         "inbox:conversation_detail",
         kwargs={"workspace_id": owner.account.workspace_id, "conversation_id": owner.conversation.pk},
     )
+
+    def capture_list(params=None):
+        url = feed + ("?" + urlencode(params) if params else "")
+        response = client.get(url, HTTP_HX_REQUEST="true")
+        assert response.status_code == 200, (url, response.content[:500])
+        list_routes[url] = response.content.decode()
+        return response
+
     with (
         patch("apps.inbox.native_thread_reads.read_native_thread") as native,
         patch("apps.inbox.services._dispatch_to_platform") as provider,
     ):
-        for url, headers in ((feed, {}), (detail, {"HTTP_HX_REQUEST": "true"}), (detail + "?standalone=1", {})):
+        response = client.get(feed)
+        assert response.status_code == 200, response.content[:500]
+        routes[feed] = response.content.decode()
+        first_rows = [row["id"] for row in response.context["unified_rows"]]
+        next_url = response.context["unified_next_url"]
+        assert next_url, "Real pagination is required by the shell fixture"
+        next_response = client.get(next_url, HTTP_HX_REQUEST="true")
+        assert next_response.status_code == 200
+        list_routes[next_url] = next_response.content.decode()
+        next_rows = [row["id"] for row in next_response.context["unified_rows"]]
+        assert first_rows and next_rows and not set(first_rows).intersection(next_rows)
+        for domain in ("all", "dm", "comment", "mention", "review"):
+            capture_list({"domain": domain})
+        capture_list()
+        for params in (
+            {"domain": "all", "platform": "facebook"},
+            {"domain": "all", "account": str(accounts[0].pk)},
+            {"domain": "all", "q": "synthetic.visitor"},
+            {"domain": "comment", "account": str(accounts[0].pk)},
+            {"domain": "comment", "account": str(accounts[0].pk), "q": "synthetic.visitor"},
+            {"domain": "dm", "account": str(owner.account.pk)},
+        ):
+            capture_list(params)
+        # Detail can mark read in the isolated DB, so export list snapshots first.
+        for url, headers in ((detail, {"HTTP_HX_REQUEST": "true"}), (detail + "?standalone=1", {})):
             response = client.get(url, **headers)
             assert response.status_code == 200, response.content[:500]
             routes[url] = response.content.decode()
-        list_response = client.get(feed, HTTP_HX_REQUEST="true")
+        legacy_threads = []
+        for message in legacy:
+            url = reverse(
+                "inbox:message_detail",
+                kwargs={"workspace_id": owner.account.workspace_id, "message_id": message.pk},
+            )
+            response = client.get(url, HTTP_HX_REQUEST="true")
+            assert response.status_code == 200, response.content[:500]
+            routes[url] = response.content.decode()
+            legacy_threads.append({"id": str(message.pk), "detail": url, "kind": message.message_type})
         history_response = client.get(detail, {"fragment": "history"}, HTTP_HX_REQUEST="true")
-        assert list_response.status_code == history_response.status_code == 200
+        assert history_response.status_code == 200
+        with override_settings(INBOX_CANONICAL_READ_ENABLED=False):
+            old_legacy = client.get(feed + "?domain=comment")
+            assert old_legacy.status_code == 200
+        old_request = client.get(feed, {"domain": "dm", "account": str(owner.account.pk)}).wsgi_request
+        old_canonical = canonical_views.feed(old_request, owner.account.workspace)
+        assert old_canonical.status_code == 200
+        routes[feed + "?shell-negative=legacy"] = old_legacy.content.decode()
+        routes[feed + "?shell-negative=duplicate"] = old_canonical.content.decode()
         native.assert_not_called()
         provider.assert_not_called()
-    # Only unrelated optional CDN widgets are stubbed. Layout, base template,
-    # compiled Tailwind, HTMX, Alpine and every inbox controller are real.
     assets = {
         "https://canonical.test/static/css/dist/styles.css": {"body": css.read_text(), "type": "text/css"},
+        "https://canonical.test/static/css/inbox-unified.css": {
+            "body": (ROOT / "static/css/inbox-unified.css").read_text(),
+            "type": "text/css",
+        },
         "https://canonical.test" + reverse("notifications:unread_count"): {
             "body": '{"count":0}',
             "type": "application/json",
@@ -79,11 +175,24 @@ def shell_export(client, owner, tmp_path):
         "origin": "https://canonical.test",
         "feed": feed,
         "routes": routes,
-        "listHtml": list_response.content.decode(),
+        "listHtml": list_routes[feed],
+        "listRoutes": list_routes,
         "assets": assets,
         "fullShell": True,
-        "legacyAccountIds": legacy_accounts,
+        "legacyAccountIds": [str(account.pk) for account in accounts] + [str(historical.pk)],
+        "commentAccount": str(accounts[0].pk),
+        "canonicalAccount": str(owner.account.pk),
+        "legacyThreads": legacy_threads,
+        "negativeRoutes": [feed + "?shell-negative=legacy", feed + "?shell-negative=duplicate"],
+        "firstRows": first_rows,
+        "nextRows": next_rows,
         "contentRoutes": {},
+        "postResponses": {
+            reverse(
+                "inbox:native_thread_refresh",
+                kwargs={"workspace_id": owner.account.workspace_id, "message_id": legacy[0].pk},
+            ): {"status": "unavailable", "reason_code": "read_failed", "anchor_message_id": str(legacy[0].pk)},
+        },
         "threads": [
             {
                 "id": str(owner.conversation.pk),
@@ -91,10 +200,7 @@ def shell_export(client, owner, tmp_path):
                 "initialHistory": history_response.content.decode(),
                 "read": reverse(
                     "inbox:conversation_read_ack",
-                    kwargs={
-                        "workspace_id": owner.account.workspace_id,
-                        "conversation_id": owner.conversation.pk,
-                    },
+                    kwargs={"workspace_id": owner.account.workspace_id, "conversation_id": owner.conversation.pk},
                 ),
             }
         ],
@@ -110,10 +216,15 @@ def test_actual_shell_fixture_keeps_account_routes(shell_export):
     _destination, manifest = shell_export
     html = manifest["routes"][manifest["feed"]]
     assert "sidebar-initial" in html and "/static/css/dist/styles.css" in html
-    assert html.count("Synthetic brand") >= 20
+    assert html.count("data-inbox-account") == 1
+    assert "Switch account" not in html
+    assert 'data-unified-domain="all" aria-current="page"' in html
+    assert 'data-message-source="canonical"' in html and 'data-message-source="legacy"' in html
+    assert all(f'data-message-type="{kind}"' in html for kind in ("dm", "comment", "mention", "review"))
+    assert "@9911223344556677" not in html and "@9988776655443322" not in html
+    assert "Unknown sender" in html
     assert "Facebook" in html and "Instagram" in html
-    assert "data-canonical-account-switcher" in html
-    assert 'name="read_source" value="canonical"' in html
+    assert manifest["firstRows"] and manifest["nextRows"]
 
 
 @pytest.mark.django_db(transaction=True)
@@ -124,7 +235,7 @@ def test_canonical_actual_shell_chromium(request):
         [node, str(ROOT / "tests/inbox_shell_browser.cjs"), "--browser", binary, "--fixtures", str(destination)],
         capture_output=True,
         text=True,
-        timeout=90,
+        timeout=150,
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
