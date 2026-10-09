@@ -117,6 +117,8 @@ async function selectFilter(page,name,value) {
     await page.settle();
 }
 
+const compactControls = `Array.from(document.querySelectorAll('#inbox-filters select')).every(select=>{const height=select.getBoundingClientRect().height;return height>=28&&height<=40;})`;
+
 async function scenario(browser,width,height,collapsed) {
     const page=await createPage(browser,{...fixture,sidebarCollapsed:collapsed},width,height);
     try {
@@ -150,6 +152,15 @@ async function scenario(browser,width,height,collapsed) {
             assert.deepEqual(await page.evaluate(clipped),[]);
         }
         await chooseType(page,'comment');
+        assert(await page.evaluate(compactControls),'Message status and Queue controls stay compact, including inside column labels');
+        if (width===1365 && !collapsed) {
+            try {
+                await page.evaluate(`const style=document.createElement('style');style.id='old-select-flex';style.textContent='.unified-shell #inbox-filters select{flex:1 1 8rem;height:auto}';document.head.append(style)`);
+                assert.equal(await page.evaluate(compactControls),false,'Inherited 8rem flex basis fails real control-height bound');
+                await screenshot(page,'regression-oversized-status-select');
+            } finally {await page.evaluate(`document.querySelector('#old-select-flex')?.remove()`);}
+            assert(await page.evaluate(compactControls),'Restoring unified select basis recovers compact filters');
+        }
         await openLegacy(page,fixture.legacyThreads.find(thread=>thread.kind==='comment'));
         assert(await page.evaluate(`!document.querySelector('[data-inbox-panel]').innerText.includes('@9911223344556677')`),'Legacy detail never renders numeric provider ID as a handle');
         await screenshot(page,`unified-comment-${width}-${collapsed?'collapsed':'expanded'}`);
@@ -253,6 +264,174 @@ async function mixedRaceScenario(browser) {
     process.stdout.write('PASS stale canonical/legacy detail and list responses cannot replace newer selection\n');
 }
 
+async function browserHistoryScenario(browser) {
+    for (const source of ['canonical','legacy']) {
+        const page=await createPage(browser,fixture,1365,900);
+        try {
+            await page.evaluate('window.originalUnifiedShell=document.querySelector("[data-unified-shell]");window.originalDetailPane=document.querySelector("#inbox-detail-panel");window.historyRestores=0;document.addEventListener("htmx:historyRestore",()=>window.historyRestores++);');
+            if (source==='canonical') await page.open(fixture.threads[0]);
+            else await openLegacy(page,fixture.legacyThreads.find(thread=>thread.kind==='comment'));
+            const draft=`Unsaved ${source} reply across browser history`;
+            await page.type(draft);
+            await page.evaluate(`window.originalComposer=document.querySelector('[data-inbox-reply-form] textarea')`);
+            await chooseType(page,'comment');
+            await chooseType(page,'dm');
+            for (const [offset,domain] of [[-1,'comment'],[1,'dm'],[-1,'comment'],[-1,'all']]) {
+                const previous=await page.evaluate('window.historyRestores');
+                const history=await page.command('Page.getNavigationHistory');
+                const entry=history.entries[history.currentIndex+offset];
+                assert(entry,'Native browser history contains the requested Back/Forward entry');
+                await page.command('Page.navigateToHistoryEntry',{entryId:entry.id});
+                await page.wait(`window.historyRestores>${previous}`,'HTMX history restoration');
+                await page.wait(`document.querySelector('[data-unified-domain][aria-current]')?.dataset.unifiedDomain===${JSON.stringify(domain)}`,'restored type');
+                assert.equal(await page.evaluate(`document.querySelector('[data-inbox-reply-form] textarea')===window.originalComposer`),true,'Browser Back/Forward preserves the exact composer node');
+                assert.equal(await page.evaluate(`document.querySelector('[data-inbox-reply-form] textarea').value`),draft,'Unsent text survives history navigation');
+                assert.equal(await page.evaluate(`document.querySelector('[data-unified-shell]')===window.originalUnifiedShell`),true,'History restores only the list pane');
+                assert.deepEqual(await page.evaluate(unifiedFailures),[]);
+                assert(await page.evaluate(compactControls));
+            }
+            assert(page.requests.filter(request=>request.historyRestore).length>=4,'History cache misses use real HX-History-Restore-Request responses');
+            assert.equal(page.dialogs.length,0,'Filter history does not discard or reconfirm preserved draft');
+            assert.equal(await page.evaluate(`(localStorage.getItem('htmx-history-cache')||'').includes(${JSON.stringify(draft)})`),false,'Unsaved message content is never saved in browser history cache');
+            assert.equal(await page.evaluate(`JSON.parse(localStorage.getItem('htmx-history-cache')||'[]').filter(item=>item.url.startsWith(${JSON.stringify(fixture.feed)})).length`),0,'Inbox DOM is never cached in localStorage');
+            // The controller must accept automatic refresh in the restored scope.
+            await page.evaluate(`window.restoredListSwaps=0;document.addEventListener('htmx:afterSwap',event=>{if(event.detail.target?.id==='inbox-list-content')window.restoredListSwaps++;});htmx.trigger(document.querySelector('[data-unified-filters]'),'inbox:refresh-list')`);
+            await page.wait('window.restoredListSwaps>0','automatic refresh after browser history');
+            assert.equal(await page.evaluate(`document.querySelector('[data-inbox-reply-form] textarea').value`),draft);
+            await page.clean();
+        } finally {await page.close();}
+    }
+    process.stdout.write('PASS native browser Back/Forward restores real server list/filter state and preserves canonical/legacy unsaved drafts without DOM caching\n');
+}
+
+async function historyRaceScenario(browser) {
+    for (const mode of ['back-forward','back-filter','filter-back']) {
+        const page=await createPage(browser,fixture,1365,900);
+        try {
+            await page.evaluate('window.originalUnifiedShell=document.querySelector("[data-unified-shell]");window.originalDetailPane=document.querySelector("#inbox-detail-panel");window.historyRestores=0;document.addEventListener("htmx:historyRestore",()=>window.historyRestores++);');
+            await page.open(fixture.threads[0]);
+            const draft='Keep this canonical draft during '+mode;
+            await page.type(draft);
+            await page.evaluate(`window.originalComposer=document.querySelector('[data-inbox-reply-form] textarea')`);
+            await chooseType(page,'comment');
+            await chooseType(page,'dm');
+            const oldPath=fixture.feed+(mode==='filter-back'?'?domain=mention':'?domain=comment');
+            page.delays.set(oldPath,700);
+            const requestsBefore=page.requests.length;
+            if (mode==='filter-back') await page.click('[data-unified-domain="mention"]');
+            else {
+                const history=await page.command('Page.getNavigationHistory');
+                await page.command('Page.navigateToHistoryEntry',{entryId:history.entries[history.currentIndex-1].id});
+            }
+            // Wait only for the old request to start, deliberately not its
+            // response. Every replacement below races the still-held request.
+            const deadline=Date.now()+8000;
+            while (!page.requests.slice(requestsBefore).some(request=>request.route===oldPath)) {
+                if (Date.now()>deadline) throw new Error('Delayed request never started: '+oldPath);
+                await new Promise(resolve=>setTimeout(resolve,10));
+            }
+            await page.evaluate(`window.raceTypes=[];window.raceObserver=new MutationObserver(()=>window.raceTypes.push(document.querySelector('[data-unified-domain][aria-current]')?.dataset.unifiedDomain));window.raceObserver.observe(document.querySelector('#inbox-list-content'),{childList:true,subtree:true});`);
+            let expected;
+            if (mode==='back-filter') {
+                expected='mention';
+                await page.click('[data-unified-domain="mention"]');
+                await page.wait(`new URL(location.href).searchParams.get('domain')==='mention'`,'new filter wins over pending Back');
+            } else {
+                expected=mode==='back-forward'?'dm':'comment';
+                const history=await page.command('Page.getNavigationHistory');
+                const offset=mode==='back-forward'?1:-1;
+                await page.command('Page.navigateToHistoryEntry',{entryId:history.entries[history.currentIndex+offset].id});
+                await page.wait('window.historyRestores>0','newer history response completes first');
+            }
+            await page.wait(`document.querySelector('[data-unified-domain][aria-current]')?.dataset.unifiedDomain===${JSON.stringify(expected)}`,'newer list visible');
+            // Give the superseded request more than its full interception delay
+            // so assertions cannot accidentally pass before stale arrival.
+            await new Promise(resolve=>setTimeout(resolve,850));
+            assert.equal(await page.evaluate(`new URL(location.href).searchParams.get('domain')`),expected,'Browser URL remains the newest intent');
+            assert.equal(await page.evaluate(`document.querySelector('[data-unified-domain][aria-current]').dataset.unifiedDomain`),expected,'Late response cannot replace newer filter list');
+            assert.equal(await page.evaluate(`document.querySelector('#inbox-filters [name="domain"]').value`),expected,'Submitted filter values agree with visible type and URL');
+            assert.equal(await page.evaluate(`window.raceTypes.includes(${JSON.stringify(mode==='filter-back'?'mention':'comment')})`),false,'Superseded response never flashes into the list');
+            assert.equal(await page.evaluate(`document.querySelector('[data-inbox-reply-form] textarea')===window.originalComposer`),true);
+            assert.equal(await page.evaluate(`document.querySelector('[data-inbox-reply-form] textarea').value`),draft);
+            assert.deepEqual(await page.evaluate(unifiedFailures),[]);
+            await page.clean();
+        } finally {await page.close();}
+    }
+    process.stdout.write('PASS delayed Back→Forward, Back→new filter, and pending filter→Back races keep URL, DOM and unsaved draft consistent\n');
+}
+
+async function historyFailureScenario(browser) {
+    for (const status of [409,0]) {
+        const page=await createPage(browser,fixture,1365,900);
+        try {
+            await page.evaluate('window.originalUnifiedShell=document.querySelector("[data-unified-shell]");window.originalDetailPane=document.querySelector("#inbox-detail-panel");window.historyError="";window.addEventListener("htmx-error",event=>{window.historyError=event.detail.message;});');
+            await page.open(fixture.threads[0]);
+            await page.type('Keep draft after failed history restore');
+            await chooseType(page,'comment');await chooseType(page,'dm');
+            page.failures.set(fixture.feed+'?domain=comment',status);
+            const history=await page.command('Page.getNavigationHistory');
+            await page.command('Page.navigateToHistoryEntry',{entryId:history.entries[history.currentIndex-1].id});
+            await page.wait(`window.historyError.includes('could not be restored')`,'history failure is explained');
+            assert.equal(await page.evaluate(`new URL(location.href).searchParams.get('domain')`),'dm','Failed navigation restores URL to still-visible scope');
+            assert.equal(await page.evaluate(`document.querySelector('[data-unified-domain][aria-current]').dataset.unifiedDomain`),'dm');
+            assert.equal(await page.evaluate(`document.querySelector('[data-inbox-reply-form] textarea').value`),'Keep draft after failed history restore');
+            await page.evaluate(`window.afterFailedHistorySwaps=0;document.addEventListener('htmx:afterSwap',event=>{if(event.detail.target?.id==='inbox-list-content')window.afterFailedHistorySwaps++;});htmx.trigger(document.querySelector('[data-unified-filters]'),'inbox:refresh-list')`);
+            await page.wait('window.afterFailedHistorySwaps>0','automatic list refresh recovers after history failure');
+            page.failures.clear();await chooseType(page,'comment');
+            await page.clean();
+        } finally {await page.close();}
+    }
+    process.stdout.write('PASS HTTP and network history failures retain draft, restore matching URL and recover automatic refresh\n');
+}
+
+async function legacyHistoryCacheScenario(browser) {
+    const page=await createPage(browser,fixture,1365,900);
+    let originalCache;
+    try {
+        originalCache=await page.evaluate(`localStorage.getItem('htmx-history-cache')`);
+        await page.evaluate('window.originalUnifiedShell=document.querySelector("[data-unified-shell]");window.originalDetailPane=document.querySelector("#inbox-detail-panel");window.historyRestores=0;document.addEventListener("htmx:historyRestore",()=>window.historyRestores++);');
+        await page.open(fixture.threads[0]);await page.type('Live draft survives pre-upgrade history');
+        await page.evaluate(`window.originalComposer=document.querySelector('[data-inbox-reply-form] textarea')`);
+        await chooseType(page,'comment');await chooseType(page,'dm');
+        const oldBody=await page.evaluate(`new DOMParser().parseFromString(${JSON.stringify(fixture.routes[fixture.negativeRoutes[0]])},'text/html').body.innerHTML`);
+        const cached=[
+            {url:'http://[',content:'Malformed legacy entry input remains',title:'Unchanged malformed entry',scroll:0},
+            {url:fixture.feed+'?domain=comment',content:oldBody+'<details data-synthetic-old-history><summary>Your draft edits were not saved. Copy this text before leaving.</summary><p>Unsaved cached reply from failed save</p><input value="Unrecoverable cached input"></details>',title:'Old inbox',scroll:27},
+            {url:'/workspaces/00000000-0000-4000-8000-000000000099/inbox/',content:'Other workspace draft remains',title:'Other workspace',scroll:9},
+            {url:'/calendar/synthetic-preserve/',content:'Other page user input remains',title:'Calendar',scroll:18}
+        ];
+        const serialized=JSON.stringify(cached);
+        await page.evaluate(`localStorage.setItem('htmx-history-cache',${JSON.stringify(serialized)});window.sawOldBody=false;window.oldBodyObserver=new MutationObserver(()=>{if(document.querySelector('[data-synthetic-old-history]'))window.sawOldBody=true;});window.oldBodyObserver.observe(document.querySelector('#inbox-list-content'),{childList:true,subtree:true});`);
+        const requestsBefore=page.requests.length;
+        for (const [offset,domain] of [[-1,'comment'],[1,'dm']]) {
+            const before=await page.command('Page.getNavigationHistory');
+            const target=before.entries[before.currentIndex+offset];
+            const restored=await page.evaluate('window.historyRestores');
+            await page.command('Page.navigateToHistoryEntry',{entryId:target.id});
+            await page.wait(`window.historyRestores>${restored}`,'fresh server restore bypassing legacy snapshot');
+            const after=await page.command('Page.getNavigationHistory');
+            assert.equal(after.entries.length,before.entries.length,'Cache bypass never pushes a new history entry');
+            assert.equal(after.entries[after.currentIndex].id,target.id,'Cache bypass preserves native history position');
+            assert.equal(await page.evaluate(`new URL(location.href).searchParams.get('domain')`),domain);
+            assert.equal(await page.evaluate(`document.querySelector('#inbox-filters [name="domain"]').value`),domain);
+            assert.equal(await page.evaluate(`document.querySelectorAll('#inbox-list-content').length`),1,'Selected history children cannot nest a duplicate list pane');
+            assert.equal(await page.evaluate(`document.querySelectorAll('#inbox-filters').length`),1);
+            assert.equal(await page.evaluate(`document.querySelector('[data-inbox-reply-form] textarea')===window.originalComposer`),true);
+            assert.equal(await page.evaluate(`document.querySelector('[data-inbox-reply-form] textarea').value`),'Live draft survives pre-upgrade history');
+            assert.equal(await page.evaluate(`localStorage.getItem('htmx-history-cache')`),serialized,'Old cached draft/input and unrelated scopes stay byte-identical');
+        }
+        assert(page.requests.slice(requestsBefore).filter(request=>request.historyRestore).length>=2,'Old cached HTML is bypassed with fresh scoped server reads');
+        assert.equal(await page.evaluate('window.sawOldBody'),false,'Old body never enters the new pane, even transiently');
+        assert.deepEqual(await page.evaluate(unifiedFailures),[]);
+        await page.clean();
+    } finally {
+        if (originalCache===null) await page.evaluate(`localStorage.removeItem('htmx-history-cache')`);
+        else if (originalCache!==undefined) await page.evaluate(`localStorage.setItem('htmx-history-cache',${JSON.stringify(originalCache)})`);
+        await page.close();
+    }
+    process.stdout.write('PASS pre-upgrade body-cache bypass preserves cached/live drafts, other workspace/page cache bytes and browser history position\n');
+}
+
 async function reportedBugNegativeControls(browser) {
     for (const [index,route] of fixture.negativeRoutes.entries()) {
         const page=await createPage(browser,{...fixture,feed:route},1365,900);
@@ -287,6 +466,10 @@ async function main() {
         await mixedInteractionScenario(browser);
         await filteringScenario(browser);
         await mixedRaceScenario(browser);
+        await browserHistoryScenario(browser);
+        await historyRaceScenario(browser);
+        await historyFailureScenario(browser);
+        await legacyHistoryCacheScenario(browser);
         await reportedBugNegativeControls(browser);
         for (const width of [1365,390]) {
             const standalone={...fixture,feed:fixture.threads[0].detail+'?standalone=1'};

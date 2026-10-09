@@ -22,7 +22,7 @@ from .canonical_access import digest, narrow_scope
 from .canonical_compat import inbox_source_snapshot, legacy_body_search_query
 from .canonical_send_target import canonical_projection_view, exclude_transport_projections
 from .models import ConversationMessage, InboxConversation, InboxMessage
-from .public_threads import PUBLIC_TYPES, public_thread_key, public_type_filter
+from .public_threads import PUBLIC_TYPES, public_native_id, public_post_id, public_thread_key, public_type_filter
 
 SALT = "inbox.unified-feed.v1"
 DOMAINS = (("all", "All Types"), ("dm", "DMs"), ("comment", "Comments"), ("mention", "Mentions"), ("review", "Reviews"))
@@ -105,6 +105,52 @@ def _legacy_query(scope, sources, selected):
     return query
 
 
+def _public_parent_cache(messages):
+    """Batch exact ancestor metadata; never fetch parent content or peers.
+
+    Filters can omit a proving parent. Resolve those identities outside the
+    filter, but only inside the matching rows' exact workspace/account pairs.
+    Rebuild on each metadata pass so a changed parent still invalidates cursors.
+    """
+    parents = {
+        (str(message.workspace_id), str(message.social_account_id), message.platform_message_id): message
+        for message in messages
+        if message.message_type in PUBLIC_TYPES and public_native_id(message.platform_message_id)
+    }
+    pending = list(parents.values())
+    for _ in range(50):
+        missing = set()
+        for message in pending:
+            extra = message.extra if isinstance(message.extra, dict) else {}
+            parent = public_native_id(extra.get("parent_id"))
+            if parent and parent != public_post_id(message):
+                key = (str(message.workspace_id), str(message.social_account_id), parent)
+                if key not in parents:
+                    missing.add(key)
+        if not missing:
+            break
+        grouped = {}
+        for workspace_id, account_id, native_id in missing:
+            grouped.setdefault((workspace_id, account_id), []).append(native_id)
+        condition = Q(pk__in=[])
+        for (workspace_id, account_id), native_ids in grouped.items():
+            condition |= Q(
+                workspace_id=workspace_id,
+                social_account_id=account_id,
+                social_account__workspace_id=workspace_id,
+                platform_message_id__in=native_ids,
+            )
+        pending = list(
+            InboxMessage.objects.filter(condition, message_type__in=PUBLIC_TYPES).only(
+                "id", "workspace_id", "social_account_id", "platform_message_id", "message_type", "extra"
+            )
+        )
+        parents.update(dict.fromkeys(missing))
+        for message in pending:
+            parents[(str(message.workspace_id), str(message.social_account_id), message.platform_message_id)] = message
+    return parents
+
+
 def _legacy_metadata(query):
     fields = (
         "pk",
@@ -135,11 +181,13 @@ def _legacy_metadata(query):
             )
             record["received_at"] = canonical_projection_view(message).received_at
     records.sort(key=lambda record: (record["received_at"], str(record["pk"])), reverse=True)
-    groups, parents, membership = {}, {}, []
-    for record in records:
-        message = InboxMessage(
-            **{key: value for key, value in record.items() if key not in {"body_digest", "has_shadow"}}
-        )
+    messages = [
+        InboxMessage(**{key: value for key, value in record.items() if key not in {"body_digest", "has_shadow"}})
+        for record in records
+    ]
+    parents = _public_parent_cache(messages) if presentation.enabled() else {}
+    groups, membership = {}, []
+    for record, message in zip(records, messages, strict=True):
         native = presentation.thread_id(message) if presentation.enabled() else ""
         key = (record["workspace_id"], record["social_account_id"], "dm", native) if native else (record["pk"],)
         if presentation.enabled() and record["message_type"] in PUBLIC_TYPES:

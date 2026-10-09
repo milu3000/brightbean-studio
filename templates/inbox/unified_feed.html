@@ -24,7 +24,7 @@
         </nav>
     </header>
     <div class="canonical-split">
-        <section id="inbox-list-content" class="canonical-list-pane" aria-label="Inbox conversations" hx-sync="this:queue last">
+        <section id="inbox-list-content" hx-history-elt class="canonical-list-pane" aria-label="Inbox conversations" hx-sync="this:queue last">
             {% include "inbox/partials/_unified_list_pane.html" %}
         </section>
         <section id="inbox-detail-panel" class="canonical-detail-pane" aria-label="Selected conversation">

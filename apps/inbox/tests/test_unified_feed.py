@@ -752,3 +752,114 @@ def test_queue_views_cannot_be_applied_to_canonical_or_mixed_dm_scope(context):
             assert error.value.code == "invalid_filter"
     with pytest.raises(reader.CanonicalReadError):
         selected(domain="dm", status="unread", workflow="waiting")
+
+
+@pytest.mark.parametrize("fault", ["workspace", "account", "platform", "native", "direction", "legacy_link"])
+def test_conflicting_legacy_shadow_never_materializes_unscoped_body_or_sender(context, fault):
+    from django.db.models.signals import post_init
+
+    other = account(context)
+    anchor = legacy(other, kind="dm", platform_message_id="synthetic-materialization-anchor")
+    thread = InboxConversation.objects.create(
+        workspace=other.workspace,
+        social_account=other,
+        platform=other.platform,
+        platform_conversation_id="synthetic-materialization-thread",
+        identity_kind="platform",
+        peer_id="synthetic-peer",
+        conversation_type="direct",
+        classification_reason="participants_pair",
+    )
+    candidate = ConversationMessage.objects.create(
+        workspace=other.workspace,
+        social_account=other,
+        platform=other.platform,
+        conversation=thread,
+        platform_message_id=anchor.platform_message_id,
+        legacy_message=anchor,
+        direction="inbound",
+        sender_id="synthetic-peer",
+        sender_name="FORBIDDEN CONFLICTING SENDER",
+        body="FORBIDDEN CONFLICTING BODY",
+        occurred_at=timezone.now(),
+    )
+    if fault == "workspace":
+        foreign = Workspace.objects.create(name="Synthetic foreign tenant", organization=other.workspace.organization)
+        changes = {"workspace": foreign}
+    elif fault == "account":
+        changes = {"social_account": account(context)}
+    elif fault == "platform":
+        changes = {"platform": "instagram_login"}
+    elif fault == "native":
+        changes = {"platform_message_id": "synthetic-different-native-id"}
+    elif fault == "direction":
+        changes = {"direction": "outbound"}
+    else:
+        changes = {"legacy_message": legacy(other, kind="comment")}
+    ConversationMessage.objects.filter(pk=candidate.pk).update(**changes)
+    materialized = []
+
+    def capture_unscoped_content(sender, instance, **kwargs):
+        # Inspect loaded attributes only; the assertion must not fetch deferred
+        # fields and accidentally create the very disclosure it is detecting.
+        if any("FORBIDDEN" in instance.__dict__.get(field, "") for field in ("body", "sender_name")):
+            materialized.append(instance.pk)
+
+    post_init.connect(capture_unscoped_content, sender=ConversationMessage, weak=False)
+    try:
+        result = feed.read_feed(context.scope, selected(domain="dm", account=str(other.pk)))
+        result["guard"]()
+    finally:
+        post_init.disconnect(capture_unscoped_content, sender=ConversationMessage)
+    assert materialized == [], "An unvalidated shadow must be inspected as identity metadata only"
+    assert [item["id"] for item in result["rows"]] == [str(anchor.pk)]
+    assert result["rows"][0]["preview"] == "Message unavailable"
+    assert "FORBIDDEN" not in repr(result["rows"])
+    assert anchor.body not in repr(result["rows"]), "A conflicting shadow must not reopen raw legacy text"
+
+
+def test_public_ancestor_query_count_depends_on_depth_not_thread_count(context):
+    accounts = [account(context), account(context)]
+    now = timezone.now()
+
+    def add_threads(start, stop):
+        records = []
+        for index in range(start, stop):
+            own = accounts[index % 2]
+            # Both accounts deliberately reuse every opaque post/native ID.
+            native = f"synthetic-batched-{index // 2}"
+            for level in range(3):
+                records.append(
+                    InboxMessage(
+                        workspace=own.workspace,
+                        social_account=own,
+                        platform_message_id=f"{native}-{level}",
+                        message_type="comment",
+                        sender_name="Synthetic ancestor sender",
+                        body="Synthetic ancestor text",
+                        received_at=now + timedelta(seconds=level),
+                        status="unread" if level == 2 else "resolved",
+                        extra={
+                            "post_id": f"synthetic-page_{index // 2}",
+                            "parent_id": "" if level == 0 else f"{native}-{level - 1}",
+                        },
+                    )
+                )
+        InboxMessage.objects.bulk_create(records)
+
+    def metadata():
+        sources, _stamp = feed.inbox_source_snapshot(context.scope)
+        query = feed._legacy_query(context.scope, sources, selected(domain="comment", status="unread"))
+        with CaptureQueriesContext(connection) as captured:
+            groups, _digest = feed._legacy_metadata(query)
+        return groups, len(captured)
+
+    add_threads(0, 10)
+    small, small_count = metadata()
+    assert len(small) == 10
+    add_threads(10, 80)
+    large, large_count = metadata()
+    assert len(large) == 80
+    assert all(group["matched_count"] == 1 for group in large)
+    assert large_count <= small_count + 2, "More independent public threads must not add one query per parent"
+    assert large_count <= 6, "Two ancestor levels across two accounts need a bounded metadata-only batch"

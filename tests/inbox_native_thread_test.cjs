@@ -478,9 +478,10 @@ test('dismiss during JSON parsing prevents late content returning, and retry is 
 });
 
 test('Back, Forward, browser restore and mobile close discard temporary observations', async () => {
-    for (const event of ['popstate', 'pagehide', 'pageshow', 'mobile-back']) {
+    for (const event of ['popstate', 'pagehide', 'pageshow', 'mobile-back', 'inbox:history-navigation']) {
         const app = setup(); await resolve(app, 0);
-        if (event === 'mobile-back') app.click(app.panel.appendChild(new Element('a', { inboxBack: '' })));
+        if (event === 'inbox:history-navigation') app.document.emit(event);
+        else if (event === 'mobile-back') app.click(app.panel.appendChild(new Element('a', { inboxBack: '' })));
         else app.window.emit(event, { persisted: true });
         assert.equal(nativeCards(app).length, 0, event); assert.equal(app.composer.value, 'My interrupted unsaved reply');
     }

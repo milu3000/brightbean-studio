@@ -7,13 +7,14 @@ const path=require('node:path');
 const vm=require('node:vm');
 const source=fs.readFileSync(path.join(__dirname,'../static/js/inbox-unified.js'),'utf8');
 function setup(present=true) {
-    const listeners=new Map(),shell={dataset:{activePanel:'detail'}};
+    let currentForm=null;
+    const dispatched=[],listeners=new Map(),shell={dataset:{activePanel:'detail'}};
     const rows=['canonical-id','legacy-id'].map(id=>({dataset:{inboxOpenMessage:id},attributes:{},setAttribute(key,value){this.attributes[key]=value;},removeAttribute(key){delete this.attributes[key];}}));
     const add=(name,handler)=>listeners.set(name,[...(listeners.get(name)||[]),handler]);
-    const context={URL,URLSearchParams,FormData:class{constructor(form){return form.entries;}},window:{location:{href:'https://fixture.test/inbox/'},addEventListener:add},document:{addEventListener:add,querySelector:()=>present?shell:null,querySelectorAll:()=>rows}};
+    const context={URL,URLSearchParams,CustomEvent:class{constructor(type,options){this.type=type;this.detail=options?.detail;}},FormData:class{constructor(form){return form.entries;}},window:{location:{href:'https://fixture.test/inbox/'},addEventListener:add},document:{addEventListener:add,dispatchEvent:event=>dispatched.push(event),querySelector:selector=>selector==='[data-unified-filters]'?currentForm:present?shell:null,querySelectorAll:()=>rows}};
     vm.runInNewContext(source,context);
     const emit=(name,event)=>{for(const handler of listeners.get(name)||[])handler(event);};
-    return {context,shell,rows,emit};
+    return {context,shell,rows,emit,dispatched,setForm(form){currentForm=form;}};
 }
 function swap(xhr) {return {detail:{xhr,shouldSwap:true},preventDefault(){this.prevented=true;}};}
 function request(app,xhr,id,source='legacy') {
@@ -93,5 +94,59 @@ test('account and platform changes clear source-specific status before HTMX coll
         const target={matches:()=>true,closest:()=>({querySelectorAll:()=>fields})};
         app.emit('change',{target});
         assert.deepEqual(fields.map(field=>field.value),['','',''],name);
+    }
+});
+
+test('history restoration resets filter scope while preserving selected detail',()=>{
+    const app=setup(),old=listEvent('dm'),restored=listEvent('comment',true);
+    app.emit('inbox:selection-approved',{detail:{messageId:'canonical-id'}});
+    app.emit('htmx:confirm',old);app.emit('htmx:beforeRequest',old);
+    app.setForm(restored.detail.elt);app.emit('htmx:historyRestore',{});
+    const stale=swap(old.detail.xhr);app.emit('htmx:beforeSwap',stale);
+    assert.equal(stale.detail.shouldSwap,false);
+    app.emit('htmx:confirm',restored);assert.equal(restored.prevented,undefined);
+    assert.equal(app.rows[0].attributes['aria-current'],'true');
+});
+
+test('old current-workspace body cache is bypassed through scoped HTMX without rewriting cached drafts',async()=>{
+    const app=setup(),calls=[],nodes=[],cache='[{"url":"http://[","content":"Malformed URL entry retains input"},{"url":"/inbox/?domain=comment","content":"<p>Unsaved cached reply</p>"},{"url":"/calendar/","content":"Other page"}]';
+    app.setForm({action:'/inbox/'});
+    app.context.window.location.href='https://fixture.test/inbox/?domain=comment';
+    app.context.window.localStorage={getItem:()=>cache,setItem(){throw new Error('Cache must not be rewritten');},removeItem(){throw new Error('Cache must not be deleted');}};
+    app.context.window.htmx={ajax(...args){calls.push(args);return Promise.resolve();}};
+    app.shell.appendChild=node=>nodes.push(node);
+    app.context.document.createElement=()=>({dataset:{},setAttribute(){},remove(){this.removed=true;}});
+    const event={state:{htmx:true},stopImmediatePropagation(){this.stopped=true;}};
+    app.emit('popstate',event);
+    assert.equal(event.stopped,true);assert.equal(calls.length,1);
+    assert.equal(app.dispatched[0].type,'inbox:history-navigation','Existing native observation cleanup still runs');
+    assert.equal(calls[0][0],'GET');assert.equal(calls[0][1],'https://fixture.test/inbox/?domain=comment');
+    assert.equal(calls[0][2].select,'#inbox-list-content > *');assert.equal(calls[0][2].target,'#inbox-list-content');
+    assert.equal(calls[0][2].headers['HX-History-Restore-Request'],'true');assert.equal(calls[0][2].values,undefined);
+    assert.equal(calls[0][2].source,nodes[0]);assert.equal(nodes[0].hidden,true);
+    assert.equal(app.context.window.localStorage.getItem(),cache);
+});
+test('history bypass leaves other pages, workspaces and origins entirely to normal navigation',()=>{
+    for(const location of ['https://fixture.test/other-workspace/inbox/','https://fixture.test/calendar/','https://elsewhere.test/inbox/']) {
+        const app=setup();app.setForm({action:'https://fixture.test/inbox/'});app.context.window.location.href=location;
+        app.context.window.localStorage={getItem(){throw new Error('Unrelated history cache should not even be inspected');}};
+        app.context.window.htmx={ajax(){throw new Error('Unrelated navigation must not be intercepted');}};
+        const event={state:{htmx:true},stopImmediatePropagation(){this.stopped=true;}};app.emit('popstate',event);
+        assert.equal(event.stopped,undefined);
+    }
+});
+
+test('malformed or unrelated cache and non-HTMX popstate never activate the bypass',()=>{
+    for(const [cache,state] of [
+        ['not valid JSON',{htmx:true}],
+        [JSON.stringify([{url:'/calendar/',content:'Other page'}]),{htmx:true}],
+        [JSON.stringify([{url:'/inbox/',content:'Old draft'}]),{}],
+        [JSON.stringify([{url:'/inbox/',content:'Old draft'}]),null]
+    ]) {
+        const app=setup();app.setForm({action:'/inbox/'});
+        app.context.window.localStorage={getItem:()=>cache,setItem(){throw new Error('No cache writes');},removeItem(){throw new Error('No cache deletion');}};
+        app.context.window.htmx={ajax(){throw new Error('Unexpected bypass');}};
+        const event={state,stopImmediatePropagation(){this.stopped=true;}};app.emit('popstate',event);
+        assert.equal(event.stopped,undefined);
     }
 });

@@ -64,7 +64,7 @@ class Page {
         this.browser = browser; this.fixture = fixture; this.session = session; this.target = target;
         this.requests = []; this.posts = []; this.unexpected = []; this.exceptions = [];
         this.fresh = false; this.conflict = false; this.holdImages = true; this.images = [];
-        this.delays = new Map(); this.dialogs = []; this.acceptDialogs = false;
+        this.delays = new Map(); this.failures = new Map(); this.dialogs = []; this.acceptDialogs = false;
         this.cancelled = new Set(); this.closed = false;
     }
     command(method, params = {}) { return this.browser.command(method, params, this.session); }
@@ -80,7 +80,7 @@ class Page {
             if (this.exceptions.length) throw new Error(this.exceptions.join('\n'));
             await delay(25);
         }
-        throw new Error(`Timed out: ${label}\n${await this.evaluate('document.body.innerText.slice(-1800)')}`);
+        throw new Error(`Timed out: ${label}\nRequests: ${JSON.stringify(this.requests.slice(-10))}\nUnexpected: ${JSON.stringify(this.unexpected)}\n${await this.evaluate('document.body.innerText.slice(-1800)')}`);
     }
     async click(selector) {
         await this.wait(`!!document.querySelector(${Q(selector)})`, `selector ${selector}`);
@@ -116,7 +116,8 @@ class Page {
     }
     async paused(event) {
         const url = new URL(event.request.url), route = url.pathname + url.search;
-        this.requests.push({url:event.request.url, method:event.request.method, route});
+        const historyRestore = Object.entries(event.request.headers).some(([name,value]) => name.toLowerCase() === 'hx-history-restore-request' && value === 'true');
+        this.requests.push({url:event.request.url, method:event.request.method, route, historyRestore});
         const asset = this.fixture.assets?.[event.request.url];
         if (asset && event.request.method === 'GET') return this.fulfill(event, asset.body, asset.type);
         // This exact synthetic CDN URL exercises the production preview
@@ -130,6 +131,11 @@ class Page {
             return this.fulfill(event, 'External requests forbidden', 'text/plain', 403);
         }
         if (this.delays.has(route)) await delay(this.delays.get(route));
+        if (this.failures.has(route)) {
+            const status = this.failures.get(route);
+            if (status === 0) return this.command('Fetch.failRequest', {requestId:event.requestId, errorReason:'ConnectionFailed'});
+            return this.fulfill(event, 'Synthetic history unavailable', 'text/plain', status);
+        }
         if (url.pathname.startsWith('/static/js/')) {
             const name = url.pathname.slice('/static/js/'.length);
             if (!/^[a-z0-9.-]+\.js$/.test(name)) throw new Error(`Unsafe asset path ${name}`);
@@ -166,11 +172,12 @@ class Page {
                 const normalized = value => {
                     const parsed = new URL(value, this.fixture.origin);
                     for (const [key, item] of Array.from(parsed.searchParams)) {
-                        if (!item || (key === 'domain' && item === 'all')) parsed.searchParams.delete(key);
+                        if (!item || ((key === 'domain' || key === 'view') && item === 'all')) parsed.searchParams.delete(key);
                     }
                     parsed.searchParams.sort(); return parsed.pathname + parsed.search;
                 };
-                const entry = Object.entries(this.fixture.listRoutes).find(([key]) => normalized(key) === normalized(route));
+                const responses = historyRestore ? this.fixture.historyRoutes || {} : this.fixture.listRoutes;
+                const entry = Object.entries(responses).find(([key]) => normalized(key) === normalized(route));
                 if (entry) return this.fulfill(event, entry[1]);
                 this.unexpected.push(`Unknown filtered GET ${route}`);
                 return this.fulfill(event, 'Unknown fixture filter', 'text/plain', 404);

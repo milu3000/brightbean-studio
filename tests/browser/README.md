@@ -71,3 +71,28 @@ reported raw numeric sender/handle regression. The history-heavy canonical
 fixture deliberately calls the internal canonical feed renderer directly so its
 existing controller/history tests remain focused; public routing is exercised
 by the actual-shell gate.
+
+Native browser Back/Forward is exercised using Chromium navigation-history
+entries, with actual HX-History-Restore-Request exports. Restore responses are
+full pages, while hx-history-elt limits the swap to the shared list pane. The
+canonical and legacy composer nodes and unsaved text survive those filter
+history changes; hx-history=false continues to prevent localStorage DOM caches.
+The gate also clicks Clear immediately after a search swap (before delayed HTMX
+settle can initialize the input), and rejects the inherited 8rem select flex
+basis that previously made Message status and Queue controls oversized.
+
+The history gate deliberately holds Back while Forward or a new filter finishes,
+then waits beyond the stale response delay and checks URL/filter/DOM agreement.
+It also covers a pending normal filter followed by Back, HTTP/network restore
+failures, retained unsaved text, and recovery of automatic list refresh. The
+controller cancels superseded history XHRs because bundled HTMX history loading
+bypasses normal beforeSwap hooks. An additional offline test extracts that exact
+bundled loader and includes an unguarded negative control reproducing the race;
+this test is distinct from the required real Chromium evidence.
+
+Upgrade coverage seeds the previous body-wide inbox cache with an unsaved
+validation paragraph and user-input marker. New navigation bypasses only an
+existing same-origin/current-workspace inbox cache hit through a fresh HTMX
+read; it never deletes or rewrites cache entries. Tests require byte-identical
+cached drafts plus unrelated workspace/page entries, one list/filter container,
+unchanged browser history length/index, and the current live composer intact.

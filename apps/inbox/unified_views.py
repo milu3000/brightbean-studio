@@ -58,7 +58,11 @@ def feed(request, workspace):
         else "",
     )
     response = render(
-        request, "inbox/partials/_unified_list_pane.html" if request.htmx else "inbox/unified_feed.html", context
+        request,
+        "inbox/partials/_unified_list_pane.html"
+        if request.htmx and not request.htmx.history_restore_request
+        else "inbox/unified_feed.html",
+        context,
     )
     try:
         result["guard"]()

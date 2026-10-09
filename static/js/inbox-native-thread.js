@@ -939,6 +939,7 @@
         initialize();
     });
     window.addEventListener('popstate', clearSnapshots);
+    document.addEventListener('inbox:history-navigation', clearSnapshots);
     window.addEventListener('pagehide', clearSnapshots);
     window.addEventListener('pageshow', function (event) {
         if (event.persisted) {

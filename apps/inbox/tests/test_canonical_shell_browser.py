@@ -83,7 +83,7 @@ def shell_export(client, owner, tmp_path):
             body=f"Older saved comment {index}",
             received_at=owner.clock.now - timedelta(days=index + 1),
         )
-    routes, list_routes = {}, {}
+    routes, list_routes, history_routes = {}, {}, {}
     feed = reverse("inbox:feed", kwargs={"workspace_id": owner.account.workspace_id})
     detail = reverse(
         "inbox:conversation_detail",
@@ -95,6 +95,9 @@ def shell_export(client, owner, tmp_path):
         response = client.get(url, HTTP_HX_REQUEST="true")
         assert response.status_code == 200, (url, response.content[:500])
         list_routes[url] = response.content.decode()
+        restored = client.get(url, HTTP_HX_REQUEST="true", HTTP_HX_HISTORY_RESTORE_REQUEST="true")
+        assert restored.status_code == 200, (url, restored.content[:500])
+        history_routes[url] = restored.content.decode()
         return response
 
     with (
@@ -177,6 +180,7 @@ def shell_export(client, owner, tmp_path):
         "routes": routes,
         "listHtml": list_routes[feed],
         "listRoutes": list_routes,
+        "historyRoutes": history_routes,
         "assets": assets,
         "fullShell": True,
         "legacyAccountIds": [str(account.pk) for account in accounts] + [str(historical.pk)],
@@ -225,6 +229,17 @@ def test_actual_shell_fixture_keeps_account_routes(shell_export):
     assert "Unknown sender" in html
     assert "Facebook" in html and "Instagram" in html
     assert manifest["firstRows"] and manifest["nextRows"]
+
+
+@pytest.mark.django_db(transaction=True)
+def test_history_restore_returns_shell_without_enabling_history_cache(shell_export):
+    _destination, manifest = shell_export
+    for url, html in manifest["historyRoutes"].items():
+        assert "data-unified-shell" in html, url
+        assert 'id="inbox-list-content" hx-history-elt' in html, url
+        assert 'hx-history="false"' in html, url
+        assert "sidebar-initial" in html, url
+        assert "data-unified-shell" not in manifest["listRoutes"][url], url
 
 
 @pytest.mark.django_db(transaction=True)
