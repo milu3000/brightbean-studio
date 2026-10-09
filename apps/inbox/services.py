@@ -95,7 +95,7 @@ def _meta_reply_window_age(message: InboxMessage) -> timedelta:
     if not valid_timestamp:
         raise DMSendGateError(
             "invalid_reply_window",
-            "BrightBean automated replies require a valid inbound message timestamp to check the 24-hour window.",
+            "BrightBean automated replies require a valid inbound message timestamp to verify activity within 24 hours.",
         )
     return now - received_at
 
