@@ -1,4 +1,5 @@
-{% load humanize %}
+{% load humanize inbox_identity %}
+{% inbox_sender message message.social_account.platform as sender %}
 <div class="flex flex-col h-full" data-inbox-panel data-selected-message-id="{{ message.id }}">
     <a href="{% url 'inbox:feed' workspace_id=workspace.id %}" data-inbox-back
        @click="if (typeof activePanel !== 'undefined') { $event.preventDefault(); activePanel = 'list'; }"
@@ -18,14 +19,16 @@
                 <img src="{{ message.sender_avatar_url }}" alt="" class="w-10 h-10 rounded-full object-cover flex-shrink-0">
                 {% else %}
                 <div class="w-10 h-10 rounded-full flex items-center justify-center text-sm font-bold text-stone-500 flex-shrink-0" style="background: var(--surface-2);">
-                    {{ message.sender_name|make_list|first|upper }}
+                    {{ sender.label|make_list|first|upper }}
                 </div>
                 {% endif %}
                 <div class="min-w-0">
                     <div class="flex items-center gap-2">
-                        <h2 class="text-sm font-semibold text-stone-900">{% if conversation_view %}{{ message.type_display }} · {% endif %}{{ message.sender_name }}</h2>
-                        {% if message.sender_handle %}
-                        <span class="text-[12px] text-stone-400">@{{ message.sender_handle }}</span>
+                        <h2 class="text-sm font-semibold text-stone-900">{% if conversation_view %}{{ message.type_display }} · {% endif %}{{ sender.label }}</h2>
+                        {% if sender.handle and sender.name %}
+                        <span class="text-[12px] text-stone-400">@{{ sender.handle }}</span>
+                        {% elif sender.native_id and not sender.name and not sender.handle %}
+                        <span class="text-[12px] text-stone-400">ID: {{ sender.native_id }}</span>
                         {% endif %}
                     </div>
                     <div class="flex items-center gap-2 mt-0.5">
@@ -124,7 +127,8 @@
         {% for child in child_messages %}
         <div class="mt-3 pl-4 border-l-2 border-stone-200">
             <div class="flex items-center gap-2 mb-1">
-                <span class="text-[12px] font-semibold text-stone-700">{{ child.sender_name }}</span>
+                {% inbox_sender child child.social_account.platform as child_sender %}
+                <span class="text-[12px] font-semibold text-stone-700">{{ child_sender.label }}</span>
                 <span class="text-[11px] text-stone-400">{{ child.received_at|timesince }} ago</span>
             </div>
             {% if child.body %}

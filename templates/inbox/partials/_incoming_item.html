@@ -1,9 +1,10 @@
-{% load humanize %}
+{% load humanize inbox_identity %}
+{% inbox_sender incoming incoming.social_account.platform as sender %}
 <article id="incoming-{{ incoming.id }}" data-incoming-message-id="{{ incoming.id }}"
          data-stored-event-bubble
          class="bg-stone-50 rounded-xl p-4 border {% if incoming.id == message.id %}border-orange-300{% else %}border-stone-100{% endif %}">
     <div class="flex items-center gap-2 flex-wrap mb-2">
-        <span class="text-[12px] font-semibold text-stone-800">{{ incoming.sender_name|default:"Unknown sender" }}</span>
+        <span class="text-[12px] font-semibold text-stone-800">{{ sender.label }}</span>
         <span class="badge-pill badge-type">Received · BrightBean history</span>
         <span class="badge-pill badge-status-{{ incoming.status }}">{{ incoming.get_status_display }}</span>
         <time datetime="{{ incoming.received_at|date:'c' }}" class="text-[11px] text-stone-400 ml-auto">{{ incoming.received_at|date:"N j, Y g:i A" }}</time>

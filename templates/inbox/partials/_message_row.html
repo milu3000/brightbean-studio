@@ -1,4 +1,5 @@
-{% load humanize %}
+{% load humanize inbox_identity %}
+{% inbox_sender message message.social_account.platform as sender %}
 <div id="msg-{{ message.id }}"
      class="inbox-row {% if inbox_row.unread_count or message.status == 'unread' %}is-unread{% endif %}"
      :class="{ 'is-active': activeMessageId === '{{ message.id }}' }">
@@ -6,7 +7,7 @@
     <!-- Checkbox -->
     <div class="flex-shrink-0 pt-0.5" @click.stop>
         <input type="checkbox"
-               aria-label="Select this message from {{ message.sender_name }} for bulk actions"
+               aria-label="Select this message from {{ sender.label }} for bulk actions"
                :checked="isSelected('{{ message.id }}')"
                @change="toggleSelect('{{ message.id }}')"
                class="w-3.5 h-3.5 rounded border-stone-300 text-orange-500 focus:ring-orange-200 cursor-pointer">
@@ -17,7 +18,7 @@
        hx-target="#inbox-detail-panel" hx-sync="#inbox-detail-panel:queue last"
        data-inbox-open-message="{{ message.id }}"
        class="flex gap-2.5 flex-1 min-w-0 rounded focus:outline-none focus:ring-2 focus:ring-orange-400"
-       aria-label="Open {{ message.type_display|default:message.get_message_type_display }} from {{ message.sender_name }}">
+       aria-label="Open {{ message.type_display|default:message.get_message_type_display }} from {{ sender.label }}">
     <!-- Platform icon -->
     <div class="flex-shrink-0 pt-0.5">
         {% include "partials/_platform_icon.html" with platform=message.social_account.platform size="sm" %}
@@ -29,7 +30,7 @@
         <img src="{{ message.sender_avatar_url }}" alt="" class="w-8 h-8 rounded-full object-cover">
         {% else %}
         <div class="w-8 h-8 rounded-full flex items-center justify-center text-[11px] font-bold text-stone-500" style="background: var(--surface-2);">
-            {{ message.sender_name|make_list|first|upper }}
+            {{ sender.label|make_list|first|upper }}
         </div>
         {% endif %}
     </div>
@@ -37,9 +38,9 @@
     <!-- Content -->
     <div class="flex-1 min-w-0">
         <div class="flex items-center gap-2 mb-0.5">
-            <span class="inbox-row-sender text-[13px] font-semibold text-stone-700 truncate">{{ message.sender_name }}</span>
-            {% if message.sender_handle %}
-            <span class="text-[11px] text-stone-400 truncate">@{{ message.sender_handle }}</span>
+            <span class="inbox-row-sender text-[13px] font-semibold text-stone-700 truncate">{{ sender.label }}</span>
+            {% if sender.handle and sender.name %}
+            <span class="text-[11px] text-stone-400 truncate">@{{ sender.handle }}</span>
             {% endif %}
             <time class="text-[11px] text-stone-400 ml-auto flex-shrink-0" datetime="{{ message.received_at|date:'c' }}">{{ message.received_at|timesince }} ago</time>
         </div>

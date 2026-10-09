@@ -17,6 +17,7 @@ from django.utils import timezone
 
 from .durable_sync import claim_ownership, lock_connection
 from .models import ConversationMessage, InboxSyncConnection, InboxSyncReceipt
+from .sender_display import normalize_sender_name
 from .sync_contracts import MessageObservation, calendar_months, valid_id, validate_observation
 from .sync_identity import SyncError, canonical_owns_account, identity_matches  # noqa: F401 stable writer guard
 
@@ -299,7 +300,7 @@ def ingest_meta_webhook(account, messaging, *, verified_instagram_delivery=False
             occurred,
             timezone.now(),
             attachments=tuple(normalize_attachments(messaging)),
-            sender_name=str(sender.get("name") or ""),
+            sender_name=normalize_sender_name(sender),
             source="webhook",
             outbound_verified=data.get("is_echo") is True,
             conversation_type=kind,

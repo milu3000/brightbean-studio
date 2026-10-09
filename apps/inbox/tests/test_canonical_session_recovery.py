@@ -56,7 +56,11 @@ def test_canonical_pages_never_fetch_overlay_and_get_never_creates_transport_row
             response = session.get(route(composer, name))
             assert response.status_code == 200
             html = response.content.decode()
-            assert "inbox-canonical.js" in html and "inbox-native-thread.js" not in html
+            assert "inbox-canonical.js" in html
+            if name == "conversation_detail":
+                assert "inbox-native-thread.js" not in html
+            else:
+                assert "data-unified-shell" in html and "data-native-thread" not in html
             assert 'hx-history="false"' in html
             assert "no-store" in response["Cache-Control"]
     assert InboxMessage.objects.count() == before
@@ -68,7 +72,7 @@ def test_search_includes_outbound_without_legacy_body_overlay(session, composer)
         composer, 1, outbound=True, body="outbound unique needle", occurred_at=timezone.now() - timedelta(seconds=10)
     )
     response = session.get(route(composer, "feed"), {"q": "unique needle"})
-    assert [item["id"] for item in response.context["canonical_rows"]] == [str(composer.conversation.pk)]
+    assert [item["id"] for item in response.context["unified_rows"]] == [str(composer.conversation.pk)]
     assert "outbound unique needle" in response.content.decode()
 
 
@@ -107,7 +111,7 @@ def test_withdrawn_and_expired_content_cannot_appear_in_list_search_or_timeline(
         item.content_status = status
         item.save(update_fields=["content_status"])
     assert "HIDDEN PRIVATE CONTENT" not in session.get(route(composer)).content.decode()
-    assert session.get(route(composer, "feed"), {"q": "HIDDEN PRIVATE CONTENT"}).context["canonical_rows"] == []
+    assert session.get(route(composer, "feed"), {"q": "HIDDEN PRIVATE CONTENT"}).context["unified_rows"] == []
 
 
 def test_undated_rows_are_separate_and_observed_outbound_does_not_claim_sent(session, composer):
@@ -364,7 +368,7 @@ def test_public_thread_keeps_selected_reply_target_and_mention_facets(session, c
     for domain in ("comment", "mention"):
         feed = session.get(route(composer, "feed"), {"domain": domain})
         assert feed.status_code == 200
-        assert any(item.pk in {root.pk, child.pk} for item in feed.context["inbox_messages"])
+        assert any(item["id"] in {str(root.pk), str(child.pk)} for item in feed.context["unified_rows"])
 
 
 def test_role_revocation_during_draft_projection_discards_the_response(session, composer):

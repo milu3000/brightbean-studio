@@ -23,6 +23,7 @@ from providers.meta_inbox_paging import PAGE_LIMITS, is_page_size_rejection
 
 from .durable_sync import ROUTE_CONTRACT, capture_permitted
 from .models import InboxSyncCheckpoint, InboxSyncConnection
+from .sender_display import normalize_sender_name
 from .sync_contracts import (
     MAX_BYTES,
     MAX_ITEMS,
@@ -301,7 +302,7 @@ class MetaSyncAdapter:
                     recipient_id=extra.get("message_recipient_id", ""),
                     participant_ids=tuple(extra.get("participant_ids", ())),
                     body=item.get("message", ""),
-                    sender_name=sender.get("name", ""),
+                    sender_name=normalize_sender_name(sender),
                     occurred_at=stamp,
                     observed_at=observed,
                     snapshot_started_at=started,

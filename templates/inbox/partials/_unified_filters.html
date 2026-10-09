@@ -1,0 +1,47 @@
+<form id="inbox-filters" data-canonical-filters data-unified-filters action="{% url 'inbox:feed' workspace_id=workspace.id %}" method="get" hx-get="{% url 'inbox:feed' workspace_id=workspace.id %}" hx-trigger="inbox:refresh-list" hx-swap="innerHTML settle:0ms" hx-target="#inbox-list-content" hx-sync="#inbox-list-content:queue last" class="unified-filters">
+    <input type="hidden" name="domain" value="{{ active_domain|default:'all' }}">
+    <input type="hidden" name="cursor" data-canonical-list-cursor value="{{ list_cursor }}">
+    <div class="unified-search">
+        <input type="search" name="q" value="{{ search_query }}" data-inbox-search aria-label="Search inbox" placeholder="Search inbox…" class="canonical-filter" hx-get="{% url 'inbox:feed' workspace_id=workspace.id %}" hx-trigger="input changed delay:400ms, inbox:clear-search" hx-target="#inbox-list-content" hx-include="#inbox-filters" hx-push-url="true" hx-sync="#inbox-list-content:queue last">
+        <button type="button" data-inbox-clear-search aria-label="Clear search" title="Clear search" {% if not search_query %}hidden{% endif %}>×</button>
+    </div>
+    <div class="unified-filter-grid">
+        <select name="platform" data-inbox-platform aria-label="Filter by platform" class="canonical-filter" hx-get="{% url 'inbox:feed' workspace_id=workspace.id %}" hx-target="#inbox-list-content" hx-include="#inbox-filters" hx-push-url="true" hx-sync="#inbox-list-content:queue last">
+            <option value="">All platforms</option>
+            {% for value,label in platform_choices %}<option value="{{ value }}" {% if value == active_platform %}selected{% endif %}>{{ label }}</option>{% endfor %}
+        </select>
+        <select name="account" data-inbox-account aria-label="Filter by account" class="canonical-filter" hx-get="{% url 'inbox:feed' workspace_id=workspace.id %}" hx-target="#inbox-list-content" hx-include="#inbox-filters" hx-push-url="true" hx-sync="#inbox-list-content:queue last">
+            <option value="">All accounts</option>
+            {% for account in account_sources %}<option value="{{ account.id }}" data-platform="{{ account.platform }}" data-source="{{ account.source }}" {% if account.id == active_account %}selected{% endif %}>{{ account.account_name }}{% if account.account_handle %} · @{{ account.account_handle }}{% endif %} · {% if account.platform == "facebook" %}Facebook{% elif account.platform == "instagram" or account.platform == "instagram_login" %}Instagram{% else %}{{ account.platform }}{% endif %}</option>{% endfor %}
+        </select>
+        {% if show_legacy_status != False %}
+        <label class="unified-filter-label">Message status
+            <select name="status" aria-label="Filter by message status" class="canonical-filter" hx-get="{% url 'inbox:feed' workspace_id=workspace.id %}" hx-target="#inbox-list-content" hx-include="#inbox-filters" hx-push-url="true" hx-sync="#inbox-list-content:queue last">
+                <option value="">All statuses</option>
+                <option value="unread" {% if active_status == 'unread' %}selected{% endif %}>Unread</option>
+                <option value="open" {% if active_status == 'open' %}selected{% endif %}>Open</option>
+                <option value="resolved" {% if active_status == 'resolved' %}selected{% endif %}>Resolved</option>
+                <option value="archived" {% if active_status == 'archived' %}selected{% endif %}>Archived</option>
+            </select>
+        </label>
+        <label class="unified-filter-label">Queue
+            <select name="view" aria-label="Filter by queue" class="canonical-filter" hx-get="{% url 'inbox:feed' workspace_id=workspace.id %}" hx-target="#inbox-list-content" hx-include="#inbox-filters" hx-push-url="true" hx-sync="#inbox-list-content:queue last">
+                <option value="">All messages</option>
+                <option value="mine" {% if current_view == 'mine' %}selected{% endif %}>My Queue</option>
+                <option value="unassigned" {% if current_view == 'unassigned' %}selected{% endif %}>Unassigned</option>
+            </select>
+        </label>
+        {% endif %}
+        {% if show_canonical_workflow != False %}
+        <label class="unified-filter-label">DM workflow
+            <select name="workflow" aria-label="Filter by DM workflow" class="canonical-filter" hx-get="{% url 'inbox:feed' workspace_id=workspace.id %}" hx-target="#inbox-list-content" hx-include="#inbox-filters" hx-push-url="true" hx-sync="#inbox-list-content:queue last">
+                <option value="">All workflows</option>
+                <option value="needs_action" {% if active_workflow == 'needs_action' %}selected{% endif %}>待處理</option>
+                <option value="waiting" {% if active_workflow == 'waiting' %}selected{% endif %}>等對方</option>
+                <option value="done" {% if active_workflow == 'done' %}selected{% endif %}>已完成</option>
+            </select>
+        </label>
+        {% endif %}
+    </div>
+    <noscript><button type="submit" class="canonical-filter">Apply filters</button></noscript>
+</form>

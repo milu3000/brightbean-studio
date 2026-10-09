@@ -420,6 +420,17 @@ def session_feed(context, client, **params):
     return client.get(reverse("inbox:feed", kwargs={"workspace_id": context.account.workspace_id}), params)
 
 
+def session_ids(response):
+    """The unified shell keeps the reader's exact object IDs, not shadows."""
+    if "unified_rows" in response.context:
+        return [item["id"] for item in response.context["unified_rows"]]
+    return [str(item.pk) for item in response.context["inbox_messages"]]
+
+
+def source_contract(sources):
+    return [{key: value for key, value in item.items() if key != "domains"} for item in sources]
+
+
 def test_mixed_scope_exposes_same_account_entry_points_on_ui_rest_and_mcp(context, mixed_accounts, client):
     account, original = mixed_accounts
     anchor = legacy(context, incoming(context, body="IRL canonical truth"))
@@ -435,24 +446,25 @@ def test_mixed_scope_exposes_same_account_entry_points_on_ui_rest_and_mcp(contex
     assert entry["source"] == "legacy"
     assert entry["tool"] == "list_inbox_messages"
     assert entry["arguments"] == {"social_account_id": str(account.pk), "message_type": "dm"}
-    assert entry["inbox_url"].replace("&", "&amp;") in page.content.decode()
+    assert f'value="{account.pk}"' in page.content.decode()
+    assert page.content.decode().count("data-inbox-account") == 1
     assert "DJ existing inbox" in page.content.decode()
     for result in [
         client_for(context).get("/api/v1/inbox-conversations/", secure=True).json(),
         rpc(context, "list_conversations", {}),
     ]:
-        assert result["account_sources"] == sources
+        assert result["account_sources"] == source_contract(sources)
         assert [item["id"] for item in result["conversations"]] == [str(context.conversation.pk)]
     for result in [
         client_for(context).get("/api/v1/inbox/", secure=True).json(),
         rpc(context, "list_inbox_messages", {})["error"]["data"],
     ]:
         assert result["error"] == "canonical_upgrade_required"
-        assert result["account_sources"] == sources
+        assert result["account_sources"] == source_contract(sources)
     legacy_page = client.get(entry["inbox_url"])
     assert legacy_page.status_code == 200
-    assert [message.pk for message in legacy_page.context["inbox_messages"]] == [original.pk]
-    assert legacy_page.context["active_filters"]["account"] == [str(account.pk)]
+    assert session_ids(legacy_page) == [str(original.pk)]
+    assert legacy_page.context["active_account"] == str(account.pk)
     assert "STALE LEGACY BODY" not in legacy_page.content.decode()
     for result in [
         client_for(context).get(entry["api"], secure=True).json(),
@@ -483,8 +495,8 @@ def test_global_canonical_rollout_does_not_change_empty_cohort_workspace(context
         permissions=["use_inbox"],
     )
     page = session_feed(context, client)
-    assert page.status_code == 200 and page.context["canonical_mode"] is False
-    assert [item.pk for item in page.context["inbox_messages"]] == [original.pk]
+    assert page.status_code == 200 and all(item["source"] == "legacy" for item in page.context["unified_rows"])
+    assert session_ids(page) == [str(original.pk)]
     assert "inbox-native-thread.js" in page.content.decode()
     for result in [
         client_for(context).get("/api/v1/inbox/", secure=True).json(),
@@ -514,13 +526,18 @@ def test_owned_source_never_revives_legacy_and_unowned_account_remains_reachable
         assert page.status_code == 200 and "CANONICAL ONLY" in page.content.decode()
         assert rest.json()["error"] == tool["error"]["data"]["error"] == "canonical_upgrade_required"
     else:
-        assert page.status_code == rest.status_code == 409
+        assert rest.status_code == 409
+        if cohort_state == "reader_disabled":
+            assert page.status_code == 409
+        else:
+            assert page.status_code == 200 and page.context["unavailable_sources"]
+            assert session_ids(page) == []
         assert rest.json()["error"] == tool["error"]["data"]["error"] == "canonical_unavailable"
         detail = client.get(f"/workspace/{context.account.workspace_id}/inbox/{anchor.pk}/")
         assert detail.status_code == 409
     legacy_page = session_feed(context, client, account=str(account.pk))
     assert legacy_page.status_code == 200
-    assert [item.pk for item in legacy_page.context["inbox_messages"]] == [original.pk]
+    assert session_ids(legacy_page) == [str(original.pk)]
     for result in [
         client_for(context).get("/api/v1/inbox/", {"social_account_id": str(account.pk)}, secure=True).json(),
         rpc(context, "list_inbox_messages", {"social_account_id": str(account.pk)}),
@@ -579,23 +596,26 @@ def test_revoked_membership_cannot_discover_any_account_source(context, mixed_ac
     assert tool.status_code == 401 and "DJ existing inbox" not in tool.content.decode()
 
 
-def test_mixed_source_htmx_account_changes_reload_the_matching_reader(context, mixed_accounts, client):
+def test_mixed_source_htmx_account_changes_keep_one_shell_and_exact_source(context, mixed_accounts, client):
     from django.urls import reverse
 
-    account, _original = mixed_accounts
+    account, original = mixed_accounts
+    incoming(context)
     client.force_login(context.user)
     url = reverse("inbox:feed", kwargs={"workspace_id": account.workspace_id})
     for source, selected in [("canonical", account.pk), ("legacy", context.account.pk)]:
         response = client.get(
             url, {"account": str(selected), "domain": "dm", "read_source": source}, HTTP_HX_REQUEST="true"
         )
-        assert response.status_code == 200 and response.content == b""
-        assert "HX-Redirect" in response
-        redirected = client.get(response["HX-Redirect"])
-        assert redirected.status_code == 200
-        expected_script = "inbox-native-thread.js" if source == "canonical" else "inbox-canonical.js"
-        assert expected_script in redirected.content.decode()
-        assert str(selected) in response["HX-Redirect"]
+        assert response.status_code == 200 and "HX-Redirect" not in response
+        assert "data-unified-filters" in response.content.decode()
+        assert response.context["active_account"] == str(selected)
+        assert response.content.decode().count("data-inbox-account") == 1
+        assert session_ids(response) == [str(original.pk if source == "canonical" else context.conversation.pk)]
+        assert all(
+            row["source"] == ("legacy" if source == "canonical" else "canonical")
+            for row in response.context["unified_rows"]
+        )
 
 
 @pytest.mark.parametrize("surface", ["session", "rest", "mcp"])
@@ -649,8 +669,8 @@ def test_mixed_workspace_legacy_only_platform_filter_retains_original_feed(conte
     account.save(update_fields=["platform"])
     page = session_feed(context, client, platform="instagram")
     assert page.status_code == 200
-    assert [item.pk for item in page.context["inbox_messages"]] == [original.pk]
-    assert page.context["active_filters"]["platform"] == ["instagram"]
+    assert session_ids(page) == [str(original.pk)]
+    assert page.context["active_platform"] == "instagram"
     assert "inbox-native-thread.js" in page.content.decode()
 
 
@@ -666,7 +686,7 @@ def test_public_sections_never_include_canonical_dm_shadows(context, mixed_accou
     )
     page = session_feed(context, client, domain="comment")
     assert page.status_code == 200
-    assert [item.pk for item in page.context["inbox_messages"]] == [public.pk]
+    assert session_ids(page) == [str(public.pk)]
     assert str(anchor.pk) not in page.content.decode()
     for result in [
         client_for(context).get("/api/v1/inbox/", {"message_type": "comment"}, secure=True).json(),
@@ -688,12 +708,19 @@ def test_unfiltered_mixed_held_workspace_keeps_other_account_links_discoverable(
     else:
         settings.INBOX_CANONICAL_READ_ENABLED = False
     page = session_feed(context, client)
-    assert page.status_code == 409
-    assert "Some saved DM accounts are unavailable" in page.content.decode()
+    if withdrawal == "reader":
+        assert page.status_code == 409
+        assert "Some saved DM accounts are unavailable" in page.content.decode()
+    else:
+        assert page.status_code == 200 and page.context["unavailable_sources"]
+        assert session_ids(page) == [str(original.pk)]
     sources = page.context["account_sources"]
     legacy_entry = next(item for item in sources if item["id"] == str(account.pk))
     assert legacy_entry["source"] == "legacy"
-    assert legacy_entry["inbox_url"].replace("&", "&amp;") in page.content.decode()
+    if withdrawal == "reader":
+        assert legacy_entry["inbox_url"].replace("&", "&amp;") in page.content.decode()
+    else:
+        assert f'value="{account.pk}"' in page.content.decode()
     assert "DJ existing inbox" in page.content.decode()
     assert "HELD CANONICAL CONTENT" not in page.content.decode() and "STALE LEGACY BODY" not in page.content.decode()
     reached = client.get(legacy_entry["inbox_url"])
@@ -703,7 +730,7 @@ def test_unfiltered_mixed_held_workspace_keeps_other_account_links_discoverable(
         rpc(context, "list_inbox_messages", {})["error"]["data"],
     ]:
         assert result["error"] == "canonical_unavailable"
-        assert result["account_sources"] == sources
+        assert result["account_sources"] == source_contract(sources)
     result = client_for(context).get(legacy_entry["api"], secure=True)
     assert result.status_code == 200
     assert [item["id"] for item in result.json()["messages"]] == [str(original.pk)]
@@ -725,11 +752,11 @@ def claim_synthetic_source(account):
 
 @pytest.mark.parametrize("boundary", ["page", "render"])
 def test_legacy_ui_discards_body_if_ownership_changes_before_response(context, mixed_accounts, client, boundary):
-    from apps.inbox import views
+    from apps.inbox import unified_feed, unified_views
 
     account, original = mixed_accounts
-    target = "apps.inbox.views.presentation.inbox_page" if boundary == "page" else "apps.inbox.views.render"
-    actual = views.presentation.inbox_page if boundary == "page" else views.render
+    target = "apps.inbox.unified_feed._project_legacy" if boundary == "page" else "apps.inbox.unified_views.render"
+    actual = unified_feed._project_legacy if boundary == "page" else unified_views.render
 
     def claim_after_read(*args, **kwargs):
         value = actual(*args, **kwargs)
@@ -818,8 +845,10 @@ def test_healthy_selected_canonical_account_and_direct_reads_ignore_held_sibling
     )
     response = client.post(acknowledgement_url, {"read_ack_token": detail.context["read_ack_token"]})
     assert response.status_code == 200 and "unread_count" not in response.json()
-    # The held account is still held when explicitly selected, rather than skipped.
-    assert session_feed(context, client, account=str(sibling.pk)).status_code == 409
+    # The unified shell explains the held account without falling back to stale rows.
+    held = session_feed(context, client, account=str(sibling.pk))
+    assert held.status_code == 200 and held.context["unavailable_sources"]
+    assert session_ids(held) == []
     assert (
         client_for(context)
         .get("/api/v1/inbox-conversations/", {"social_account_id": str(sibling.pk)}, secure=True)

@@ -37,7 +37,12 @@
         input.value = ''; update(); input.focus();
         const form = input.closest('form');
         if (form.dataset && Object.hasOwn(form.dataset, 'inboxPlainFilters')) form.requestSubmit();
-        else if (window.htmx) window.htmx.trigger(input, 'inbox:clear-search');
+        else if (window.htmx) {
+            // The global Clear button can be clicked immediately after a swap,
+            // before HTMX's delayed settle task initializes the new input.
+            window.htmx.process(input);
+            window.htmx.trigger(input, 'inbox:clear-search');
+        }
     });
     document.addEventListener('htmx:configRequest', function (event) {
         const element = event.detail.elt;
@@ -47,6 +52,7 @@
         if (parameters.q === '') delete parameters.q;
     });
     document.addEventListener('htmx:afterSwap', update);
+    document.addEventListener('htmx:historyRestore', update);
     if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', update);
     else update();
 })();

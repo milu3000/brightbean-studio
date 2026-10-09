@@ -44,26 +44,32 @@ def canonical_projection_view(message):
     projected = copy(current or message)
     if current is not None and current.message_type != "dm":
         return projected
+    # Conflicting shadows must still withhold the raw legacy body, but their
+    # content must never be materialized before their exact identity is proved.
     candidates = list(
         ConversationMessage.objects.filter(
             Q(legacy_message_id=message.pk)
             | Q(social_account_id=message.social_account_id, platform_message_id=message.platform_message_id)
-        )[:2]
+        ).values_list("pk", flat=True)[:2]
     )
     restriction = legacy_content_restriction(current.extra) if current is not None else ""
     if current is not None and not candidates and not is_transport_projection(current):
         return _restricted_legacy_view(projected, restriction) if restriction else projected
-    row = candidates[0] if len(candidates) == 1 else None
-    valid = bool(
-        current is not None
-        and row is not None
-        and row.workspace_id == current.workspace_id
-        and row.social_account_id == current.social_account_id
-        and row.platform == current.social_account.platform
-        and row.platform_message_id == current.platform_message_id
-        and row.direction == "inbound"
-        and row.legacy_message_id in {None, current.pk}
+    row = (
+        ConversationMessage.objects.filter(
+            Q(legacy_message_id__isnull=True) | Q(legacy_message_id=current.pk),
+            pk=candidates[0],
+            workspace_id=current.workspace_id,
+            social_account_id=current.social_account_id,
+            social_account__workspace_id=current.workspace_id,
+            platform=current.social_account.platform,
+            platform_message_id=current.platform_message_id,
+            direction="inbound",
+        ).first()
+        if current is not None and len(candidates) == 1
+        else None
     )
+    valid = row is not None
     content = (
         visible_content(row)
         if valid

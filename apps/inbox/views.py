@@ -340,6 +340,11 @@ def inbox_feed(request, workspace_id):
     """Main inbox feed with filtering, pagination, and split-panel layout."""
     workspace = _get_workspace(request, workspace_id)
     from . import canonical_views
+
+    if canonical_views.enabled():
+        from .unified_views import feed
+
+        return feed(request, workspace)
     from .canonical_compat import inbox_sources, recheck_inbox_source, selected_inbox_source
     from .canonical_reads import CanonicalReadError, session_read_scope
 
