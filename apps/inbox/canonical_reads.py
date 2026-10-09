@@ -669,6 +669,44 @@ def acknowledge_read(scope, conversation_id, read_ack_token):
     }
 
 
+def _legacy_canonical_messages(scope, accounts, legacy):
+    """Read-only identity bridge; never create or repair a legacy link.
+
+    Native IDs are scoped to one account/platform. An unlinked row additionally
+    needs saved connection/archive provenance and cannot override another row's
+    explicit legacy link. Neither content nor timestamps establish identity.
+    """
+    account = accounts.get(legacy.social_account_id)
+    if account is None or not legacy.platform_message_id:
+        return ConversationMessage.objects.none()
+    matching = Q(legacy_message_id=legacy.pk)
+    if account._canonical_connection is not None or account._canonical_archive is not None:
+        linked = ConversationMessage.objects.filter(legacy_message_id=legacy.pk)
+        matching |= Q(legacy_message__isnull=True) & ~Q(Exists(linked))
+    current = InboxMessage.objects.filter(
+        pk=legacy.pk,
+        workspace_id=scope.workspace_id,
+        social_account_id=account.pk,
+        social_account__workspace_id=scope.workspace_id,
+        social_account__platform=account.platform,
+        platform_message_id=legacy.platform_message_id,
+        message_type="dm",
+    )
+    return ConversationMessage.objects.filter(
+        _scope_filter(scope, accounts, messages=True),
+        matching,
+        Exists(current),
+        social_account_id=account.pk,
+        platform=account.platform,
+        platform_message_id=legacy.platform_message_id,
+        direction="inbound",
+        legacy_reply__isnull=True,
+        conversation__workspace_id=scope.workspace_id,
+        conversation__social_account_id=account.pk,
+        conversation__platform=account.platform,
+    )
+
+
 def resolve_legacy_conversation(scope, message_id):
     scope = narrow_scope(scope, target=(InboxMessage, message_id))
     accounts, token = _snapshot(scope)
@@ -681,9 +719,8 @@ def resolve_legacy_conversation(scope, message_id):
     ).first()
     if legacy is None:
         raise _denied()
-    row = ConversationMessage.objects.filter(
-        _scope_filter(scope, accounts, messages=True), legacy_message=legacy
-    ).first()
+    matching = _legacy_canonical_messages(scope, accounts, legacy)
+    row = matching.first()
     if row is None or row.conversation_id is None:
         raise CanonicalReadError(
             "canonical_unavailable", "This incoming record has no proven canonical conversation yet."
@@ -693,6 +730,8 @@ def resolve_legacy_conversation(scope, message_id):
     ).exists():
         raise _denied()
     _recheck(scope, token)
+    if not matching.filter(pk=row.pk, conversation_id=row.conversation_id, updated_at=row.updated_at).exists():
+        raise CanonicalReadError("stale_revision", "The incoming message changed while reading; reload.")
     return row.conversation_id
 
 

@@ -36,8 +36,9 @@ def build_send_payload(
 ) -> dict:
     """Build a Send API request body.
 
-    Past 24 hours Meta only accepts a tagged message, and HUMAN_AGENT is the tag
-    for a person (never a bot) answering within 7 days.
+    Ordinary replies use RESPONSE; Meta checks its current messaging window.
+    HUMAN_AGENT requires an explicit caller choice and approved human use.
+    An old stored message alone cannot establish current window eligibility.
     """
     payload: dict = {
         "recipient": {"id": recipient_id},

@@ -13,10 +13,16 @@ before network access and fulfills only this fixture and repository JavaScript.
 Keyboard submissions return an intercepted 204; they do not run a send route.
 
 The actual bundled HTMX and Alpine execute, along with all inbox controllers,
-templates, attachment cards, and canonical CSS. Since the existing pytest job
-does not build Tailwind, a small explicitly synthetic `base.html` supplies the
-viewport shell and the required utility styles. These tests cover the canonical
-fragment layout, not every production sidebar or Tailwind utility.
+templates, attachment cards, and canonical CSS. The history/controller fixture
+uses a small explicitly synthetic `base.html` for its large history scenarios.
+`test_canonical_shell_browser.py` separately renders the actual application
+base, sidebar, nested overflow containers, and compiled Tailwind. Build that
+stylesheet with `npm ci && npm run build` in `theme/static_src` before running
+the shell test. CI runs both gates and keeps their synthetic layout screenshots.
+The shell gate checks controls against every clipping ancestor at five viewport
+sizes, both sidebar states, compact platform-labelled account switching, mobile
+list/detail navigation, and direct conversation URLs. Optional calendar/chart/
+sorting CDN widgets are stubbed; all inbox dependencies and styling are real.
 
 The DOM gate covers desktop/mobile layout, a visible composer during scroll,
 localized time, fast conversation changes and delayed stale history, unsaved
