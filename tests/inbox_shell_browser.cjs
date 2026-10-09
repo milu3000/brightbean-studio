@@ -96,6 +96,11 @@ async function scenario(browser,width,height,collapsed) {
         assert.deepEqual(await page.evaluate(clipped),[], 'Visible controls and first conversation must fit all clipping ancestors');
         if (width===1365 && !collapsed) await oldLayoutNegativeControl(page);
         assert(await page.evaluate('document.documentElement.scrollWidth <= innerWidth+1'),'No document horizontal overflow');
+        assert(await page.evaluate(`(() => {const selects=Array.from(document.querySelectorAll('#inbox-filters select'));return selects.length===3&&selects.every(select=>{
+            const style=getComputedStyle(select),canvas=document.createElement('canvas'),context=canvas.getContext('2d');
+            context.font=style.fontWeight+' '+style.fontSize+' '+style.fontFamily;
+            return context.measureText(select.selectedOptions[0].textContent).width + parseFloat(style.paddingLeft) + parseFloat(style.paddingRight) + 24 <= select.clientWidth;
+        });})()`),'Default filter labels remain legible with room for their dropdown arrow');
         assert(await page.evaluate(`document.querySelector('#inbox-message-list').getBoundingClientRect().height > 180`),'Account navigation leaves room for conversations');
         const directory=await page.evaluate(`(() => { const nav=document.querySelector('[aria-label="Other DM accounts"]'),details=nav.closest('details');return {count:nav.querySelectorAll('a').length,visible:details.getBoundingClientRect().height,open:details.open};})()`);
         assert.equal(directory.count,10,'All existing account routes remain reachable');
@@ -140,6 +145,7 @@ async function main() {
             const standalone={...fixture,feed:fixture.threads[0].detail+'?standalone=1'};
             const page=await createPage(browser,standalone,width,844);
             try {
+                assert.equal(await page.evaluate(`Array.from(document.querySelectorAll('a')).filter(link=>link.textContent.trim()==='Back to inbox'&&link.getClientRects().length&&getComputedStyle(link).display!=='none'&&!['hidden','collapse'].includes(getComputedStyle(link).visibility)).length`),1,'Direct conversation has one visible route back to the inbox');
                 assert(await page.evaluate(`(() => {const p=document.querySelector('.canonical-panel').getBoundingClientRect(), c=document.querySelector('#inbox-canonical-composer').getBoundingClientRect();return p.top>=0&&p.left>=0&&p.right<=innerWidth+1&&c.bottom<=innerHeight+1&&c.height>40;})()`),'Direct conversation URL keeps its composer on screen');
                 await screenshot(page,`standalone-${width}`);
                 await page.clean();
