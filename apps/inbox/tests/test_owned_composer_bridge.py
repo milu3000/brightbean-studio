@@ -314,7 +314,7 @@ def test_unknown_never_retries_or_retires(owner):
 
 
 @pytest.mark.parametrize("automated,age", [(False, 0.5), (False, 2), (True, 0.5), (False, 8)])
-def test_only_new_human_action_can_answer_old_in_window_incoming(owner, automated, age):
+def test_only_new_human_action_can_answer_old_incoming(owner, automated, age):
     # This actual verified latest incoming predates both resume boundaries.
     from apps.inbox.models import ConversationMessage
 
@@ -324,7 +324,7 @@ def test_only_new_human_action_can_answer_old_in_window_incoming(owner, automate
     )
     owner.clock.now += timedelta(seconds=1)
     with patch("apps.inbox.services._dispatch_to_platform", side_effect=accepted) as provider:
-        if automated or age >= 1:
+        if automated:
             with pytest.raises(ValueError):
                 send(owner, inputs(owner), automated=automated)
             provider.assert_not_called()
@@ -456,8 +456,8 @@ def test_api_cannot_supply_human_mode_or_server_observation_metadata():
             ConversationDraftInput.model_validate({**base, **extra})
 
 
-def test_unknown_human_agent_approval_holds_context_and_send_without_freezing_draft(owner):
-    from apps.inbox.models import ConversationMessage, InboxReply
+def test_manual_standard_response_does_not_require_human_agent_approval(owner):
+    from apps.inbox.models import ConversationMessage
 
     ConversationMessage.objects.filter(conversation=owner.conversation).exclude(pk=owner.row.pk).delete()
     ConversationMessage.objects.filter(pk=owner.row.pk).update(occurred_at=owner.clock.now - timedelta(days=2))
@@ -467,36 +467,35 @@ def test_unknown_human_agent_approval_holds_context_and_send_without_freezing_dr
         send_authorization=owner.authorization,
         observation_token=observe(owner),
     )
-    assert state["send_availability"]["code"] == "human_agent_permission_unverified"
+    assert state["send_availability"]["allowed"]
     assert state["can_save_draft"]
-    with patch("apps.inbox.services._dispatch_to_platform") as provider, pytest.raises(ValueError):
-        send(owner, inputs(owner))
-    provider.assert_not_called()
-    assert not SendOperation.objects.exists()
-    draft = InboxReply.objects.get()
-    assert draft.status == "draft" and draft.send_generation == 0
+    with patch("apps.inbox.services._dispatch_to_platform", side_effect=accepted) as provider:
+        reply = send(owner, inputs(owner))
+    provider.assert_called_once()
+    assert reply.status == "sent"
+    assert SendOperation.objects.get().status == "confirmed"
 
 
-def test_human_window_permission_is_rechecked_at_last_provider_boundary(owner):
+def test_manual_standard_reply_does_not_expire_at_local_24_hour_boundary(owner):
     from apps.inbox.models import ConversationMessage
 
     ConversationMessage.objects.filter(conversation=owner.conversation).exclude(pk=owner.row.pk).delete()
     ConversationMessage.objects.filter(pk=owner.row.pk).update(
-        occurred_at=owner.clock.now - timedelta(hours=23, minutes=59)
+        occurred_at=owner.clock.now - timedelta(hours=24) + timedelta(seconds=1)
     )
     external_requests = []
 
     def provider(*args, **kwargs):
-        owner.clock.now += timedelta(minutes=2)
+        owner.clock.now += timedelta(seconds=2)
         kwargs["before_provider"]()
         external_requests.append(True)
-        return "must-not-happen"
+        return "platform-accepted"
 
-    with patch("apps.inbox.services._dispatch_to_platform", side_effect=provider), pytest.raises(ValueError):
-        send(owner, inputs(owner))
-    assert not external_requests
+    with patch("apps.inbox.services._dispatch_to_platform", side_effect=provider):
+        assert send(owner, inputs(owner)).status == "sent"
+    assert external_requests == [True]
     operation = SendOperation.objects.get()
-    assert operation.status == "failed" and operation.attempt.outcome == "not_sent"
+    assert operation.status == "confirmed" and operation.attempt.outcome == "sent"
 
 
 @pytest.mark.parametrize("transport", ["rest", "mcp"])

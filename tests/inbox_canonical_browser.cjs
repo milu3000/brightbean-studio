@@ -117,6 +117,8 @@ class Page {
     async paused(event) {
         const url = new URL(event.request.url), route = url.pathname + url.search;
         this.requests.push({url:event.request.url, method:event.request.method, route});
+        const asset = this.fixture.assets?.[event.request.url];
+        if (asset && event.request.method === 'GET') return this.fulfill(event, asset.body, asset.type);
         // This exact synthetic CDN URL exercises the production preview
         // allowlist. CDP returns local SVG bytes before any network connection.
         if (event.request.url === this.fixture.lateImageUrl) {
@@ -194,6 +196,9 @@ async function createPage(browser, fixture, width = 1365, height = 900) {
     await page.command('Emulation.setDeviceMetricsOverride', {width,height,deviceScaleFactor:1,mobile:width<768});
     await page.command('Emulation.setTimezoneOverride', {timezoneId:'Asia/Taipei'});
     await page.command('Fetch.enable', {patterns:[{urlPattern:'*',requestStage:'Request'}]});
+    if (fixture.fullShell) await page.command('Page.addScriptToEvaluateOnNewDocument', {source:
+        `localStorage.setItem('sidebarCollapsed',${Q(Boolean(fixture.sidebarCollapsed))});
+        document.addEventListener('alpine:initialized',()=>{document.querySelector('main').dataset.alpineReady='true';});`});
     await page.command('Page.navigate', {url:fixture.origin + fixture.feed});
     await page.wait('window.htmx && window.Alpine && document.querySelector("main").dataset.alpineReady === "true"', 'actual HTMX and Alpine initialized');
     await page.clean();
@@ -516,4 +521,5 @@ async function main() {
         fs.rmSync(profile,{recursive:true,force:true,maxRetries:5,retryDelay:100});
     });
 }
-main().catch(error=>{process.stderr.write(`${error.stack}\n`);process.exitCode=1;});
+if (require.main === module) main().catch(error=>{process.stderr.write(`${error.stack}\n`);process.exitCode=1;});
+module.exports = {createPage, layoutScenario};

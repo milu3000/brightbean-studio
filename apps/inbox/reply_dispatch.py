@@ -413,7 +413,7 @@ def human_observed_action_allowed(binding, reply, *, cutoff, now):
     coordinator._validate_payload(operation)
     return bool(
         cutoff < reply.created_at <= operation.human_observed_at <= operation.created_at <= now
-        and timedelta(0) <= now - reply.inbox_message.received_at < timedelta(days=7)
+        and timedelta(0) <= now - reply.inbox_message.received_at
     )
 
 

@@ -214,8 +214,8 @@ def _metadata(scope, conversation):
     }
 
 
-def _stable(scope, accounts, token, row, conversation):
-    from .canonical_reads import CanonicalReadError, _recheck, _scope_filter
+def _stable(scope, accounts, token, row, conversation, *, legacy=None):
+    from .canonical_reads import CanonicalReadError, _legacy_canonical_messages, _recheck, _scope_filter
 
     _recheck(scope, token)
     if (
@@ -234,6 +234,7 @@ def _stable(scope, accounts, token, row, conversation):
         or not InboxConversation.objects.filter(
             _scope_filter(scope, accounts), pk=conversation.pk, revision=conversation.revision
         ).exists()
+        or (legacy is not None and not _legacy_canonical_messages(scope, accounts, legacy).filter(pk=row.pk).exists())
     ):
         raise CanonicalReadError("stale_revision", "The incoming message changed while reading; reload.")
 
@@ -241,7 +242,13 @@ def _stable(scope, accounts, token, row, conversation):
 def read_legacy_message(scope, message):
     from apps.api.schemas import InboxMessageResponse
 
-    from .canonical_reads import CanonicalReadError, _scope_filter, _snapshot, resolve_legacy_conversation
+    from .canonical_reads import (
+        CanonicalReadError,
+        _legacy_canonical_messages,
+        _scope_filter,
+        _snapshot,
+        resolve_legacy_conversation,
+    )
 
     if not _is_canonical(scope, message):
         return None
@@ -260,12 +267,11 @@ def read_legacy_message(scope, message):
         .first()
     )
     conversation = InboxConversation.objects.filter(_scope_filter(scope, accounts), pk=conversation_id).first()
-    row = ConversationMessage.objects.filter(
-        _scope_filter(scope, accounts, messages=True),
-        legacy_message_id=message.pk,
-        conversation_id=conversation_id,
-        direction="inbound",
-    ).first()
+    row = (
+        _legacy_canonical_messages(scope, accounts, current).filter(conversation_id=conversation_id).first()
+        if current is not None
+        else None
+    )
     if (
         current is None
         or row is None
@@ -323,7 +329,7 @@ def read_legacy_message(scope, message):
         "requires_current_authorization": True,
     }
     value.update(_metadata(scope, conversation))
-    _stable(scope, accounts, token, row, conversation)
+    _stable(scope, accounts, token, row, conversation, legacy=current)
     return value
 
 

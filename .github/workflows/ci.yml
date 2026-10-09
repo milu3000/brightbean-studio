@@ -121,8 +121,25 @@ jobs:
 
       # Print complete browser failure details before the aggregate suite,
       # including when a later job timeout prevents pytest's final summary.
+      - name: Install CJK fonts for representative UI screenshots
+        run: sudo apt-get update && sudo apt-get install -y fonts-noto-cjk
+
+      - name: Build application CSS for actual-shell browser regression
+        working-directory: theme/static_src
+        run: npm ci && npm run build
+
       - name: Real Chromium regression
-        run: pytest apps/inbox/tests/test_canonical_browser.py -vv --tb=long --show-capture=all
+        env:
+          BRIGHTBEAN_BROWSER_ARTIFACTS: ${{ runner.temp }}/brightbean-browser-artifacts
+        run: pytest apps/inbox/tests/test_canonical_browser.py apps/inbox/tests/test_canonical_shell_browser.py -vv --tb=long --show-capture=all
+
+      - name: Keep synthetic layout screenshots
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: inbox-shell-screenshots
+          path: ${{ runner.temp }}/brightbean-browser-artifacts/*.png
+          if-no-files-found: warn
 
       - name: pytest
         run: pytest --cov=apps --cov-report=term-missing

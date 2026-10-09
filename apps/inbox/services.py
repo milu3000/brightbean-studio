@@ -14,7 +14,7 @@ to live in ``apps/inbox/views.py``; it moved here verbatim.
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 from django.db import transaction
 from django.utils import timezone
@@ -33,7 +33,7 @@ _COMMENT_LIKE_TYPES = {
     InboxMessage.MessageType.REVIEW,
 }
 
-# Extended replies require separately verified Meta feature approval and permitted use.
+# BrightBean currently automates the standard window, never Human Agent exceptions.
 HUMAN_AGENT_AFTER = timedelta(hours=24)
 
 # States a reply can be sent (or re-sent) from.
@@ -44,51 +44,87 @@ class ReplyStateError(ValueError):
     """Raised when an operation is not valid for a reply's current status."""
 
 
+def _meta_reply_window_age(message: InboxMessage) -> timedelta:
+    """Use the latest verified customer incoming in this exact stored thread.
+
+    A draft keeps its original target/receipt identity. Selecting an older
+    message must not hide newer activity that reopened the standard window.
+    Transient history reads and our own outbound messages never reopen it.
+    """
+    from .dm_send_gate import DMSendGateError
+    from .presentation import stored_thread_messages, thread_id
+    from .reply_safety import _recipient, validate_dm_target
+    from .tasks import _is_outgoing_dm
+
+    now = timezone.now()
+    received_at = message.received_at
+    valid_timestamp = (
+        isinstance(received_at, datetime)
+        and timezone.is_aware(received_at)
+        and datetime(1970, 1, 1, tzinfo=UTC) < received_at <= now
+    )
+    peer = _recipient(message)
+    if thread_id(message) and peer:
+        candidates = (
+            stored_thread_messages(message)
+            .filter(
+                received_at__gt=received_at if valid_timestamp else datetime(1970, 1, 1, tzinfo=UTC),
+                received_at__lte=now,
+            )
+            .exclude(pk=message.pk)
+            .select_related("social_account", "conversation_message__conversation")
+            .order_by("-received_at", "-pk")
+        )
+        for candidate in candidates:
+            if _recipient(candidate) != peer:
+                continue
+            if _is_outgoing_dm(
+                candidate.social_account,
+                candidate.sender_handle,
+                candidate.extra,
+                platform_message_id=candidate.platform_message_id,
+            ):
+                continue
+            try:
+                validate_dm_target(candidate)
+            except DMSendGateError:
+                continue
+            received_at = candidate.received_at
+            valid_timestamp = True
+            break
+    if not valid_timestamp:
+        raise DMSendGateError(
+            "invalid_reply_window",
+            "BrightBean automated replies require a valid inbound message timestamp to verify activity within 24 hours.",
+        )
+    return now - received_at
+
+
 def validate_automated_reply_window(message: InboxMessage) -> None:
-    """Meta's HUMAN_AGENT exception is never available to an automated caller."""
+    """BrightBean currently automates only the verified standard window."""
     if message.message_type != InboxMessage.MessageType.DM or message.social_account.platform not in {
         "facebook",
         "instagram",
         "instagram_login",
     }:
         return
-    received_at = message.received_at
-    if not isinstance(received_at, datetime) or timezone.is_naive(received_at):
-        raise ReplyStateError("Automated Meta replies require a valid inbound message timestamp.")
-    age = timezone.now() - received_at
-    if age < timedelta(0) or age >= HUMAN_AGENT_AFTER:
-        raise ReplyStateError("Automated Meta replies are only allowed within 24 hours of the inbound message.")
+    if _meta_reply_window_age(message) >= HUMAN_AGENT_AFTER:
+        raise ReplyStateError(
+            "BrightBean automated replies currently require a verified incoming message within 24 hours. "
+            "Refresh the conversation to check for newer customer activity."
+        )
 
 
 def validate_meta_reply_window(message: InboxMessage, *, automated: bool) -> None:
-    """No Meta DM surface may infer app feature approval from manual mode.
+    """Keep automated replies within the locally verified standard window.
 
-    Current account metadata records missing OAuth scopes, not Meta's Human
-    Agent feature approval or permitted purpose. No empty scope list, setting,
-    session identity or provider mock supplies that missing evidence.
+    Manual replies use standard RESPONSE and let Meta enforce eligibility.
+    Stored inbox timestamps cannot prove the window is closed: qualifying
+    customer interactions such as postbacks may not be captured here. Manual
+    mode never grants or automatically selects the Human Agent exception.
     """
-    from .dm_send_gate import DMSendGateError
-
-    if message.message_type != InboxMessage.MessageType.DM or message.social_account.platform not in {
-        "facebook",
-        "instagram",
-        "instagram_login",
-    }:
-        return
     if automated:
         validate_automated_reply_window(message)
-        return
-    received_at = message.received_at
-    if not isinstance(received_at, datetime) or timezone.is_naive(received_at):
-        raise DMSendGateError("invalid_reply_window", "This reply requires a verified incoming message timestamp.")
-    age = timezone.now() - received_at
-    if age < timedelta(0) or age >= timedelta(days=7):
-        raise DMSendGateError("reply_window_closed", "The incoming message is outside the supported reply window.")
-    if age >= HUMAN_AGENT_AFTER:
-        raise DMSendGateError(
-            "human_agent_permission_unverified",
-            "Replies after 24 hours require verified platform Human Agent approval and permitted use; that approval is not verified for this account.",
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -155,7 +191,6 @@ def _dispatch_to_platform(
             quote_kwargs["reply_to_message_id"] = reply.quote_platform_message_id
         # Recheck after credentials resolve and immediately before provider dispatch.
         validate_meta_reply_window(message, automated=automated)
-        overdue = not automated and timezone.now() - message.received_at > HUMAN_AGENT_AFTER
         if before_provider is not None:
             before_provider()
         result = provider.reply_to_message(
@@ -163,7 +198,7 @@ def _dispatch_to_platform(
             message_id=message.platform_message_id,
             text=body,
             extra=extra,
-            human_agent=overdue,
+            human_agent=False,
             **quote_kwargs,
         )
 

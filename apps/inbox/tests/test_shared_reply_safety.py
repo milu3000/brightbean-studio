@@ -696,7 +696,7 @@ def test_postgres_committed_unknown_visible_and_second_send_cannot_enter(dm):
 
 
 @pytest.mark.parametrize("platform", ["facebook", "instagram_login"])
-def test_legacy_manual_extended_window_needs_verified_platform_approval(dm, platform):
+def test_legacy_manual_standard_reply_lets_platform_check_eligibility(dm, platform):
     from datetime import timedelta
 
     dm.account.platform = platform
@@ -705,23 +705,22 @@ def test_legacy_manual_extended_window_needs_verified_platform_approval(dm, plat
     dm.message.received_at = timezone.now() - timedelta(days=2)
     dm.message.save(update_fields=["received_at"])
     reply = draft(dm)
-    assert services.reply_send_availability(dm.message, reply=reply)["code"] == "human_agent_permission_unverified"
-    with patch("apps.inbox.services._dispatch_to_platform") as provider, pytest.raises(DMSendGateError) as held:
+    assert services.reply_send_availability(dm.message, reply=reply)["allowed"]
+    with patch("apps.inbox.services._dispatch_to_platform", side_effect=accepted) as provider:
         services.send_reply_now(reply, actor=dm.user, authorization=dm.authorization, automated=False)
-    assert held.value.code == "human_agent_permission_unverified"
-    provider.assert_not_called()
+    provider.assert_called_once()
     reply.refresh_from_db()
-    assert reply.status == "draft" and reply.send_generation == 0
+    assert reply.status == "sent" and reply.send_generation == 1
 
 
 def test_final_provider_entry_cannot_turn_manual_flag_into_human_agent_approval(dm):
     from datetime import timedelta
 
     dm.message.received_at = timezone.now() - timedelta(days=2)
-    with patch("apps.inbox.services.get_provider") as provider, pytest.raises(DMSendGateError) as held:
+    with patch("apps.inbox.services.get_provider") as provider:
         services._dispatch_to_platform(dm.message, "Synthetic", automated=False)
-    assert held.value.code == "human_agent_permission_unverified"
-    provider.assert_not_called()
+    provider.return_value.reply_to_message.assert_called_once()
+    assert provider.return_value.reply_to_message.call_args.kwargs["human_agent"] is False
 
 
 def test_comment_reply_does_not_acquire_a_dm_window_restriction(dm):

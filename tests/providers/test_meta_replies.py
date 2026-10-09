@@ -2,7 +2,7 @@
 
 These cover the edges Meta actually accepts: comments answered on a comment
 edge, DMs sent through the Send API addressed to a person's scoped ID, and the
-HUMAN_AGENT tag once the incoming message is more than 24 hours old.
+HUMAN_AGENT payload only when a caller explicitly requests that tag.
 """
 
 from unittest.mock import MagicMock

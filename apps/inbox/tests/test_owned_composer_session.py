@@ -71,13 +71,13 @@ def test_old_drafts_do_not_block_sequential_owned_conversation_messages(session,
     assert InboxReply.objects.filter(conversation__isnull=True, status="draft").count() == 23
 
 
-def test_extended_window_hold_is_visible_without_preventing_draft_save(session, owner):
+def test_manual_standard_reply_and_draft_stay_available_after_24_hours(session, owner):
     owner.clock.now += timedelta(hours=25)
     response = session.get(route(owner))
     assert response.status_code == 200
-    assert response.context["send_availability"]["code"] == "human_agent_permission_unverified"
+    assert response.context["send_availability"]["allowed"]
     assert response.context["can_save_draft"]
-    assert response.context["send_availability"]["reason"] in response.content.decode()
+    assert "human_agent_permission_unverified" not in response.content.decode()
     with patch("apps.inbox.services._dispatch_to_platform") as provider:
         saved = session.post(route(owner, "conversation_save_draft"), posted(response, "Keep a draft for later"))
     assert "HX-Reply-Failed" not in saved
