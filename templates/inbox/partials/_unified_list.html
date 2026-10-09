@@ -11,4 +11,4 @@
     </div>
 </a>
 {% empty %}<p class="unified-empty-list" role="status">No messages match these filters.</p>{% endfor %}
-{% if unified_next_url %}<a href="{{ unified_next_url }}" hx-get="{{ unified_next_url }}" hx-target="#inbox-list-content" hx-sync="#inbox-list-content:queue last" hx-push-url="true" class="unified-pagination" data-unified-next>Older messages</a>{% endif %}
+{% if unified_next_url %}<a href="{{ unified_next_url }}" hx-get="{{ unified_next_url }}" hx-target="#inbox-list-content" hx-swap="innerHTML settle:0ms" hx-sync="#inbox-list-content:queue last" hx-push-url="true" class="unified-pagination" data-unified-next>Older messages</a>{% endif %}

@@ -96,3 +96,12 @@ existing same-origin/current-workspace inbox cache hit through a fresh HTMX
 read; it never deletes or rewrites cache entries. Tests require byte-identical
 cached drafts plus unrelated workspace/page entries, one list/filter container,
 unchanged browser history length/index, and the current live composer intact.
+
+Every unified list-producing source uses a zero-settle innerHTML swap, including
+filter descendants, type links, pagination and the cache-bypass AJAX path. This
+makes newly inserted controls interactive before the next user event without
+changing detail/composer timing. The real-browser regression checks bindings at
+the first post-swap microtask and clicks immediately; removing those source rules
+reproduces a native full-page navigation under an enlarged default settle delay.
+Independent shell scenarios report all failures before failing the gate, so a
+single interaction failure no longer prevents history/race diagnostics.

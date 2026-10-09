@@ -1,7 +1,7 @@
 <nav class="unified-type-tabs" aria-label="Message types" data-unified-types>
     {% for tab in domain_tabs %}
     {% if tab.enabled != False %}
-    <a href="{{ tab.url }}" hx-get="{{ tab.url }}" hx-target="#inbox-list-content" hx-sync="#inbox-list-content:queue last" hx-push-url="true" data-unified-domain="{{ tab.value }}" {% if tab.value == active_domain %}aria-current="page"{% endif %}>{{ tab.label }}</a>
+    <a href="{{ tab.url }}" hx-get="{{ tab.url }}" hx-target="#inbox-list-content" hx-swap="innerHTML settle:0ms" hx-sync="#inbox-list-content:queue last" hx-push-url="true" data-unified-domain="{{ tab.value }}" {% if tab.value == active_domain %}aria-current="page"{% endif %}>{{ tab.label }}</a>
     {% endif %}
     {% endfor %}
 </nav>

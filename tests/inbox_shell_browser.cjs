@@ -204,6 +204,44 @@ async function mixedInteractionScenario(browser) {
     } finally {await page.close();}
 }
 
+async function immediateListControlScenario(browser) {
+    for (const negative of [false,true]) {
+        const withoutImmediate=html=>html.replaceAll(' hx-swap="innerHTML settle:0ms"','');
+        const oldRoutes=routes=>Object.fromEntries(Object.entries(routes).map(([url,html])=>[url,withoutImmediate(html)]));
+        const responses=negative?{...fixture,routes:{...oldRoutes(fixture.routes),...oldRoutes(fixture.historyRoutes)},listRoutes:oldRoutes(fixture.listRoutes),historyRoutes:oldRoutes(fixture.historyRoutes)}:fixture;
+        const page=await createPage(browser,responses,1365,900);
+        try {
+            await page.evaluate(`window.beforeImmediateClick=document.querySelector('[data-unified-shell]')`);
+            if (!negative) {
+                await page.open(fixture.threads[0]);
+                await page.type('Draft remains while clicking freshly swapped filters');
+            }
+            // Widen the exact bundled HTMX default-settle gap so the negative
+            // control is deterministic. Candidate source rules must override it.
+            await page.evaluate(`window.listReadyAtMicrotask=[];document.addEventListener('htmx:afterSwap',event=>{if(event.detail.target?.id==='inbox-list-content')queueMicrotask(()=>window.listReadyAtMicrotask.push(Array.from(document.querySelectorAll('#inbox-list-content [hx-get]')).every(node=>node['htmx-internal-data']?.initHash!==undefined)));});htmx.config.defaultSettleDelay=600;const input=document.querySelector('[data-inbox-search]');input.value='synthetic.visitor';input.dispatchEvent(new Event('input',{bubbles:true}));`);
+            await page.wait(`new URL(location.href).searchParams.get('q')==='synthetic.visitor'`,'search response URL before the next immediate action');
+            assert.equal(await page.evaluate('window.listReadyAtMicrotask.at(-1)'),!negative,'Every new type/filter/row/pagination trigger is initialized at the first post-swap microtask');
+            const href=await page.evaluate(`document.querySelector('[data-unified-domain="comment"]').getAttribute('href')`);
+            // No settling sleep: an immediately clickable anchor must already
+            // have HTMX listeners, or it performs a destructive full navigation.
+            await page.click('[data-unified-domain="comment"]');
+            await page.wait(`document.querySelector('[data-unified-domain][aria-current]')?.dataset.unifiedDomain==='comment'`,'immediate type selection');
+            const nativeNavigation=page.requests.some(request=>request.route===href&&!request.htmxRequest);
+            if (negative) {
+                assert.equal(nativeNavigation,true,'Removing zero-settle rules reproduces the native full-page GET');
+                assert.equal(await page.evaluate(`document.querySelector('[data-unified-shell]')===window.beforeImmediateClick`),false,'Default settle loses the previous shell');
+                await screenshot(page,'regression-default-settle-native-navigation');
+            } else {
+                assert.equal(nativeNavigation,false,'Fresh list controls never fall through to native navigation');
+                assert.equal(await page.evaluate(`document.querySelector('[data-unified-shell]')===window.beforeImmediateClick`),true);
+                assert.equal(await page.evaluate(`document.querySelector('[data-inbox-reply-form] textarea').value`),'Draft remains while clicking freshly swapped filters');
+            }
+            await page.clean();
+        } finally {await page.close();}
+    }
+    process.stdout.write('PASS immediate swapped type controls remain HTMX-bound; old default-settle negative control performs full navigation\n');
+}
+
 async function filteringScenario(browser) {
     const page=await createPage(browser,fixture,1365,900);
     try {
@@ -460,18 +498,26 @@ async function main() {
     const browser=new Browser(value('--browser'),profile);
     await withCleanup(async()=>{try {
         await browser.command('Browser.getVersion',{},undefined,30000);
-        for (const [width,height,collapsed] of [[1365,900,false],[1052,1344,true],[1024,768,false],[768,900,false],[390,844,false]]) {
-            await scenario(browser,width,height,collapsed);
+        const failures=[];
+        async function run(label,operation) {
+            try { await operation(); } catch (error) {
+                const failure=label+': '+error.stack;failures.push(failure);process.stderr.write('SCENARIO FAILED '+failure+'\n');
+            }
         }
-        await mixedInteractionScenario(browser);
-        await filteringScenario(browser);
-        await mixedRaceScenario(browser);
-        await browserHistoryScenario(browser);
-        await historyRaceScenario(browser);
-        await historyFailureScenario(browser);
-        await legacyHistoryCacheScenario(browser);
-        await reportedBugNegativeControls(browser);
+        for (const [width,height,collapsed] of [[1365,900,false],[1052,1344,true],[1024,768,false],[768,900,false],[390,844,false]]) {
+            await run(`layout ${width}x${height}`,()=>scenario(browser,width,height,collapsed));
+        }
+        await run('mixedInteractionScenario',()=>mixedInteractionScenario(browser));
+        await run('immediateListControlScenario',()=>immediateListControlScenario(browser));
+        await run('filteringScenario',()=>filteringScenario(browser));
+        await run('mixedRaceScenario',()=>mixedRaceScenario(browser));
+        await run('browserHistoryScenario',()=>browserHistoryScenario(browser));
+        await run('historyRaceScenario',()=>historyRaceScenario(browser));
+        await run('historyFailureScenario',()=>historyFailureScenario(browser));
+        await run('legacyHistoryCacheScenario',()=>legacyHistoryCacheScenario(browser));
+        await run('reportedBugNegativeControls',()=>reportedBugNegativeControls(browser));
         for (const width of [1365,390]) {
+            await run(`standalone ${width}`,async()=>{
             const standalone={...fixture,feed:fixture.threads[0].detail+'?standalone=1'};
             const page=await createPage(browser,standalone,width,844);
             try {
@@ -480,8 +526,10 @@ async function main() {
                 await screenshot(page,`standalone-${width}`);
                 await page.clean();
             } finally {await page.close();}
+            });
         }
-        assert.deepEqual(browser.errors,[]);
+        if (browser.errors.length) failures.push('CDP handler errors: '+browser.errors.join('\n'));
+        assert.equal(failures.length,0,failures.join('\n\n'));
         process.stdout.write('ACTUAL SHELL CHROMIUM PASSED\n');
     } catch(error) {throw new Error(`${error.stack}\nChromium stderr:\n${browser.stderr}`);}
     },async()=>{await browser.close();fs.rmSync(profile,{recursive:true,force:true,maxRetries:5,retryDelay:100});});

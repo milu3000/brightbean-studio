@@ -121,7 +121,7 @@ test('old current-workspace body cache is bypassed through scoped HTMX without r
     assert.equal(event.stopped,true);assert.equal(calls.length,1);
     assert.equal(app.dispatched[0].type,'inbox:history-navigation','Existing native observation cleanup still runs');
     assert.equal(calls[0][0],'GET');assert.equal(calls[0][1],'https://fixture.test/inbox/?domain=comment');
-    assert.equal(calls[0][2].select,'#inbox-list-content > *');assert.equal(calls[0][2].target,'#inbox-list-content');
+    assert.equal(calls[0][2].swap,'innerHTML settle:0ms');assert.equal(calls[0][2].select,'#inbox-list-content > *');assert.equal(calls[0][2].target,'#inbox-list-content');
     assert.equal(calls[0][2].headers['HX-History-Restore-Request'],'true');assert.equal(calls[0][2].values,undefined);
     assert.equal(calls[0][2].source,nodes[0]);assert.equal(nodes[0].hidden,true);
     assert.equal(app.context.window.localStorage.getItem(),cache);

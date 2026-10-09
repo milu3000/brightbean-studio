@@ -2,6 +2,7 @@
 
 import json
 import os
+import re
 import subprocess
 from datetime import timedelta
 from pathlib import Path
@@ -122,6 +123,7 @@ def shell_export(client, owner, tmp_path):
             {"domain": "all", "platform": "facebook"},
             {"domain": "all", "account": str(accounts[0].pk)},
             {"domain": "all", "q": "synthetic.visitor"},
+            {"q": "synthetic.visitor", "domain": "comment"},
             {"domain": "comment", "account": str(accounts[0].pk)},
             {"domain": "comment", "account": str(accounts[0].pk), "q": "synthetic.visitor"},
             {"domain": "dm", "account": str(owner.account.pk)},
@@ -222,6 +224,10 @@ def test_actual_shell_fixture_keeps_account_routes(shell_export):
     assert "sidebar-initial" in html and "/static/css/dist/styles.css" in html
     assert html.count("data-inbox-account") == 1
     assert "Switch account" not in html
+    form = re.search(r'<form[^>]+id="inbox-filters"[^>]*>', html)
+    assert form and 'hx-swap="innerHTML settle:0ms"' in form.group()
+    list_links = re.findall(r'<a[^>]+hx-target="#inbox-list-content"[^>]*>', html)
+    assert list_links and all('hx-swap="innerHTML settle:0ms"' in link for link in list_links)
     assert 'data-unified-domain="all" aria-current="page"' in html
     assert 'data-message-source="canonical"' in html and 'data-message-source="legacy"' in html
     assert all(f'data-message-type="{kind}"' in html for kind in ("dm", "comment", "mention", "review"))
@@ -250,7 +256,7 @@ def test_canonical_actual_shell_chromium(request):
         [node, str(ROOT / "tests/inbox_shell_browser.cjs"), "--browser", binary, "--fixtures", str(destination)],
         capture_output=True,
         text=True,
-        timeout=150,
+        timeout=240,
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr

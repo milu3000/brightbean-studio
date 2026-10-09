@@ -109,7 +109,7 @@
         source.setAttribute('data-no-error-toast', '');
         root.appendChild(source);
         window.htmx.ajax('GET', url.href, {
-            source, target:'#inbox-list-content', swap:'innerHTML', select:'#inbox-list-content > *',
+            source, target:'#inbox-list-content', swap:'innerHTML settle:0ms', select:'#inbox-list-content > *',
             headers:{'HX-History-Restore-Request':'true'}
         }).catch(function () {}).finally(function () { source.remove(); });
     }, true);

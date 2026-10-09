@@ -116,8 +116,9 @@ class Page {
     }
     async paused(event) {
         const url = new URL(event.request.url), route = url.pathname + url.search;
+        const htmxRequest = Object.entries(event.request.headers).some(([name,value]) => name.toLowerCase() === 'hx-request' && value === 'true');
         const historyRestore = Object.entries(event.request.headers).some(([name,value]) => name.toLowerCase() === 'hx-history-restore-request' && value === 'true');
-        this.requests.push({url:event.request.url, method:event.request.method, route, historyRestore});
+        this.requests.push({url:event.request.url, method:event.request.method, route, historyRestore, htmxRequest});
         const asset = this.fixture.assets?.[event.request.url];
         if (asset && event.request.method === 'GET') return this.fulfill(event, asset.body, asset.type);
         // This exact synthetic CDN URL exercises the production preview
