@@ -85,6 +85,8 @@ def test_rest_mcp_and_reply_context_share_the_native_identity_bridge(context, un
 @pytest.mark.parametrize("fault", ["native_id", "empty_id", "direction", "unassigned", "platform", "linked_elsewhere"])
 def test_same_content_and_time_never_replace_exact_incoming_identity(context, unlinked, fault):
     message, anchor, _sync = unlinked
+    anchor.body = message.body
+    anchor.save(update_fields=["body"])
     if fault == "linked_elsewhere":
         other_anchor = InboxMessage.objects.create(
             workspace=context.account.workspace,
@@ -108,6 +110,15 @@ def test_same_content_and_time_never_replace_exact_incoming_identity(context, un
     with pytest.raises(JsonRpcError) as error:
         read(context, anchor)
     assert error.value.data["error"] == "canonical_unavailable"
+    # The compatibility DTO has its own identity checks. Exercise the shared
+    # resolver and reply-context route so those checks cannot hide a weak match.
+    with pytest.raises(canonical_reads.CanonicalReadError) as resolver_error:
+        canonical_reads.resolve_legacy_conversation(context.scope, anchor.pk)
+    assert resolver_error.value.code == "canonical_unavailable"
+    result = rpc(context, "get_reply_context", {"message_id": str(anchor.pk)})
+    assert "error" in result and "result" not in result
+    assert message.body not in json.dumps(result)
+    assert "STALE LEGACY BODY" not in json.dumps(result)
 
 
 def test_existing_conflicting_link_cannot_be_bypassed_by_native_match(context, unlinked):
@@ -117,6 +128,9 @@ def test_existing_conflicting_link_cannot_be_bypassed_by_native_match(context, u
     with pytest.raises(JsonRpcError) as error:
         read(context, anchor)
     assert error.value.data["error"] == "canonical_unavailable"
+    with pytest.raises(canonical_reads.CanonicalReadError) as resolver_error:
+        canonical_reads.resolve_legacy_conversation(context.scope, anchor.pk)
+    assert resolver_error.value.code == "canonical_unavailable"
 
 
 @pytest.mark.parametrize("foreign_workspace", [False, True])
@@ -153,6 +167,9 @@ def test_native_id_collision_cannot_cross_account_or_workspace(
         read(context, anchor)
     assert error.value.data["error"] == "canonical_unavailable"
     assert "Foreign private body" not in str(error.value)
+    with pytest.raises(canonical_reads.CanonicalReadError) as resolver_error:
+        canonical_reads.resolve_legacy_conversation(context.scope, anchor.pk)
+    assert resolver_error.value.code == "canonical_unavailable"
 
 
 @pytest.mark.parametrize(
@@ -184,6 +201,8 @@ def test_revoked_provenance_or_read_scope_never_reopens_legacy_content(context, 
         read(context, anchor)
     assert "Canonical incoming text" not in str(error.value)
     assert "STALE LEGACY BODY" not in str(error.value)
+    with pytest.raises(canonical_reads.CanonicalReadError):
+        canonical_reads.resolve_legacy_conversation(context.scope, anchor.pk)
 
 
 def test_unlinked_native_match_requires_saved_provenance(context):
@@ -193,6 +212,9 @@ def test_unlinked_native_match_requires_saved_provenance(context):
     with pytest.raises(JsonRpcError) as error:
         read(context, anchor)
     assert error.value.data["error"] == "canonical_unavailable"
+    with pytest.raises(canonical_reads.CanonicalReadError) as resolver_error:
+        canonical_reads.resolve_legacy_conversation(context.scope, anchor.pk)
+    assert resolver_error.value.code == "canonical_unavailable"
 
 
 @pytest.mark.parametrize("source", ["canonical_withdrawn", "canonical_expired", "legacy_withdrawn", "legacy_expired"])

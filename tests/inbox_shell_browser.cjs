@@ -17,8 +17,19 @@ const clipped = `(() => {
     for (const selector of ['.canonical-shell > header','[data-inbox-search]','[data-inbox-platform]',
         '[data-inbox-account]','[data-inbox-open-message]']) {
         const element=document.querySelector(selector);
-        if (!element || !element.getClientRects().length) continue;
+        if (!element || !element.getClientRects().length) {
+            failures.push({selector,reason:'Required list control is missing or hidden'});
+            continue;
+        }
+        if (['hidden','collapse'].includes(getComputedStyle(element).visibility)) {
+            failures.push({selector,reason:'Required list control is not visible'});
+            continue;
+        }
         const box=element.getBoundingClientRect();
+        if (box.width<=0 || box.height<=0) {
+            failures.push({selector,reason:'Required list control has no visible size'});
+            continue;
+        }
         for (let parent=element.parentElement;parent;parent=parent.parentElement) {
             const style=getComputedStyle(parent),bounds=parent.getBoundingClientRect();
             const clipX=/hidden|auto|scroll|clip/.test(style.overflowX);
@@ -39,6 +50,43 @@ async function screenshot(page, name) {
     fs.writeFileSync(path.join(fixture.screenshotDirectory,name+'.png'),Buffer.from(result.data,'base64'));
 }
 
+async function oldLayoutNegativeControl(page) {
+    // Exact shell rules from base commit 8c20d79b. Reintroduce the reported
+    // clipping inside the real base wrapper, then prove normal layout recovers.
+    const oldCss='.canonical-shell{display:flex;flex-direction:column;min-height:0;height:calc(100% + 1.5rem);margin:-.75rem;overflow:hidden}\n'+
+        '@media(min-width:640px){.canonical-shell{height:calc(100% + 2rem);margin:-1rem}}\n'+
+        '@media(min-width:1024px){.canonical-shell{height:calc(100% + 3rem);margin:-1.5rem}}';
+    try {
+        await page.evaluate(`(() => {const style=document.createElement('style');style.id='old-layout-negative-control';style.textContent=${JSON.stringify(oldCss)};document.head.append(style);})()`);
+        await page.settle();
+        await screenshot(page,'regression-negative-margins');
+        const failures=await page.evaluate(clipped);
+        assert(failures.some(item=>item.parent),'The old negative margins must fail real ancestor geometry');
+    } finally {
+        await page.evaluate(`document.querySelector('#old-layout-negative-control')?.remove()`);
+        await page.settle();
+    }
+    assert.deepEqual(await page.evaluate(clipped),[],'Restoring candidate styles returns to valid geometry');
+    for (const mode of ['hidden','missing','invisible']) {
+        const failures=await page.evaluate(`(() => {
+            const element=document.querySelector('.canonical-shell > header'),parent=element.parentElement,next=element.nextSibling;
+            const saved=element.getAttribute('style');
+            try {
+                if (${JSON.stringify(mode)}==='missing') element.remove();
+                else if (${JSON.stringify(mode)}==='invisible') element.style.visibility='hidden';
+                else element.style.display='none';
+                return ${clipped};
+            } finally {
+                if (!element.isConnected) parent.insertBefore(element,next);
+                if (saved===null) element.removeAttribute('style');else element.setAttribute('style',saved);
+            }
+        })()`);
+        assert(failures.some(item=>item.selector==='.canonical-shell > header'),`${mode} required header must fail`);
+    }
+    assert.deepEqual(await page.evaluate(clipped),[],'Negative controls leave the real page intact');
+    process.stdout.write('PASS real DOM negative controls: old margins, missing and hidden header fail; candidate recovers\n');
+}
+
 async function scenario(browser,width,height,collapsed) {
     const page=await createPage(browser,{...fixture,sidebarCollapsed:collapsed},width,height);
     try {
@@ -46,10 +94,21 @@ async function scenario(browser,width,height,collapsed) {
         const name=`shell-${width}-${collapsed?'collapsed':'expanded'}`;
         await screenshot(page,name);
         assert.deepEqual(await page.evaluate(clipped),[], 'Visible controls and first conversation must fit all clipping ancestors');
+        if (width===1365 && !collapsed) await oldLayoutNegativeControl(page);
         assert(await page.evaluate('document.documentElement.scrollWidth <= innerWidth+1'),'No document horizontal overflow');
         assert(await page.evaluate(`document.querySelector('#inbox-message-list').getBoundingClientRect().height > 180`),'Account navigation leaves room for conversations');
         const directory=await page.evaluate(`(() => { const nav=document.querySelector('[aria-label="Other DM accounts"]'),details=nav.closest('details');return {count:nav.querySelectorAll('a').length,visible:details.getBoundingClientRect().height,open:details.open};})()`);
         assert.equal(directory.count,10,'All existing account routes remain reachable');
+        const destinations=await page.evaluate(`Array.from(document.querySelectorAll('[aria-label="Other DM accounts"] a'),link=>link.href)`);
+        const accounts=destinations.map(href=>{
+            const url=new URL(href);
+            assert.equal(url.origin,fixture.origin,'Account switch stays on the same application');
+            assert.equal(url.pathname,fixture.feed,'Account switch stays in the selected workspace');
+            assert.deepEqual([...url.searchParams.keys()].sort(),['account','domain'],'Each switch selects one account and DM');
+            assert.equal(url.searchParams.get('domain'),'dm');
+            return url.searchParams.get('account');
+        });
+        assert.deepEqual(accounts.sort(),[...fixture.legacyAccountIds].sort(),'Every account has its own exact destination');
         assert.equal(directory.open,false,'Other accounts start collapsed');
         assert(directory.visible<60,'Other accounts are compact before expansion');
         await page.click('[data-canonical-account-switcher] summary');

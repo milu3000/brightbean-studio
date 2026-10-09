@@ -121,6 +121,9 @@ jobs:
 
       # Print complete browser failure details before the aggregate suite,
       # including when a later job timeout prevents pytest's final summary.
+      - name: Install CJK fonts for representative UI screenshots
+        run: sudo apt-get update && sudo apt-get install -y fonts-noto-cjk
+
       - name: Build application CSS for actual-shell browser regression
         working-directory: theme/static_src
         run: npm ci && npm run build

@@ -28,14 +28,16 @@ def shell_export(client, owner, tmp_path):
     OnboardingChecklist.objects.create(user=owner.user, workspace=owner.account.workspace, is_dismissed=True)
     for message in ConversationMessage.objects.filter(conversation=owner.conversation):
         proof(owner, message)
+    legacy_accounts = []
     for index in range(10):
-        SocialAccount.objects.create(
+        account = SocialAccount.objects.create(
             workspace=owner.account.workspace,
             platform="facebook" if index % 2 else "instagram_login",
             account_platform_id=f"synthetic-shell-account-{index}",
             account_name=f"Synthetic brand {index // 2}",
             account_handle=f"synthetic.brand.{index // 2}",
         )
+        legacy_accounts.append(str(account.pk))
     routes = {}
     feed = reverse("inbox:feed", kwargs={"workspace_id": owner.account.workspace_id})
     detail = reverse(
@@ -50,6 +52,9 @@ def shell_export(client, owner, tmp_path):
             response = client.get(url, **headers)
             assert response.status_code == 200, response.content[:500]
             routes[url] = response.content.decode()
+        list_response = client.get(feed, HTTP_HX_REQUEST="true")
+        history_response = client.get(detail, {"fragment": "history"}, HTTP_HX_REQUEST="true")
+        assert list_response.status_code == history_response.status_code == 200
         native.assert_not_called()
         provider.assert_not_called()
     # Only unrelated optional CDN widgets are stubbed. Layout, base template,
@@ -74,13 +79,16 @@ def shell_export(client, owner, tmp_path):
         "origin": "https://canonical.test",
         "feed": feed,
         "routes": routes,
+        "listHtml": list_response.content.decode(),
         "assets": assets,
         "fullShell": True,
+        "legacyAccountIds": legacy_accounts,
         "contentRoutes": {},
         "threads": [
             {
                 "id": str(owner.conversation.pk),
                 "detail": detail,
+                "initialHistory": history_response.content.decode(),
                 "read": reverse(
                     "inbox:conversation_read_ack",
                     kwargs={
