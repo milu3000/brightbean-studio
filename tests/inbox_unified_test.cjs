@@ -63,7 +63,7 @@ function listEvent(domain,refresh=false,query={}) {
     const form={action:'/inbox/',entries:[['domain',domain],...Object.entries(query)]};
     form.closest=selector=>selector==='#inbox-filters'?form:null;
     form.matches=()=>refresh;
-    const element=refresh?form:{dataset:{},closest:()=>null,matches:()=>false,getAttribute:()=>'/inbox/?domain='+domain};
+    const element=refresh?form:{dataset:{},closest:()=>null,matches:()=>false,getAttribute:()=>'/inbox/?'+new URLSearchParams(form.entries)};
     element.dataset={};
     return {detail:{elt:element,target:{id:'inbox-list-content'},xhr:{}},preventDefault(){this.prevented=true;}};
 }
@@ -86,6 +86,50 @@ test('same-scope automatic list refresh remains enabled',()=>{
     app.emit('htmx:confirm',first);app.emit('htmx:beforeRequest',first);app.emit('htmx:confirm',second);
     const event=swap(first.detail.xhr);app.emit('htmx:beforeSwap',event);
     assert.equal(event.detail.shouldSwap,true);
+});
+
+test('successful paginated refresh rebases its scope so the next mutation refresh is accepted',()=>{
+    const app=setup(),older=listEvent('comment',false,{cursor:'page-two'}),refresh=listEvent('comment',true,{cursor:'page-two'});
+    app.emit('htmx:confirm',older);
+    app.emit('htmx:confirm',refresh);assert.equal(refresh.prevented,undefined);
+    app.emit('htmx:beforeRequest',refresh);
+    const firstPage=listEvent('comment',true);
+    app.setForm(firstPage.detail.elt);
+    app.emit('htmx:afterSwap',{detail:{xhr:refresh.detail.xhr,target:{id:'inbox-list-content'}}});
+    app.emit('htmx:confirm',firstPage);assert.equal(firstPage.prevented,undefined);
+});
+test('failed paginated refresh keeps the old visible scope retryable',()=>{
+    const app=setup(),older=listEvent('comment',false,{cursor:'page-two'});
+    app.emit('htmx:confirm',older);
+    for(let attempt=0;attempt<2;attempt++) {
+        const refresh=listEvent('comment',true,{cursor:'page-two'});
+        app.emit('htmx:confirm',refresh);assert.equal(refresh.prevented,undefined);
+        app.emit('htmx:beforeRequest',refresh);
+        app.emit('htmx:afterRequest',{detail:{xhr:refresh.detail.xhr,failed:true,successful:false}});
+    }
+});
+test('detail swaps cannot prematurely rebase a tracked list refresh',()=>{
+    const app=setup(),older=listEvent('comment',false,{cursor:'page-two'}),refresh=listEvent('comment',true,{cursor:'page-two'});
+    app.emit('htmx:confirm',older);app.emit('htmx:confirm',refresh);app.emit('htmx:beforeRequest',refresh);
+    app.setForm(listEvent('comment',true).detail.elt);
+    app.emit('htmx:afterSwap',{detail:{xhr:refresh.detail.xhr,target:{id:'inbox-detail-panel'}}});
+    const retry=listEvent('comment',true,{cursor:'page-two'});
+    app.emit('htmx:confirm',retry);assert.equal(retry.prevented,undefined);
+});
+test('old paginated refresh cannot overwrite or rebase newer filter, page or history intent',()=>{
+    for(const mode of ['filter','page','history']) {
+        const app=setup(),older=listEvent('comment',false,{cursor:'page-two'}),refresh=listEvent('comment',true,{cursor:'page-two'});
+        app.emit('htmx:confirm',older);app.emit('htmx:confirm',refresh);app.emit('htmx:beforeRequest',refresh);
+        const newer=mode==='page'?listEvent('comment',false,{cursor:'page-three'}):listEvent('mention');
+        if(mode==='history') {app.setForm(listEvent('mention',true).detail.elt);app.emit('htmx:historyRestore',{});}
+        else app.emit('htmx:confirm',newer);
+        const stale=swap(refresh.detail.xhr);app.emit('htmx:beforeSwap',stale);assert.equal(stale.detail.shouldSwap,false,mode);
+        // A stale/foreign completion cannot rebase wantedList even if an event is delivered late.
+        app.setForm(listEvent('comment',true).detail.elt);
+        app.emit('htmx:afterSwap',{detail:{xhr:refresh.detail.xhr,target:{id:'inbox-list-content'}}});
+        const expected=mode==='page'?listEvent('comment',true,{cursor:'page-three'}):listEvent('mention',true);
+        app.emit('htmx:confirm',expected);assert.equal(expected.prevented,undefined,mode);
+    }
 });
 
 test('account and platform changes clear source-specific status before HTMX collects values',()=>{

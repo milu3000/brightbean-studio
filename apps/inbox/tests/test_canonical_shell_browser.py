@@ -226,6 +226,7 @@ def test_actual_shell_fixture_keeps_account_routes(shell_export):
     assert "Switch account" not in html
     form = re.search(r'<form[^>]+id="inbox-filters"[^>]*>', html)
     assert form and 'hx-swap="innerHTML settle:0ms"' in form.group()
+    assert 'hx-replace-url="true"' in form.group(), "Mutation refresh must replace its stale page URL on success"
     list_links = re.findall(r'<a[^>]+hx-target="#inbox-list-content"[^>]*>', html)
     assert list_links and all('hx-swap="innerHTML settle:0ms"' in link for link in list_links)
     assert 'data-unified-domain="all" aria-current="page"' in html
