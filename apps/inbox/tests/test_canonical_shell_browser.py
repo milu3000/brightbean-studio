@@ -5,6 +5,7 @@ import os
 import re
 import subprocess
 from datetime import timedelta
+from html import unescape
 from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import urlencode
@@ -91,15 +92,33 @@ def shell_export(client, owner, tmp_path):
         kwargs={"workspace_id": owner.account.workspace_id, "conversation_id": owner.conversation.pk},
     )
 
+    captured_lists = {}
+
+    def capture_url(url):
+        pending = [(url, frozenset())]
+        while pending:
+            current, ancestors = pending.pop(0)
+            assert current not in ancestors, "Fixture pagination must not cycle"
+            if current in captured_lists:
+                continue
+            assert len(captured_lists) < 128, "Fixture pagination must remain bounded"
+            response = client.get(current, HTTP_HX_REQUEST="true")
+            assert response.status_code == 200, (current, response.content[:500])
+            list_routes[current] = response.content.decode()
+            restored = client.get(current, HTTP_HX_REQUEST="true", HTTP_HX_HISTORY_RESTORE_REQUEST="true")
+            assert restored.status_code == 200, (current, restored.content[:500])
+            history_routes[current] = restored.content.decode()
+            captured_lists[current] = response
+            # Each render can issue a different timestamp-signed cursor even for
+            # the same snapshot. Export every exact emitted link, not an alias.
+            for rendered in (response, restored):
+                next_url = rendered.context["unified_next_url"]
+                if next_url:
+                    pending.append((next_url, ancestors | {current}))
+        return captured_lists[url]
+
     def capture_list(params=None):
-        url = feed + ("?" + urlencode(params) if params else "")
-        response = client.get(url, HTTP_HX_REQUEST="true")
-        assert response.status_code == 200, (url, response.content[:500])
-        list_routes[url] = response.content.decode()
-        restored = client.get(url, HTTP_HX_REQUEST="true", HTTP_HX_HISTORY_RESTORE_REQUEST="true")
-        assert restored.status_code == 200, (url, restored.content[:500])
-        history_routes[url] = restored.content.decode()
-        return response
+        return capture_url(feed + ("?" + urlencode(params) if params else ""))
 
     with (
         patch("apps.inbox.native_thread_reads.read_native_thread") as native,
@@ -111,9 +130,7 @@ def shell_export(client, owner, tmp_path):
         first_rows = [row["id"] for row in response.context["unified_rows"]]
         next_url = response.context["unified_next_url"]
         assert next_url, "Real pagination is required by the shell fixture"
-        next_response = client.get(next_url, HTTP_HX_REQUEST="true")
-        assert next_response.status_code == 200
-        list_routes[next_url] = next_response.content.decode()
+        next_response = capture_url(next_url)
         next_rows = [row["id"] for row in next_response.context["unified_rows"]]
         assert first_rows and next_rows and not set(first_rows).intersection(next_rows)
         for domain in ("all", "dm", "comment", "mention", "review"):
@@ -236,6 +253,18 @@ def test_actual_shell_fixture_keeps_account_routes(shell_export):
     assert "Unknown sender" in html
     assert "Facebook" in html and "Instagram" in html
     assert manifest["firstRows"] and manifest["nextRows"]
+    # Signed cursor timestamps can differ between initial render and refresh.
+    # Every exact URL emitted by either response must exist in the fixture;
+    # never accept arbitrary cursor aliases to hide an unknown browser request.
+    for html in [
+        manifest["routes"][manifest["feed"]],
+        *manifest["listRoutes"].values(),
+        *manifest["historyRoutes"].values(),
+    ]:
+        for anchor in re.findall(r"<a[^>]+data-unified-next[^>]*>", html):
+            target = re.search(r'href="([^"]+)"', anchor)
+            assert target and unescape(target.group(1)) in manifest["listRoutes"], anchor
+            assert unescape(target.group(1)) in manifest["historyRoutes"], anchor
 
 
 @pytest.mark.django_db(transaction=True)
