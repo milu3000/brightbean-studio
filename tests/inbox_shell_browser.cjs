@@ -302,6 +302,64 @@ async function mixedRaceScenario(browser) {
     process.stdout.write('PASS stale canonical/legacy detail and list responses cannot replace newer selection\n');
 }
 
+async function paginatedMutationRefreshScenario(browser) {
+    // Request/history wiring with actual HTMX and rendered fixtures. The Django
+    // endpoint regression separately proves read/status/assignment HX-Trigger
+    // and stale-cursor 409s against real isolated database mutations.
+    const page=await createPage(browser,fixture,1365,900);
+    try {
+        await page.evaluate('window.originalUnifiedShell=document.querySelector("[data-unified-shell]");window.originalDetailPane=document.querySelector("#inbox-detail-panel")');
+        await page.open(fixture.threads[0]);await page.settle();
+        await page.type('Unsaved reply survives mutation refresh');
+        await page.evaluate(`window.refreshComposer=document.querySelector('[data-inbox-reply-form] textarea');window.refreshDetail=document.querySelector('#inbox-detail-panel');window.mutationListSwaps=0;window.mutationErrors=0;document.addEventListener('htmx:afterSwap',event=>{if(event.detail.target?.id==='inbox-list-content')window.mutationListSwaps++;});document.addEventListener('htmx:responseError',()=>window.mutationErrors++);`);
+        async function older() {
+            await page.click('[data-unified-next]');
+            await page.wait(`new URL(location.href).searchParams.has('cursor')`,'older page before mutation refresh');
+            await page.settle();
+            assert.deepEqual(await page.evaluate(`Array.from(document.querySelectorAll('[data-unified-row]'),row=>row.dataset.inboxOpenMessage)`),fixture.nextRows);
+        }
+        async function refresh() {
+            const swaps=await page.evaluate('window.mutationListSwaps');
+            await page.evaluate(`document.dispatchEvent(new CustomEvent('inbox:refresh',{bubbles:true}))`);
+            await page.wait(`window.mutationListSwaps>${swaps}`,'successful mutation list refresh');
+        }
+        await older();
+        const before=await page.command('Page.getNavigationHistory');
+        await refresh();
+        const after=await page.command('Page.getNavigationHistory');
+        assert.equal(after.entries.length,before.entries.length,'Automatic refresh replaces rather than pushes history');
+        assert.equal(after.currentIndex,before.currentIndex);
+        assert.equal(await page.evaluate(`new URL(location.href).searchParams.has('cursor')`),false);
+        assert.equal(await page.evaluate(`document.querySelector('[data-canonical-list-cursor]').value`),'','Canonical afterSwap must not reintroduce the old URL cursor');
+        assert.deepEqual(await page.evaluate(`Array.from(document.querySelectorAll('[data-unified-row]'),row=>row.dataset.inboxOpenMessage)`),fixture.firstRows);
+        const refreshRoute=page.requests.filter(request=>request.htmxRequest&&new URL(request.url).pathname===fixture.feed).at(-1).route;
+        assert.equal(new URL(refreshRoute,fixture.origin).searchParams.has('cursor'),false,'Refresh never submits the stale cursor');
+        await refresh(); // A stale wantedList signature used to block this follow-up.
+        await older();
+        const oldUrl=await page.evaluate('location.href'),oldCursor=await page.evaluate(`document.querySelector('[data-canonical-list-cursor]').value`);
+        const errors=await page.evaluate('window.mutationErrors'),swaps=await page.evaluate('window.mutationListSwaps');
+        page.failures.set(refreshRoute,409);
+        await page.evaluate(`document.dispatchEvent(new CustomEvent('inbox:refresh',{bubbles:true}))`);
+        await page.wait(`window.mutationErrors>${errors}`,'synthetic failed mutation refresh');
+        assert.equal(await page.evaluate('location.href'),oldUrl);
+        assert.equal(await page.evaluate(`document.querySelector('[data-canonical-list-cursor]').value`),oldCursor);
+        assert.equal(await page.evaluate('window.mutationListSwaps'),swaps);
+        assert.deepEqual(await page.evaluate(`Array.from(document.querySelectorAll('[data-unified-row]'),row=>row.dataset.inboxOpenMessage)`),fixture.nextRows);
+        page.failures.delete(refreshRoute);
+        await refresh();
+        await older();page.delays.set(refreshRoute,350);
+        await page.evaluate(`document.dispatchEvent(new CustomEvent('inbox:refresh',{bubbles:true}))`);
+        await chooseType(page,'mention');await page.settle();
+        assert.equal(await page.evaluate(`new URL(location.href).searchParams.get('domain')`),'mention','Delayed refresh cannot replace a newer filter URL');
+        assert.equal(await page.evaluate(`document.querySelector('[data-inbox-reply-form] textarea')===window.refreshComposer`),true);
+        assert.equal(await page.evaluate(`document.querySelector('#inbox-detail-panel')===window.refreshDetail`),true);
+        assert.equal(await page.evaluate(`document.querySelector('[data-inbox-reply-form] textarea').value`),'Unsaved reply survives mutation refresh');
+        assert.equal(page.posts.filter(post=>/reply|send/.test(post.route)).length,0);
+        await page.clean();
+        process.stdout.write('PASS paginated mutation refresh drops cursor, replaces URL, remains retryable and preserves newer navigation/detail/draft\n');
+    } finally {await page.close();}
+}
+
 async function browserHistoryScenario(browser) {
     for (const source of ['canonical','legacy']) {
         const page=await createPage(browser,fixture,1365,900);
@@ -510,6 +568,7 @@ async function main() {
         await run('mixedInteractionScenario',()=>mixedInteractionScenario(browser));
         await run('immediateListControlScenario',()=>immediateListControlScenario(browser));
         await run('filteringScenario',()=>filteringScenario(browser));
+        await run('paginatedMutationRefreshScenario',()=>paginatedMutationRefreshScenario(browser));
         await run('mixedRaceScenario',()=>mixedRaceScenario(browser));
         await run('browserHistoryScenario',()=>browserHistoryScenario(browser));
         await run('historyRaceScenario',()=>historyRaceScenario(browser));

@@ -6,6 +6,25 @@ const bundle=fs.readFileSync(path.join(root,'static/js/htmx.min.js'),'utf8');
 const start=bundle.indexOf('function Gt(o){'),end=bundle.indexOf('function Wt(e){',start);
 assert(start>0&&end>start,'Reinspect bundled HTMX history loading if its implementation changes');
 const historyLoader=bundle.slice(start,end),controller=fs.readFileSync(path.join(root,'static/js/inbox-unified.js'),'utf8');
+test('actual HTMX replaces the refreshed page URL while user filters retain push navigation',()=>{
+    const html=fs.readFileSync(path.join(root,'templates/inbox/partials/_unified_filters.html'),'utf8');
+    const form={attributes:Object.fromEntries([...html.match(/<form[^>]+>/)[0].matchAll(/(hx-[\w-]+)="([^"]*)"/g)].map(match=>[match[1],match[2]]))};
+    const replaced=[];
+    const sandbox={R:()=>false,re(element,name){for(let node=element;node;node=node.parent)if(node.attributes[name])return node.attributes[name];},ie:()=>({}),Q:{config:{historyEnabled:true}},history:{replaceState:(state,title,url)=>replaced.push(url)},Bt:'/inbox/?cursor=old'};
+    vm.createContext(sandbox);
+    const choose=bundle.indexOf('function Nn('),chooseEnd=bundle.indexOf('function In(',choose);
+    const replace=bundle.indexOf('function Jt('),replaceEnd=bundle.indexOf('function Kt(',replace);
+    assert(choose>0&&chooseEnd>choose&&replace>0&&replaceEnd>replace,'Reinspect bundled HTMX history functions if they change');
+    vm.runInContext(bundle.slice(choose,chooseEnd)+bundle.slice(replace,replaceEnd),sandbox);
+    const response={xhr:{},pathInfo:{finalRequestPath:'/inbox/?domain=comment&account=synthetic'}};
+    const result=sandbox.Nn(form,response);
+    assert.equal(result.type,'replace');assert.equal(result.path,response.pathInfo.finalRequestPath);
+    sandbox.Jt(result.path);assert.deepEqual(replaced,[result.path]);assert.equal(sandbox.Bt,result.path);
+    const input={parent:form,attributes:{'hx-push-url':'true'}};
+    assert.equal(sandbox.Nn(input,response).type,'push','Explicit user filter navigation still adds browser history');
+    delete form.attributes['hx-replace-url'];
+    assert.equal(sandbox.Nn(form,response).type,undefined,'Old markup leaves the stale cursor URL unchanged');
+});
 function setup(enabled=true) {
     const listeners={},pending=[],body={},shell={},notices=[];let visible='dm';
     const currentForm=()=>({action:'/inbox/',entries:[['domain',visible]],closest(){return this;}});

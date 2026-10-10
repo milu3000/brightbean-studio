@@ -105,3 +105,11 @@ the first post-swap microtask and clicks immediately; removing those source rule
 reproduces a native full-page navigation under an enlarged default settle delay.
 Independent shell scenarios report all failures before failing the gate, so a
 single interaction failure no longer prevents history/race diagnostics.
+
+Paginated mutation-refresh coverage restarts the unified snapshot after read,
+status or assignment changes. Real Django endpoint tests require the actual
+`HX-Trigger`, reject the old cursor with 409 and verify complete freshly scoped
+pagination. The browser wiring scenario dispatches that refresh event through
+the existing bridge and actual HTMX: stale cursor removal, replacement (not
+pushed) history, consecutive refresh, failed-refresh retry, newer navigation,
+and unchanged detail/composer/draft. Canonical-only refresh behavior is retained.
