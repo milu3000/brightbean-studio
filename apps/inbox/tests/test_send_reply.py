@@ -153,7 +153,11 @@ def test_the_error_shown_to_users_carries_no_raw_api_text(client, fb_account, or
     body = response.content.decode()
     assert "DM send stopped" in body
     assert "fbtrace_id" not in body
-    assert "401" not in body
+    # Scope numeric diagnostics to the rendered error, not random UUIDs in
+    # links/tokens: a valid workspace UUID can legitimately contain "401".
+    reply = InboxReply.objects.get(inbox_message=message)
+    assert "401" not in reply.send_error
+    assert reply.send_error in body
 
 
 def test_an_expired_connection_gets_a_reconnect_hint(client, fb_account, org_owner, user):

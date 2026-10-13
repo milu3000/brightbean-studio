@@ -204,6 +204,52 @@ async function mixedInteractionScenario(browser) {
     } finally {await page.close();}
 }
 
+async function metadataPreservesComposerScenario(browser) {
+    for (const width of [1365,390]) {
+        const page=await createPage(browser,fixture,width,844);
+        try {
+            await page.evaluate('window.originalUnifiedShell=document.querySelector("[data-unified-shell]");window.originalDetailPane=document.querySelector("#inbox-detail-panel")');
+            await chooseType(page,'comment');
+            const comment=fixture.legacyThreads.find(thread=>thread.kind==='comment');
+            await openLegacy(page,comment);
+            await page.type('未保存的回覆保留');
+            const routes=Object.keys(fixture.htmlPostResponses);
+            await page.evaluate(`window.metadataEditor=document.querySelector('[data-inbox-reply-form] textarea');window.metadataScroll=document.querySelector('[data-inbox-scroll]');window.metadataEditor.setSelectionRange(2,4);const filler=document.createElement('div');filler.style.height='1800px';filler.setAttribute('aria-hidden','true');window.metadataScroll.appendChild(filler);window.metadataScroll.scrollTop=247;window.metadataTop=window.metadataScroll.scrollTop;window.metadataSwaps=0;document.addEventListener('htmx:afterSwap',event=>{if(event.detail.target?.id==='inbox-message-header')window.metadataSwaps++;});`);
+            for (const route of routes) {
+                page.delays.set(route,250);
+                const selector=`#inbox-message-header [hx-post="${route}"]`;
+                // Dispatch the real button click through HTMX. The menu is
+                // normally hidden; removing x-show avoids testing its toggle.
+                await page.evaluate(`document.querySelector(${JSON.stringify(selector)}).parentElement.style.display='block'`);
+                const before=await page.evaluate('window.metadataSwaps');
+                await page.click(selector);
+                await page.wait(`document.querySelector('#inbox-message-header-pending').classList.contains('htmx-request')`,'metadata pending indicator');
+                await page.evaluate(`window.metadataEditor.focus();window.metadataEditor.setSelectionRange(2,4)`);
+                await page.wait(`window.metadataSwaps>${before}`,'metadata header response');
+                assert(await page.evaluate(`document.querySelector('[data-inbox-reply-form] textarea')===window.metadataEditor`),'Metadata must keep the same composer DOM node');
+                assert(await page.evaluate(`document.activeElement===window.metadataEditor`),'Metadata response preserves composer focus');
+                assert.equal(await page.evaluate('window.metadataEditor.value'),'未保存的回覆保留');
+                assert.deepEqual(await page.evaluate('[window.metadataEditor.selectionStart,window.metadataEditor.selectionEnd]'),[2,4]);
+                assert(await page.evaluate(`document.querySelector('[data-inbox-scroll]')===window.metadataScroll`));
+                assert.equal(await page.evaluate('window.metadataScroll.scrollTop'),await page.evaluate('window.metadataTop'));
+            }
+            for (const failure of [409,500,0]) {
+                const route=routes[0];page.failures.set(route,failure);page.delays.delete(route);
+                const before=await page.evaluate('window.metadataSwaps');
+                await page.evaluate(`(() => {const button=document.querySelector('#inbox-message-header [hx-post="'+${JSON.stringify(route)}+'"]');button.parentElement.style.display='block';button.click();})()`);
+                await page.wait(`Boolean(document.querySelector('[data-inbox-request-error]'))`,'metadata failure warning');
+                assert.equal(await page.evaluate('window.metadataSwaps'),before);
+                assert.equal(await page.evaluate('window.metadataEditor.value'),'未保存的回覆保留');
+                await page.evaluate(`document.querySelector('[data-inbox-request-error]').remove()`);
+                page.failures.delete(route);
+            }
+            assert.equal(page.posts.filter(post=>/reply|send/.test(post.route)).length,0);
+            await page.clean();
+            process.stdout.write(`PASS metadata header preserves actual composer/focus/selection/scroll with delayed and 409/500/offline responses at ${width}\n`);
+        } finally {await page.close();}
+    }
+}
+
 async function immediateListControlScenario(browser) {
     for (const negative of [false,true]) {
         const withoutImmediate=html=>html.replaceAll(' hx-swap="innerHTML settle:0ms"','');
@@ -558,6 +604,7 @@ async function main() {
         await browser.command('Browser.getVersion',{},undefined,30000);
         const failures=[];
         async function run(label,operation) {
+            if (args.includes('--scenario') && value('--scenario') !== label) return;
             try { await operation(); } catch (error) {
                 const failure=label+': '+error.stack;failures.push(failure);process.stderr.write('SCENARIO FAILED '+failure+'\n');
             }
@@ -566,6 +613,7 @@ async function main() {
             await run(`layout ${width}x${height}`,()=>scenario(browser,width,height,collapsed));
         }
         await run('mixedInteractionScenario',()=>mixedInteractionScenario(browser));
+        await run('metadataPreservesComposerScenario',()=>metadataPreservesComposerScenario(browser));
         await run('immediateListControlScenario',()=>immediateListControlScenario(browser));
         await run('filteringScenario',()=>filteringScenario(browser));
         await run('paginatedMutationRefreshScenario',()=>paginatedMutationRefreshScenario(browser));

@@ -107,6 +107,44 @@ def _reply_content(reply):
     return reply
 
 
+def _unprojected_acceptance(target):
+    """Expose receipt status, never raw body, while saved history is pending."""
+    from django.db.models import Exists, OuterRef
+
+    from .canonical_access import read_connection
+    from .models import ConversationMessage
+
+    connection, archived = read_connection(target.social_account)
+    if archived:
+        return None
+    projected = ConversationMessage.objects.filter(
+        workspace_id=target.workspace_id,
+        social_account_id=target.social_account_id,
+        platform=target.platform,
+        platform_message_id=OuterRef("platform_reply_id"),
+        direction="outbound",
+    )
+    receipt = (
+        target.composer_replies.filter(
+            status="sent",
+            sent_at__isnull=False,
+            not_sent_verified=False,
+            inbox_message__workspace_id=target.workspace_id,
+            inbox_message__social_account_id=target.social_account_id,
+            account_platform_id=target.social_account.account_platform_id,
+            recipient_id=target.peer_id,
+            platform_conversation_id=target.platform_conversation_id,
+            connection_generation=connection.generation if connection else None,
+        )
+        .exclude(platform_reply_id="")
+        .annotate(has_projection=Exists(projected))
+        .filter(has_projection=False)
+        .order_by("-sent_at", "-pk")
+        .first()
+    )
+    return {"id": str(receipt.pk), "status": "provider_accepted"} if receipt else None
+
+
 def _panel_context(request, workspace, result, *, observation_token=None):
     from .conversation_composer import composer_context, session_read_authorization
 
@@ -184,6 +222,7 @@ def _panel_context(request, workspace, result, *, observation_token=None):
         can_save_draft=can_save,
         send_availability=availability,
         pinned_receipt=active if active and active.status != "draft" else None,
+        unprojected_acceptance=_unprojected_acceptance(target),
         **pending_context,
         can_review_delivery=all(
             permissions.get(key) for key in ("use_inbox", "manage_workspace_settings", "reply_from_inbox")
@@ -298,11 +337,13 @@ def detail(request, workspace_id, conversation_id):
     workspace = _get_workspace(request, workspace_id)
     reader = _reader()
     try:
-        result = reader.read_conversation(
+        from .saved_reads import read_detail
+
+        result = read_detail(
             reader.session_read_scope(request.user, workspace.pk),
             conversation_id,
             cursor=request.GET.get("cursor") or None,
-        )
+        )["data"]
         if request.GET.get("fragment") == "history":
             return render(
                 request,

@@ -688,6 +688,7 @@ Rate-limit responses (`429`) include `Retry-After`, `X-RateLimit-Limit`, and `X-
 | `POST` | `/media` | Upload a media file (multipart) | `upload_media` |
 | `GET` | `/media/{media_id}` | Retrieve a media asset | — |
 | `GET` | `/media` | List media assets (filter, paginate) | — |
+| `GET` | `/inbox/saved` | Saved All Types list shared with the UI; server selects sources | `use_inbox` |
 | `GET` | `/inbox` | List inbox messages (filter by status/type/account, paginate) | `use_inbox` |
 | `GET` | `/inbox/{message_id}` | Read one inbox message with its reply thread | `use_inbox` |
 | `POST` | `/inbox/{message_id}/replies` | Draft a reply (set `send: true` to deliver it now) | `use_inbox` (+ `reply_from_inbox` to send) |
@@ -718,6 +719,7 @@ The MCP server lives at `POST {APP_URL}/api/v1/mcp` and speaks JSON-RPC 2.0 over
 | `upload_media` | Upload a small base64-encoded file (≤ 1 MB raw). For larger files, use REST `POST /media`. | `upload_media` |
 | `get_account_analytics` | Channel analytics over a rolling 7–90 day window | `view_analytics` |
 | `get_post_analytics` | Per-platform metrics for a single post (safe for polling drafts) | `view_analytics` |
+| `list_inbox` | Saved All Types list shared with the UI (canonical reads rollout); no caller source choice | `use_inbox` |
 | `list_inbox_messages` | List inbox items (comments, mentions, DMs, reviews) with their reply threads | `use_inbox` |
 | `get_inbox_message` | Retrieve one inbox message and its reply thread | `use_inbox` |
 | `create_reply_draft` | Draft a reply to an inbox message (saved, not sent) | `use_inbox` |
@@ -796,3 +798,41 @@ To report a security vulnerability, see [SECURITY.md](SECURITY.md). Do not open 
 ## License
 
 [AGPL-3.0](LICENSE) - see LICENSE for details.
+
+### Saved inbox list
+
+With the existing canonical-read rollout enabled, `GET /api/v1/inbox/saved/`
+and MCP `list_inbox` use the same application service and projected rows as the
+Social Inbox UI. The default is All Types. Filters are `domain`, `account`,
+`platform`, `q`, `status`, `workflow`, and `view`; pagination uses `cursor` and
+`limit` (1–100). Existing source-specific inbox endpoints and tools remain
+compatible. This list performs no provider fetch or read acknowledgement.
+Draft/send/status intent adapters are not supplied by this list endpoint.
+
+The existing inbox worker also retries missing outgoing history projections
+from saved sent DM receipts in bounded batches of 100. It uses the original
+provider message ID and send timestamp, never posts again, and retains failures
+for the next cycle. It does not restore compacted content or overwrite an
+existing native observation, including withdrawal evidence. Uncertain receipts
+remain uncertain and are not repaired as accepted sends. This retry is not a
+freshness guarantee; a stopped worker or a held account can still delay history.
+
+The saved action facade adds `read_inbox`, `save_inbox_draft`,
+`send_inbox_reply`, and `get_inbox_send_status`. REST equivalents are
+`GET /inbox/saved/targets/{target_id}` and `POST /inbox/saved/draft`, `/send`,
+and `/status`. Read returns actual saved context and an opaque `reference`.
+Pass that reference with the requested body and optional `quote_target_id`.
+Keep the returned reference after saving. Reusing it sends the same action;
+a new message requires a fresh explicit conversation read. Saving does not
+renew the observed history proof. The status read reports acceptance separately
+from delivery and can look up the original receipt after the write reference
+expires, under current account and inbox permissions.
+
+The facade resolves canonical conversations and legacy/public targets on the
+server. Legacy drafts reuse existing reply rows and current permissions. Public
+sends commit an unknown marker before transport; ambiguous outcomes remain
+held across old entry points. Native quotes remain available through canonical
+conversation controls; public adapters do not gain an invented quote route.
+Historical draft adoption continues through existing composer controls.
+Per-account reader/writer retirement and real platform coverage remain separate
+acceptance gates.

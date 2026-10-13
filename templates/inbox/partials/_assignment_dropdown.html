@@ -18,8 +18,8 @@
         {% if message.assigned_to %}
         <button hx-post="{% url 'inbox:assign' workspace_id=workspace.id message_id=message.id %}"
                 hx-vals='{"assigned_to": ""}'
-                hx-target="#inbox-detail-panel"
-                hx-swap="innerHTML"
+                hx-target="#inbox-message-header"
+                hx-swap="outerHTML"
                 @click="assignOpen = false"
                 class="w-full text-left px-3 py-2 text-[12px] text-stone-500 hover:bg-stone-50 transition-colors flex items-center gap-2">
             <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12"/></svg>
@@ -30,8 +30,8 @@
         {% for membership in team_members %}
         <button hx-post="{% url 'inbox:assign' workspace_id=workspace.id message_id=message.id %}"
                 hx-vals='{"assigned_to": "{{ membership.user.id }}"}'
-                hx-target="#inbox-detail-panel"
-                hx-swap="innerHTML"
+                hx-target="#inbox-message-header"
+                hx-swap="outerHTML"
                 @click="assignOpen = false"
                 class="w-full text-left px-3 py-2 text-[12px] text-stone-700 hover:bg-stone-50 transition-colors flex items-center gap-2 {% if message.assigned_to and message.assigned_to.id == membership.user.id %}font-semibold bg-stone-50{% endif %}">
             <div class="w-5 h-5 rounded-full flex items-center justify-center text-[9px] font-bold text-white flex-shrink-0" style="background: var(--accent-indigo);">

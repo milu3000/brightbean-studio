@@ -11,67 +11,7 @@
         <p class="whitespace-pre-wrap mt-2">{{ unsaved_draft_body }}</p>
     </details>
     {% endif %}
-    <!-- Message header -->
-    <div class="px-5 py-4 border-b border-stone-100 flex-shrink-0">
-        <div class="flex items-start justify-between gap-4">
-            <div class="flex items-center gap-3 min-w-0">
-                {% if message.sender_avatar_url %}
-                <img src="{{ message.sender_avatar_url }}" alt="" class="w-10 h-10 rounded-full object-cover flex-shrink-0">
-                {% else %}
-                <div class="w-10 h-10 rounded-full flex items-center justify-center text-sm font-bold text-stone-500 flex-shrink-0" style="background: var(--surface-2);">
-                    {{ sender.label|make_list|first|upper }}
-                </div>
-                {% endif %}
-                <div class="min-w-0">
-                    <div class="flex items-center gap-2">
-                        <h2 class="text-sm font-semibold text-stone-900">{% if conversation_view %}{{ message.type_display }} · {% endif %}{{ sender.label }}</h2>
-                        {% if sender.handle and sender.name %}
-                        <span class="text-[12px] text-stone-400">@{{ sender.handle }}</span>
-                        {% elif sender.native_id and not sender.name and not sender.handle %}
-                        <span class="text-[12px] text-stone-400">ID: {{ sender.native_id }}</span>
-                        {% endif %}
-                    </div>
-                    <div class="flex items-center gap-2 mt-0.5">
-                        <div class="flex items-center gap-1">
-                            {% include "partials/_platform_icon.html" with platform=message.social_account.platform size="sm" %}
-                            <span class="text-[11px] text-stone-500">{{ message.social_account.account_name|default:message.social_account.account_handle }}</span>
-                        </div>
-                        <time datetime="{{ message.received_at|date:'c' }}" class="text-[11px] text-stone-400">{{ message.received_at|date:"N j, Y g:i A" }}</time>
-                    </div>
-                </div>
-            </div>
-            <div class="flex items-center gap-2 flex-shrink-0">
-                <!-- Status dropdown -->
-                <div x-data="{ statusOpen: false }" class="relative">
-                    <button @click="statusOpen = !statusOpen"
-                            class="badge-pill badge-status-{{ message.status }} cursor-pointer hover:opacity-80 transition-opacity">
-                        {{ message.get_status_display }}
-                        <svg class="w-2.5 h-2.5 ml-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24" stroke-width="3"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7"/></svg>
-                    </button>
-                    <div x-show="statusOpen" @click.away="statusOpen = false" x-cloak
-                         x-transition
-                         class="absolute right-0 top-full mt-1 bg-white rounded-lg shadow-lg ring-1 ring-stone-200 py-1 z-50 min-w-[120px]">
-                        {% for value, label in status_choices %}
-                        <button hx-post="{% url 'inbox:change_status' workspace_id=workspace.id message_id=message.id %}"
-                                hx-vals='{"status": "{{ value }}"}'
-                                hx-target="#inbox-detail-panel"
-                                hx-swap="innerHTML"
-                                @click="statusOpen = false"
-                                class="w-full text-left px-3 py-1.5 text-[12px] text-stone-700 hover:bg-stone-50 transition-colors {% if message.status == value %}font-semibold{% endif %}">
-                            {{ label }}
-                        </button>
-                        {% endfor %}
-                    </div>
-                </div>
-
-                <!-- Assignment dropdown -->
-                {% include "inbox/partials/_assignment_dropdown.html" %}
-            </div>
-        </div>
-        {% if conversation_view %}
-        {% if not has_native_thread %}<p class="text-[11px] text-stone-500 mt-1">The conversation could not be matched reliably, so this message is shown on its own.</p>{% endif %}
-        {% endif %}
-    </div>
+    {% include "inbox/partials/_message_header.html" %}
 
     <!-- Message body + thread -->
     <div class="flex-1 overflow-y-auto px-5 py-4" data-inbox-scroll>

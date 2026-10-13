@@ -182,8 +182,11 @@ class InboxSyncEngine:
         and the recurring ``run_inbox_sync_cycle`` background task, so the two
         never diverge.
         """
+        from .accepted_projection import repair_missing_accepted_settlements, repair_missing_sent_replies
         from .sync_scheduler import run_sync_cycle
 
+        repair_missing_accepted_settlements()
+        repair_missing_sent_replies()
         run_sync_cycle()
         self.sync_all()
         self.check_sla()

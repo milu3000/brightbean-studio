@@ -76,4 +76,5 @@
     }
     document.addEventListener('htmx:responseError', showRequestError);
     document.addEventListener('htmx:sendError', showRequestError);
+    document.addEventListener('htmx:timeout', showRequestError);
 })();

@@ -86,6 +86,7 @@ def shell_export(client, owner, tmp_path):
             received_at=owner.clock.now - timedelta(days=index + 1),
         )
     routes, list_routes, history_routes = {}, {}, {}
+    metadata_posts = {}
     feed = reverse("inbox:feed", kwargs={"workspace_id": owner.account.workspace_id})
     detail = reverse(
         "inbox:conversation_detail",
@@ -171,6 +172,19 @@ def shell_export(client, owner, tmp_path):
         assert old_canonical.status_code == 200
         routes[feed + "?shell-negative=legacy"] = old_legacy.content.decode()
         routes[feed + "?shell-negative=duplicate"] = old_canonical.content.decode()
+        for name, values in (("change_status", {"status": "resolved"}), ("assign", {"assigned_to": ""})):
+            url = reverse(
+                "inbox:" + name, kwargs={"workspace_id": owner.account.workspace_id, "message_id": legacy[1].pk}
+            )
+            response = client.post(url, values, HTTP_HX_REQUEST="true")
+            assert response.status_code == 200
+            assert response["HX-Retarget"] == "#inbox-message-header"
+            metadata_posts[url] = {
+                "body": response.content.decode(),
+                "headers": [
+                    {"name": key, "value": response[key]} for key in ("HX-Retarget", "HX-Reswap", "HX-Trigger")
+                ],
+            }
         native.assert_not_called()
         provider.assert_not_called()
     assets = {
@@ -210,6 +224,7 @@ def shell_export(client, owner, tmp_path):
         "firstRows": first_rows,
         "nextRows": next_rows,
         "contentRoutes": {},
+        "htmlPostResponses": metadata_posts,
         "postResponses": {
             reverse(
                 "inbox:native_thread_refresh",

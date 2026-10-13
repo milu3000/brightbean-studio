@@ -334,6 +334,8 @@ def _lock_reply_with_account(reply: InboxReply) -> None:
 def update_reply_draft(reply: InboxReply, *, body: str) -> InboxReply:
     """Edit a draft (or failed) reply's body."""
     _lock_reply_with_account(reply)
+    if reply.legacy_action_nonce and reply.send_generation:
+        raise ReplyStateError("An attempted action cannot change its body. Read its original outcome.")
     if reply.conversation_id:
         raise ReplyStateError("Use the conversation composer revision to edit this draft.")
     from .reply_safety import LEGACY_UNVERIFIED_MESSAGE, UNKNOWN_MESSAGE, is_unresolved_reply
@@ -379,6 +381,20 @@ def send_reply_now(
     """Common UI/REST/MCP boundary; persisted DM enrollment cannot be toggled off."""
     from .dm_send_gate import EnrolledDMSendError, capture_send_snapshot, send_enrolled_dm
 
+    if reply.inbox_message.message_type != "dm":
+        from .dm_send_gate import session_send_authorization
+        from .legacy_intents import send_public_action
+
+        public_authorization = authorization
+        if public_authorization is None and reply.legacy_action_nonce:
+            public_authorization = session_send_authorization(actor)
+        return send_public_action(
+            reply,
+            actor=actor,
+            authorization=public_authorization,
+            automated=automated,
+            dispatch_binding=dispatch_binding,
+        )
     snapshot = capture_send_snapshot(reply)
     try:
         if snapshot is not None:
@@ -427,9 +443,11 @@ def _send_legacy_reply(
     """
     failure: Exception | None = None
     with transaction.atomic():
-        _lock_reply(reply)
+        _lock_reply_with_account(reply)
         message = InboxMessage.objects.select_for_update().get(pk=reply.inbox_message_id)
-        if message.replies.filter(status=InboxReply.Status.UNKNOWN).exclude(pk=reply.pk).exists():
+        from .legacy_intents import public_send_hold
+
+        if public_send_hold(message, exclude_reply_id=reply.pk):
             raise ReplyStateError("Delivery outcome is unknown. Do not retry this incoming message.")
         if reply.dm_send_attempts.filter(outcome="unknown").exists():
             from .dm_send_gate import DMSendUnknownError

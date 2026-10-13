@@ -433,7 +433,7 @@ def test_uncertain_provider_outcomes_hold_entire_chain_and_never_expire(owned, o
     assert DMSendAttempt.objects.count() == 1
 
 
-@pytest.mark.parametrize("phase", ["reply", "attempt", "operation", "commit"])
+@pytest.mark.parametrize("phase", ["reply", "attempt", "commit"])
 def test_post_acceptance_database_failure_preserves_all_durable_unknown_markers(owned, phase):
     operation = claim(owned)
     seen_provider = False
@@ -474,6 +474,34 @@ def test_post_acceptance_database_failure_preserves_all_durable_unknown_markers(
     with patch("apps.inbox.services._dispatch_to_platform") as retry, pytest.raises(REJECTED):
         deliver(owned, operation)
     retry.assert_not_called()
+
+
+def test_operation_bookkeeping_failure_preserves_acceptance_and_repairs_without_dispatch(owned):
+    operation = claim(owned)
+    original = SendOperation.save
+
+    def fail_confirmed(obj, *args, **kwargs):
+        if obj.status == "confirmed":
+            raise DatabaseError("synthetic accepted-operation bookkeeping failure")
+        return original(obj, *args, **kwargs)
+
+    with (
+        patch.object(SendOperation, "save", fail_confirmed),
+        patch(
+            "apps.inbox.services._dispatch_to_platform", return_value="synthetic-accepted-pending-bookkeeping"
+        ) as send,
+    ):
+        pending = deliver(owned, operation)
+    assert send.call_count == 1
+    pending.refresh_from_db()
+    assert pending.status == "outcome_unknown"
+    assert pending.reply.status == "sent" and pending.attempt.outcome == "sent"
+    assert pending.reply.platform_reply_id == "synthetic-accepted-pending-bookkeeping"
+    with patch("apps.inbox.services._dispatch_to_platform") as no_send:
+        assert dispatch.settle_recorded_acceptance(pending.attempt_id)
+        replay = deliver(owned, pending)
+        no_send.assert_not_called()
+    assert replay.status == "confirmed"
 
 
 def test_process_crash_inside_provider_cannot_erase_attempt_or_enable_retry(owned):
