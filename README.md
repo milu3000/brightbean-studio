@@ -891,3 +891,22 @@ content rules; withdrawn/retained content is not exposed. Use a message ID,
 not a conversation ID whose latest message the server would have to guess.
 Legacy/public full-message detail and existing attachment tools retain their
 current contracts. Complete saved text does not mean complete platform history.
+
+Old `InboxReply.id` receipt UUIDs are also accepted by `read_inbox`. The service
+checks their original message, saved conversation and linked projection agree
+within the current workspace/account scope. Conflicting brands or threads return
+`ambiguous_reference`; unavailable accounts remain unavailable. `anchor_receipt`
+contains receipt metadata. When an outgoing projection exists, `anchor_message`
+contains its normal visible content. A missing projection never causes the raw
+receipt body to be substituted or coverage to be declared complete.
+
+For truncated content, follow the item's `next_read`: each entry supplies the
+existing `tool` and complete `arguments`, including the correct message ID.
+Canonical full text points to `read_inbox` with `content: "body"`; attachments
+point to the existing `get_conversation_attachments`; legacy/public details point
+to `get_inbox_message`. No account lookup or source probe is needed. Existing
+attachment responses use `next_cursor`: keep the request's arguments and put that
+value in `cursor` to continue. Root `next_read` similarly supplies ready history,
+undated-history or body continuation requests and retains the page limit.
+These descriptions are guidance, not grants: every follow-up rechecks access.
+The reader never executes the requests automatically or calls the platform.

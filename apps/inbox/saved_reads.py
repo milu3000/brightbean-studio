@@ -189,6 +189,10 @@ def resolve_read_reference(scope, reference):
                 if sources[account_id] != "canonical":
                     continue
             add(value[field])
+    if identifier is not None:
+        receipt_target = _receipt_read_target(scope, identifier)
+        if receipt_target is not None:
+            add(receipt_target)
     # A native legacy DM thread can contain many messages. Resolve once per
     # account, rather than requiring callers to enumerate or select accounts.
     legacy_threads = InboxMessage.objects.filter(message_type="dm", extra__conversation_id=text, **bounds)
@@ -208,3 +212,105 @@ def resolve_read_reference(scope, reference):
     if not candidates:
         raise CanonicalReadError("not_found_or_denied", "This saved conversation or message is unavailable.")
     return next(iter(candidates.values()))
+
+
+def _receipt_read_target(scope, identifier):
+    """Validate an old reply's saved relationships before selecting its thread."""
+    from django.db.models import Q
+
+    from .canonical_reads import CanonicalReadError
+    from .models import ConversationMessage, InboxReply
+    from .presentation import thread_id
+
+    accounts, _ = scope.refresh()
+    receipt = (
+        InboxReply.objects.filter(
+            pk=identifier,
+            inbox_message__workspace_id=scope.workspace_id,
+            inbox_message__social_account__workspace_id=scope.workspace_id,
+            inbox_message__social_account_id__in=accounts.values("pk"),
+        )
+        .values(
+            "inbox_message_id",
+            "inbox_message__social_account_id",
+            "inbox_message__social_account__platform",
+            "platform_reply_id",
+            "conversation_id",
+            "conversation__workspace_id",
+            "conversation__social_account_id",
+            "conversation__platform",
+            "conversation__platform_conversation_id",
+        )
+        .first()
+    )
+    if receipt is None:
+        return None
+
+    def conflict():
+        return CanonicalReadError(
+            "ambiguous_reference", "This saved receipt has conflicting account or thread identities."
+        )
+
+    account_id = receipt["inbox_message__social_account_id"]
+    platform = receipt["inbox_message__social_account__platform"]
+    conversations, native_ids = set(), set()
+    if receipt["conversation_id"]:
+        if (
+            receipt["conversation__workspace_id"],
+            receipt["conversation__social_account_id"],
+            receipt["conversation__platform"],
+        ) != (scope.workspace_id, account_id, platform):
+            raise conflict()
+        conversations.add(receipt["conversation_id"])
+        native_ids.add(receipt["conversation__platform_conversation_id"])
+    linked = list(
+        ConversationMessage.objects.filter(
+            Q(legacy_message_id=receipt["inbox_message_id"]) | Q(legacy_reply_id=identifier)
+        ).values(
+            "workspace_id",
+            "social_account_id",
+            "platform",
+            "conversation_id",
+            "conversation__workspace_id",
+            "conversation__social_account_id",
+            "conversation__platform",
+            "conversation__platform_conversation_id",
+            "legacy_message_id",
+            "legacy_reply_id",
+            "direction",
+            "platform_message_id",
+        )[:3]
+    )
+    linked_anchor = False
+    for item in linked:
+        if (item["workspace_id"], item["social_account_id"], item["platform"]) != (
+            scope.workspace_id,
+            account_id,
+            platform,
+        ):
+            raise conflict()
+        if item["legacy_reply_id"] == identifier and (
+            item["direction"] != "outbound"
+            or (receipt["platform_reply_id"] and item["platform_message_id"] != receipt["platform_reply_id"])
+        ):
+            raise conflict()
+        if item["conversation_id"]:
+            if (
+                item["conversation__workspace_id"],
+                item["conversation__social_account_id"],
+                item["conversation__platform"],
+            ) != (scope.workspace_id, account_id, platform):
+                raise conflict()
+            conversations.add(item["conversation_id"])
+            native_ids.add(item["conversation__platform_conversation_id"])
+            linked_anchor |= item["legacy_message_id"] == receipt["inbox_message_id"]
+    kind, target = resolve_target(scope, receipt["inbox_message_id"])
+    if kind == "canonical":
+        conversations.add(target)
+    elif conversations:
+        native = thread_id(target)
+        if target.message_type != "dm" or (native and native_ids != {native}) or (not native and not linked_anchor):
+            raise conflict()
+    if len(conversations) > 1:
+        raise conflict()
+    return receipt["inbox_message_id"]

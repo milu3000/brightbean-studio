@@ -96,6 +96,7 @@ def read_inbox(*, key, target_id, request=None, cursor=None, limit=30, content=N
     if before != (sorted(str(pk) for pk in accounts.values_list("pk", flat=True)), grants):
         raise reader.CanonicalReadError("stale_scope", "This saved context changed while reading. Read it again.")
     result["conversation"].pop("composer_observation_token", None)
+    _next_reads(result)
     return result
 
 
@@ -250,7 +251,7 @@ def _read_summary(scope, result, requested_reference):
         account = conversation.social_account
         anchors = list(
             ConversationMessage.objects.filter(
-                match | Q(legacy_message_id=uuid) if uuid else match,
+                match | Q(legacy_message_id=uuid) | Q(legacy_reply_id=uuid) if uuid else match,
                 conversation=conversation,
                 workspace_id=scope.workspace_id,
                 social_account=account,
@@ -296,8 +297,22 @@ def _read_summary(scope, result, requested_reference):
         replies = list({r["id"]: r for item in data["messages"] for r in item["replies"]}.values())
         eligibility = reply_send_availability(message)
         coverage = {"coverage": "unknown", "outbound_coverage": data["outbound_coverage"]}
+    anchor_receipt = None
+    if uuid is not None:
+        anchor_receipt = (
+            InboxReply.objects.filter(
+                pk=uuid, inbox_message__workspace_id=scope.workspace_id, inbox_message__social_account_id=account.pk
+            )
+            .values("id", "inbox_message_id", "status", "platform_reply_id", "sent_at")
+            .first()
+        )
+        if anchor_receipt:
+            anchor_receipt["id"] = str(anchor_receipt["id"])
+            anchor_receipt["message_id"] = str(anchor_receipt.pop("inbox_message_id"))
+            anchor_receipt["sent_at"] = anchor_receipt["sent_at"].isoformat() if anchor_receipt["sent_at"] else None
     return {
         "target_id": result["target_id"],
+        "anchor_receipt": anchor_receipt,
         "anchor_message": anchor_message,
         "account": {
             "id": str(account.pk),
@@ -356,3 +371,51 @@ def _read_body(scope, reference, *, cursor=None):
         "draft": None,
         "reply_status": {"allowed": False, "code": "not_evaluated", "advisory_only": True, "send_authorized": False},
     }
+
+
+def _next_reads(result):
+    """Ready-to-use read requests only; never execute them or infer coverage."""
+
+    def call(tool, **arguments):
+        return {"tool": tool, "arguments": arguments}
+
+    pending = {}
+    data = result.get("conversation", {})
+    history = result.get("history", {})
+    for purpose, field in (("history", "next_cursor"), ("undated_history", "undated_next_cursor")):
+        if history.get(field):
+            pending[purpose] = call(
+                "read_inbox", target_id=result["target_id"], cursor=history[field], limit=data["limit"]
+            )
+    if result.get("content", {}).get("kind") == "body" and result.get("next_cursor"):
+        pending["body"] = call(
+            "read_inbox", target_id=result["target_id"], content="body", cursor=result["next_cursor"]
+        )
+    result["next_read"] = pending
+    items = data.get("messages", []) + data.get("undated_messages", [])
+    if result.get("anchor_message"):
+        items = [result["anchor_message"], *items]
+    for item in items:
+        requests = {}
+        canonical = item.get("id_namespace") == "canonical_message"
+        if item.get("body_truncated"):
+            requests["body"] = (
+                call("read_inbox", target_id=item["id"], content="body")
+                if canonical
+                else call("get_inbox_message", message_id=item["id"])
+            )
+        if item.get("attachments_truncated"):
+            requests["attachments"] = (
+                call("get_conversation_attachments", message_id=item["id"], limit=3)
+                if canonical
+                else call("get_inbox_message", message_id=item["id"])
+            )
+        if item.get("replies_truncated") and not canonical:
+            requests["replies"] = call("get_inbox_message", message_id=item["id"])
+        item["next_read"] = requests
+    receipt = result.get("anchor_receipt")
+    if receipt:
+        if data.get("source") == "canonical":
+            receipt["next_read"] = (result.get("anchor_message") or {}).get("next_read", {})
+        else:
+            receipt["next_read"] = {"detail": call("get_inbox_message", message_id=receipt["message_id"])}
