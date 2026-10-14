@@ -872,3 +872,22 @@ Existing rollout flags and current account permissions still apply.
 
 This updates the existing facade, not its older source-specific compatibility
 tools. REST's existing `/inbox/saved/targets/{UUID}` route remains UUID-based.
+
+If a canonical incoming or outgoing item's `body_truncated` is true, request its
+saved full text through the **same** MCP tool, without a platform read:
+
+```json
+{"target_id": "the-message-id", "content": "body"}
+```
+
+This returns `content.body`, `content.body_offset`, and `next_cursor`. Text is
+bounded to 4000 characters per response. Start this full-text stream at offset
+zero; do not append the earlier preview. Continue with the same `target_id`,
+`content: "body"` and the returned `cursor` until `next_cursor` is null.
+History `limit` does not change the fixed text-page size. This mode returns no
+action reference and does not refresh an earlier send proof. Content changes,
+message switches, expiry and revoked scope remain subject to the existing saved
+content rules; withdrawn/retained content is not exposed. Use a message ID,
+not a conversation ID whose latest message the server would have to guess.
+Legacy/public full-message detail and existing attachment tools retain their
+current contracts. Complete saved text does not mean complete platform history.

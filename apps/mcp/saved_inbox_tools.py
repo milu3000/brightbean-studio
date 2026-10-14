@@ -83,7 +83,7 @@ for name, schema, handler, description in (
         "read_inbox",
         InboxReadInput,
         _read_intent,
-        "Read a conversation in one call using target_id: a saved conversation/message UUID (incoming or outgoing) or exact native ID. Returns brand account, original thread, saved history, existing replies, advisory reply status and explicit coverage limits. No account lookup or source selection needed. Cross-account ambiguity returns an error. Use cursor only for older saved content. No platform fetch, read acknowledgement or send.",
+        "Read a conversation in one call using target_id: a saved conversation/message UUID (incoming or outgoing) or exact native ID. Returns brand account, original thread, saved history, existing replies, advisory reply status and explicit coverage limits. No account lookup or source selection needed. Cross-account ambiguity returns an error. Use cursor for older saved history. For truncated full text, pass that message ID with content=body, then use returned next_cursor with the same arguments. No platform fetch, read acknowledgement or send.",
     ),
     (
         "save_inbox_draft",

@@ -1,4 +1,4 @@
-"""Extra integration characterization; outbound full-text MCP is a known gap."""
+"""Extra saved-content and history integration characterization."""
 
 import json
 from unittest.mock import patch
@@ -28,7 +28,7 @@ def context_for(key):
 
 
 @pytest.mark.parametrize("direction", ["inbound", "outbound"])
-def test_long_text_is_saved_and_readable_but_outbound_mcp_followup_is_a_known_gap(intent_context, direction):
+def test_long_text_service_and_legacy_detail_tool_keep_their_existing_contracts(intent_context, direction):
     c, _client, key = intent_context
     body = "開始" + "Synthetic long body. " * 300 + "結尾"
     message = row(
@@ -56,9 +56,8 @@ def test_long_text_is_saved_and_readable_but_outbound_mcp_followup_is_a_known_ga
                 break
         assert cursor is None and "".join(chunks) == body
         if direction == "outbound":
-            # Characterize the actual acceptance blocker, not a passing claim:
-            # the DB/REST service can continue, this MCP facade has no body
-            # continuation, and its old message-detail tool rejects outbound.
+            # The legacy message-detail contract remains incoming-only; the
+            # common read_inbox body mode supplies the new bounded continuation.
             with pytest.raises(JsonRpcError):
                 _get_inbox_message({"message_id": str(message.pk)}, context_for(key))
         send.assert_not_called()

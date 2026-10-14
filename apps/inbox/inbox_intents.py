@@ -4,6 +4,7 @@ The caller retains an opaque action reference. The same nonce is replayed;
 claiming, ownership checks and dispatch still belong to the existing composer.
 """
 
+from typing import Literal
 from uuid import UUID
 
 from django.core import signing
@@ -23,6 +24,10 @@ class InboxReadInput(BaseModel):
         min_length=1,
         max_length=1024,
         description="One saved conversation/message UUID or exact native ID. No account lookup required.",
+    )
+    content: Literal["body"] | None = Field(
+        default=None,
+        description="Request bounded full text for a message ID. Returns next_cursor for more text; never reads retained content.",
     )
     cursor: str | None = Field(default=None, max_length=4096)
     limit: int = Field(default=30, ge=1, le=50)
@@ -77,11 +82,16 @@ def _decode(scope, reference, *, max_age=3600):
         ) from exc
 
 
-def read_inbox(*, key, target_id, request=None, cursor=None, limit=30):
+def read_inbox(*, key, target_id, request=None, cursor=None, limit=30, content=None):
     scope = reader.key_read_scope(key, request)
     accounts, grants = scope.refresh()
     before = (sorted(str(pk) for pk in accounts.values_list("pk", flat=True)), grants)
-    result = _read_inbox(scope, key=key, target_id=target_id, request=request, cursor=cursor, limit=limit)
+    if content == "body":
+        result = _read_body(scope, target_id, cursor=cursor)
+    elif content is None:
+        result = _read_inbox(scope, key=key, target_id=target_id, request=request, cursor=cursor, limit=limit)
+    else:
+        raise reader.CanonicalReadError("invalid_content", "Only bounded message body content can be requested.")
     accounts, grants = scope.refresh()
     if before != (sorted(str(pk) for pk in accounts.values_list("pk", flat=True)), grants):
         raise reader.CanonicalReadError("stale_scope", "This saved context changed while reading. Read it again.")
@@ -312,4 +322,37 @@ def _read_summary(scope, result, requested_reference):
                 "Individual bodies and attachments may be previews; their truncation flags remain authoritative.",
             ],
         },
+    }
+
+
+def _read_body(scope, reference, *, cursor=None):
+    """Continue default visible text through the same scoped read entry point."""
+    target_id = saved_reads.resolve_read_reference(scope, reference)
+    detail = saved_reads.read_detail(scope, target_id, limit=1)
+    overview = _read_summary(scope, detail, str(reference))
+    message = overview["anchor_message"]
+    if detail["kind"] != "canonical":
+        raise reader.CanonicalReadError(
+            "content_unavailable",
+            "This legacy/public item retains its existing get_inbox_message full-detail contract.",
+        )
+    if message is None:
+        raise reader.CanonicalReadError(
+            "message_reference_required",
+            "Use the canonical message ID returned by read_inbox to read its full text.",
+        )
+    body = reader.read_message_body(scope, message["id"], cursor=cursor, limit=4000)
+    if body["conversation_id"] != detail["target_id"]:
+        raise reader.CanonicalReadError("stale_scope", "The message changed while reading; read it again.")
+    return {
+        "target_id": message["id"],
+        "account": overview["account"],
+        "thread": {"id": body["conversation_id"], "domain": "dm"},
+        "conversation": {},
+        "content": {"kind": "body", **body},
+        "next_cursor": body["next_cursor"],
+        "history": {"complete": False, "coverage": overview["history"]["coverage"]},
+        "reference": None,
+        "draft": None,
+        "reply_status": {"allowed": False, "code": "not_evaluated", "advisory_only": True, "send_authorized": False},
     }
