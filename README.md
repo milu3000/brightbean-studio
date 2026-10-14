@@ -836,3 +836,39 @@ conversation controls; public adapters do not gain an invented quote route.
 Historical draft adoption continues through existing composer controls.
 Per-account reader/writer retirement and real platform coverage remain separate
 acceptance gates.
+
+### Read one saved conversation with MCP
+
+Use the existing `read_inbox` tool with one required argument:
+
+```json
+{"target_id": "a-known-conversation-or-message-id"}
+```
+
+The reference may be a saved conversation UUID, an incoming or outgoing message
+UUID, an original inbox UUID, or an exact native ID already saved for this key.
+No preliminary account lookup, ID-conversion tool, source selection or proof
+parameters are required. `list_inbox` is optional when you do not already have an
+ID. An ID shared by multiple authorized brands/threads returns
+`ambiguous_reference`; use the exact saved UUID instead of guessing an account.
+
+The result includes `account`, `thread`, `anchor_message` when the reference
+identifies a message, `existing_replies`, advisory `reply_status`, and `history`.
+The compatible `conversation` field retains the bounded saved timeline; native
+outgoing appears there. Canonical receipt summaries contain metadata, while
+message bodies come from the canonical content projection. Empty receipt lists
+do not prove nobody replied on the platform. Older anchors remain available even
+when the latest page contains newer activity.
+
+Only request older saved content when needed, using the same reference and
+`history.next_cursor` (or `history.undated_next_cursor` for undated content) as
+`cursor`. `limit` is optional, defaults to 30 and is capped at 50. Pages and reply
+summaries are bounded; body/attachment truncation flags remain authoritative.
+No cursor means no more saved rows in that lane, not complete platform history.
+Legacy history only covers saved BrightBean replies; unknown coverage stays
+unknown. `reply_status` is advisory and never grants permission or authorizes a
+send. Reading does not fetch the platform, mark read, change workflow or send.
+Existing rollout flags and current account permissions still apply.
+
+This updates the existing facade, not its older source-specific compatibility
+tools. REST's existing `/inbox/saved/targets/{UUID}` route remains UUID-based.

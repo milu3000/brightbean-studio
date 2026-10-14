@@ -19,7 +19,11 @@ SALT = "inbox.intent-action.v1"
 
 class InboxReadInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    target_id: UUID
+    target_id: str = Field(
+        min_length=1,
+        max_length=1024,
+        description="One saved conversation/message UUID or exact native ID. No account lookup required.",
+    )
     cursor: str | None = Field(default=None, max_length=4096)
     limit: int = Field(default=30, ge=1, le=50)
 
@@ -75,10 +79,24 @@ def _decode(scope, reference, *, max_age=3600):
 
 def read_inbox(*, key, target_id, request=None, cursor=None, limit=30):
     scope = reader.key_read_scope(key, request)
+    accounts, grants = scope.refresh()
+    before = (sorted(str(pk) for pk in accounts.values_list("pk", flat=True)), grants)
+    result = _read_inbox(scope, key=key, target_id=target_id, request=request, cursor=cursor, limit=limit)
+    accounts, grants = scope.refresh()
+    if before != (sorted(str(pk) for pk in accounts.values_list("pk", flat=True)), grants):
+        raise reader.CanonicalReadError("stale_scope", "This saved context changed while reading. Read it again.")
+    result["conversation"].pop("composer_observation_token", None)
+    return result
+
+
+def _read_inbox(scope, *, key, target_id, request=None, cursor=None, limit=30):
+    requested_reference = str(target_id)
+    target_id = saved_reads.resolve_read_reference(scope, target_id)
     result = saved_reads.read_detail(scope, target_id, cursor=cursor, limit=limit)
+    summary = _read_summary(scope, result, requested_reference)
     result["data"].pop("read_ack_token", None)
     if cursor:
-        return {"conversation": result["data"], "reference": None, "draft": None}
+        return {**summary, "conversation": result["data"], "reference": None, "draft": None}
     if result["kind"] == "legacy":
         from .legacy_intents import context_digest, identity, read_action
 
@@ -96,12 +114,14 @@ def read_inbox(*, key, target_id, request=None, cursor=None, limit=30):
             salt=SALT,
             compress=True,
         )
-        return {"conversation": result["data"], "reference": reference, "draft": draft}
+        return {**summary, "conversation": result["data"], "reference": reference, "draft": draft}
     # The caller sees actual newest history with the proof. Mutations never
     # invoke this read to mint a fresh observation on the caller's behalf.
     observation = result["data"]["composer_observation_token"]
     state = read_composer(key=key, conversation_id=result["target_id"], request=request, observation_token=observation)
+    summary["reply_status"] = {**state["send_availability"], "advisory_only": True, "send_authorized": False}
     return {
+        **summary,
         "conversation": result["data"],
         "draft": state["active_reply"],
         "reference": _reference(scope, state, observation) if state["enabled"] and state["scope_token"] else None,
@@ -196,4 +216,100 @@ def inbox_send_status(*, key, reference, request=None):
     return {
         "receipt": result,
         "transport_state": "provider_accepted" if reply.status == "sent" and reply.platform_reply_id else reply.status,
+    }
+
+
+def _read_summary(scope, result, requested_reference):
+    """Common read-only overview; reply eligibility is never send authorization."""
+    from django.db.models import Q
+
+    from .models import ConversationMessage, InboxConversation, InboxReply
+    from .reply_safety import reply_send_availability
+
+    data = result["data"]
+    match = Q(platform_message_id=requested_reference)
+    uuid: UUID | None
+    try:
+        uuid = UUID(requested_reference)
+        match |= Q(pk=uuid)
+    except ValueError:
+        uuid = None
+    anchor_message = None
+    if result["kind"] == "canonical":
+        conversation = InboxConversation.objects.select_related("social_account").get(pk=result["target_id"])
+        account = conversation.social_account
+        anchors = list(
+            ConversationMessage.objects.filter(
+                match | Q(legacy_message_id=uuid) if uuid else match,
+                conversation=conversation,
+                workspace_id=scope.workspace_id,
+                social_account=account,
+            ).select_related("conversation")[:2]
+        )
+        if len(anchors) == 1:
+            anchor_message = reader.project_message(anchors[0])
+        thread = data["conversation"]
+        replies = list(
+            InboxReply.objects.filter(
+                Q(conversation=conversation)
+                | Q(conversation_message__conversation=conversation)
+                | Q(
+                    inbox_message_id__in=ConversationMessage.objects.filter(
+                        conversation=conversation, social_account=account
+                    ).values("legacy_message_id")
+                ),
+                inbox_message__workspace_id=scope.workspace_id,
+                inbox_message__social_account_id=account.pk,
+            )
+            .order_by("-created_at", "-pk")
+            .values("id", "status", "platform_reply_id", "sent_at")[:21]
+        )
+        for reply in replies:
+            reply["id"] = str(reply["id"])
+            reply["sent_at"] = reply["sent_at"].isoformat() if reply["sent_at"] else None
+        eligibility = {
+            "allowed": False,
+            "code": "not_evaluated",
+            "reason": "Eligibility is not evaluated on older pages; sending rechecks current permissions.",
+        }
+        coverage = data["coverage"]
+    else:
+        _kind, message = saved_reads.resolve_target(scope, result["target_id"])
+        account = message.social_account
+        from .presentation import stored_thread_messages
+        from .thread_reads import _bounded_message
+
+        anchors = list(stored_thread_messages(message).filter(match).select_related("social_account")[:2])
+        if len(anchors) == 1:
+            anchor_message = _bounded_message(anchors[0])
+        thread = {"id": result["target_id"], "domain": message.message_type, "grouping": data["grouping"]}
+        replies = list({r["id"]: r for item in data["messages"] for r in item["replies"]}.values())
+        eligibility = reply_send_availability(message)
+        coverage = {"coverage": "unknown", "outbound_coverage": data["outbound_coverage"]}
+    return {
+        "target_id": result["target_id"],
+        "anchor_message": anchor_message,
+        "account": {
+            "id": str(account.pk),
+            "name": account.account_name,
+            "handle": account.account_handle,
+            "platform": account.platform,
+        },
+        "thread": thread,
+        "existing_replies": replies[:20],
+        "existing_replies_truncated": len(replies) > 20
+        or (result["kind"] == "legacy" and bool(data["next_cursor"]))
+        or any(item.get("replies_truncated") for item in data["messages"]),
+        "reply_status": {**eligibility, "advisory_only": True, "send_authorized": False},
+        "history": {
+            "complete": False,
+            "coverage": coverage,
+            "next_cursor": data["next_cursor"],
+            "undated_next_cursor": data.get("undated_next_cursor"),
+            "limitations": [
+                "Saved authorized history only; missing outgoing does not prove unanswered.",
+                "More saved content requires the returned cursor; platform history may remain incomplete.",
+                "Individual bodies and attachments may be previews; their truncation flags remain authoritative.",
+            ],
+        },
     }

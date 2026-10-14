@@ -125,3 +125,86 @@ def read_detail(scope, target_id, *, cursor=None, limit=30):
     ):
         raise reader.CanonicalReadError("stale_scope", "This saved target changed while reading.")
     return {"kind": kind, "target_id": str(target.pk), "data": result}
+
+
+def resolve_read_reference(scope, reference):
+    """Resolve one scoped saved UUID or native ID; never probe a provider."""
+    from django.db.models import Q
+
+    from .canonical_reads import CanonicalReadError
+    from .models import ConversationMessage, InboxConversation, InboxMessage
+    from .presentation import stored_thread_messages
+
+    text = str(reference)
+    if not text or len(text) > 1024 or any(ord(c) < 33 or ord(c) == 127 for c in text):
+        raise CanonicalReadError("invalid_reference", "Use one saved conversation or message ID.")
+    allowed, _ = scope.refresh()
+    bounds = {
+        "workspace_id": scope.workspace_id,
+        "social_account__workspace_id": scope.workspace_id,
+        "social_account_id__in": allowed.values("pk"),
+    }
+    try:
+        identifier = UUID(text)
+    except ValueError:
+        identifier = None
+    candidates = {}
+    sources = {}
+
+    def add(target_id):
+        kind, target = resolve_target(scope, target_id)
+        if kind == "canonical":
+            group = (kind, str(target))
+        else:
+            anchor = stored_thread_messages(target).order_by("created_at", "pk").values_list("pk", flat=True).first()
+            group = (kind, str(target.social_account_id), str(anchor))
+        candidates.setdefault(group, target_id)
+
+    conv_filter = Q(platform_conversation_id=text)
+    canonical_filter = Q(platform_message_id=text)
+    legacy_filter = Q(platform_message_id=text)
+    if identifier:
+        conv_filter |= Q(pk=identifier)
+        canonical_filter |= Q(pk=identifier)
+        legacy_filter |= Q(pk=identifier)
+    for model, query, field in (
+        (InboxConversation, conv_filter, "pk"),
+        (ConversationMessage, canonical_filter & Q(conversation__isnull=False), "conversation_id"),
+        (InboxMessage, legacy_filter, "pk"),
+    ):
+        matches = list(
+            model.objects.filter(query, **bounds).order_by().values("pk", "social_account_id", field).distinct()[:51]
+        )
+        if len(matches) > 50:
+            raise CanonicalReadError(
+                "ambiguous_reference", "This reference matches too many saved targets. Use its saved UUID."
+            )
+        for value in matches:
+            if model is not InboxMessage and value["pk"] != identifier:
+                from .canonical_compat import selected_inbox_source
+
+                account_id = value["social_account_id"]
+                if account_id not in sources:
+                    sources[account_id] = selected_inbox_source(scope, social_account_ids=[account_id])["source"]
+                if sources[account_id] != "canonical":
+                    continue
+            add(value[field])
+    # A native legacy DM thread can contain many messages. Resolve once per
+    # account, rather than requiring callers to enumerate or select accounts.
+    legacy_threads = InboxMessage.objects.filter(message_type="dm", extra__conversation_id=text, **bounds)
+    accounts = list(legacy_threads.order_by().values_list("social_account_id", flat=True).distinct()[:3])
+    for account_id in accounts:
+        add(
+            legacy_threads.filter(social_account_id=account_id)
+            .order_by("created_at", "pk")
+            .values_list("pk", flat=True)
+            .first()
+        )
+    if len(candidates) > 1 or len(accounts) > 2:
+        raise CanonicalReadError(
+            "ambiguous_reference",
+            "This ID matches multiple saved accounts or threads. Use the exact saved UUID from list_inbox.",
+        )
+    if not candidates:
+        raise CanonicalReadError("not_found_or_denied", "This saved conversation or message is unavailable.")
+    return next(iter(candidates.values()))

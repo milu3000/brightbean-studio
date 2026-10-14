@@ -83,7 +83,7 @@ for name, schema, handler, description in (
         "read_inbox",
         InboxReadInput,
         _read_intent,
-        "Read a saved inbox target from list_inbox or an existing ID; server resolves sources. Newest saved history supplies one opaque action reference. No provider fetch or read acknowledgement.",
+        "Read a conversation in one call using target_id: a saved conversation/message UUID (incoming or outgoing) or exact native ID. Returns brand account, original thread, saved history, existing replies, advisory reply status and explicit coverage limits. No account lookup or source selection needed. Cross-account ambiguity returns an error. Use cursor only for older saved content. No platform fetch, read acknowledgement or send.",
     ),
     (
         "save_inbox_draft",
