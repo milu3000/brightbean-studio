@@ -51,7 +51,7 @@ class InboxStatusRequest(InboxStatusInput, Schema):
 
 
 @router.get("/targets/{target_id}", response=dict, summary="Read a saved inbox target without choosing a source")
-def read_target(request, target_id: UUID, cursor: str | None = None, limit: int = 30):
+def read_target(request, target_id: UUID, cursor: str | None = None, limit: int = Query(30, ge=1, le=50)):
     from .inbox import _require_perm
 
     enforce_http_rate_limits(request, is_write=False)
