@@ -11,6 +11,7 @@ import pytest
 from django.db import connection, transaction
 from django.test import Client
 from django.utils import timezone
+from jsonschema import Draft202012Validator, FormatChecker
 
 from apps.api.auth import VirtualMembership
 from apps.api_keys.services import issue_api_key
@@ -103,7 +104,13 @@ class TestSubscriptions:
         definition = result["events"][0]
         assert definition["name"] == "inbox.dm.received"
         assert definition["inputSchema"]["required"] == ["social_account_id"]
-        assert set(definition["payloadSchema"]["properties"]) == {"message_id", "workspace_id", "social_account_id"}
+        assert set(definition["payloadSchema"]["properties"]) == {
+            "message_id",
+            "workspace_id",
+            "social_account_id",
+            "conversation_id",
+        }
+        assert definition["payloadSchema"]["required"] == ["message_id", "workspace_id", "social_account_id"]
 
     def test_idempotent_subscribe_and_refresh(self, context, params, verify):
         first = events.subscribe(params, context)
@@ -251,6 +258,9 @@ class TestOutbox:
         assert payload["timestamp"] == message.received_at.isoformat().replace("+00:00", "Z")
         assert payload["eventId"] == delivery.event_id
         assert payload["data"]["message_id"] == str(message.pk)
+        Draft202012Validator(events.EVENT_DEFINITION["payloadSchema"], format_checker=FormatChecker()).validate(
+            payload["data"]
+        )
         assert "private text" not in delivery.payload and "Someone" not in delivery.payload
 
     @pytest.mark.parametrize(
