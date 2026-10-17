@@ -343,7 +343,10 @@ def detail(request, workspace_id, conversation_id):
             reader.session_read_scope(request.user, workspace.pk),
             conversation_id,
             cursor=request.GET.get("cursor") or None,
-        )["data"]
+        )
+        if result["kind"] != "canonical":
+            return HttpResponse("Conversation unavailable.", status=404)
+        result = result["data"]
         if request.GET.get("fragment") == "history":
             return render(
                 request,

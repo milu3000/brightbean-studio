@@ -145,10 +145,8 @@ def save_action(scope, message, payload, *, body, author):
             if existing.body != body.strip():
                 raise DMSendGateError("attempted_action", "An attempted action cannot change its body.")
             return existing
-        if (
-            payload.get("reply_revision")
-            and existing.updated_at.isoformat() != payload["reply_revision"]
-            and existing.body != body.strip()
+        if payload.get("reply_revision") is None or (
+            existing.updated_at.isoformat() != payload["reply_revision"] and existing.body != body.strip()
         ):
             raise DMSendGateError("stale_revision", "The saved draft changed. Read it again.")
     if context_digest(current) != payload["context_digest"]:

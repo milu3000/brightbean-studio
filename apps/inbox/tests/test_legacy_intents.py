@@ -247,3 +247,52 @@ def test_legacy_dm_facade_retains_route_checks_and_replays_receipt(public, verif
     else:
         assert first.status_code == again.status_code == 409, (first.content, again.content)
         provider.assert_not_called()
+
+
+@pytest.mark.parametrize("action", ["draft", "send"])
+@pytest.mark.parametrize("same_body", [False, True])
+@pytest.mark.parametrize("reference_stage", ["initial", "saved"])
+def test_stale_reference_cannot_change_or_send_unattempted_draft(public, action, same_body, reference_stage):
+    client, _message, initial = public
+    first = post(client, "draft", initial)
+    assert first.status_code == 200, first.content
+    saved = first.json()["reference"]
+    advanced = post(client, "draft", saved, "Newer synthetic draft")
+    assert advanced.status_code == 200, advanced.content
+    stale = initial if reference_stage == "initial" else saved
+    body = "Newer synthetic draft" if same_body else "Stale synthetic overwrite"
+    with patch("apps.inbox.services._dispatch_to_platform", side_effect=accepted) as provider:
+        response = post(client, action, stale, body)
+    # Existing revision-bearing references retain same-body save semantics.
+    if reference_stage == "saved" and same_body:
+        assert response.status_code == 200, response.content
+    else:
+        assert response.status_code == 409, response.content
+        assert b"The saved draft changed. Read it again." in response.content
+        provider.assert_not_called()
+    reply = InboxReply.objects.get(inbox_message=_message)
+    assert reply.body == "Newer synthetic draft"
+
+
+@pytest.mark.parametrize("action", ["draft", "send"])
+@pytest.mark.parametrize("same_body", [False, True])
+@pytest.mark.parametrize("outcome", ["sent", "unknown"])
+def test_initial_reference_keeps_attempted_action_replay(public, action, same_body, outcome):
+    client, message, reference = public
+
+    def transport(*args, **kwargs):
+        kwargs["before_provider"]()
+        if outcome == "unknown":
+            raise TimeoutError("Synthetic uncertain acceptance")
+        return "synthetic-accepted-replay"
+
+    with patch("apps.inbox.services._dispatch_to_platform", side_effect=transport) as provider:
+        first = post(client, "send", reference)
+        assert first.status_code == (200 if outcome == "sent" else 409)
+        body = "Synthetic public answer" if same_body else "Changed attempted body"
+        replay = post(client, action, reference, body)
+    expected = 200 if same_body and (action == "draft" or outcome == "sent") else 409
+    assert replay.status_code == expected, replay.content
+    assert provider.call_count == 1
+    reply = InboxReply.objects.get(inbox_message=message)
+    assert reply.body == "Synthetic public answer" and reply.status == outcome
