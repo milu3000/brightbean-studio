@@ -555,7 +555,7 @@ for _name, _description, _properties, _required, _handler in (
     ),
     (
         "get_conversation_messages",
-        "Read saved bidirectional DM history including native outgoing. Canonical mode orders known occurrence times with undated rows separate; compatibility observed mode uses first observation order. Coverage stays explicit. Does not authorize a reply.",
+        "For a one-call account/thread/reply-status overview, prefer read_inbox when available; it accepts this conversation ID directly. This compatibility tool reads saved bidirectional DM history including native outgoing. Canonical mode orders known occurrence times with undated rows separate; compatibility observed mode uses first observation order. Coverage stays explicit. Does not authorize a reply.",
         {
             "conversation_id": {"type": "string", "format": "uuid"},
             "social_account_id": {"type": "string", "format": "uuid"},
@@ -583,7 +583,7 @@ for _name, _description, _properties, _required, _handler in (
     ),
     (
         "get_reply_context",
-        "Read bounded bidirectional context for an existing inbound DM inbox ID, including sync gaps and newer observed outgoing. No observed reply does not prove nobody replied on Instagram. Read-only; does not authorize or send.",
+        "For a one-call account/thread/reply-status overview, prefer read_inbox when available; it accepts this message ID directly. This compatibility tool reads bounded bidirectional context for an existing inbound DM inbox ID, including sync gaps and newer observed outgoing. No observed reply does not prove nobody replied on Instagram. Read-only; does not authorize or send.",
         {"message_id": {"type": "string", "format": "uuid"}, "limit": _PAGING["limit"]},
         ["message_id"],
         _get_reply_context,

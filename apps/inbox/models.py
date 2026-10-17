@@ -226,6 +226,10 @@ class InboxReply(models.Model):
         "InboxConversation", on_delete=models.PROTECT, null=True, blank=True, related_name="composer_replies"
     )
     action_nonce = models.UUIDField(null=True, blank=True)
+    # Source-neutral actions on existing legacy/public reply rows. No body copy
+    # or new retention store; the canonical nonce/identity constraint remains.
+    legacy_action_nonce = models.UUIDField(null=True, blank=True, unique=True)
+    legacy_context_digest = models.CharField(max_length=64, blank=True, default="", db_default="")
     account_platform_id = models.CharField(max_length=255, blank=True, default="", db_default="")
     recipient_id = models.CharField(max_length=255, blank=True, default="", db_default="")
     platform_conversation_id = models.CharField(max_length=255, blank=True, default="", db_default="")
@@ -265,6 +269,18 @@ class InboxReply(models.Model):
         ordering = ["created_at"]
         constraints = [
             models.UniqueConstraint(fields=["conversation", "action_nonce"], name="inbox_reply_conversation_nonce"),
+            models.CheckConstraint(
+                condition=(
+                    models.Q(legacy_action_nonce__isnull=True, legacy_context_digest="")
+                    | (
+                        models.Q(
+                            legacy_action_nonce__isnull=False, conversation__isnull=True, action_nonce__isnull=True
+                        )
+                        & ~models.Q(legacy_context_digest="")
+                    )
+                ),
+                name="inbox_reply_legacy_intent",
+            ),
             models.CheckConstraint(
                 condition=(
                     models.Q(

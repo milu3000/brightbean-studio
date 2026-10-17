@@ -385,3 +385,18 @@ def test_role_revocation_during_draft_projection_discards_the_response(session, 
     with patch.object(canonical_views, "_reply_content", side_effect=revoke):
         response = session.get(route(composer))
     assert response.status_code == 404 and b"PRIVATE DRAFT" not in response.content
+
+
+@pytest.mark.parametrize("kind", ["comment", "mention"])
+@pytest.mark.parametrize("history", [False, True])
+@pytest.mark.parametrize("htmx", [False, True])
+def test_canonical_detail_rejects_public_message_uuid(session, composer, kind, history, htmx):
+    from apps.inbox.tests.test_unified_feed import account, legacy
+
+    message = legacy(account(composer, connection_status="connected"), kind=kind)
+    url = reverse(
+        "inbox:conversation_detail",
+        kwargs={"workspace_id": message.workspace_id, "conversation_id": message.pk},
+    )
+    response = session.get(url, {"fragment": "history"} if history else {}, HTTP_HX_REQUEST=str(htmx).lower())
+    assert response.status_code == 404

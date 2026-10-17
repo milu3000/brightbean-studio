@@ -50,6 +50,19 @@ _DEEP_SWEEPS_PER_CYCLE = 1
 
 def _provider_failure_details(exc: Exception) -> tuple[int | None, str]:
     """Return safe diagnostics without logging provider payloads or credentials."""
+    from providers.meta_inbox_paging import InboxPagingError
+
+    from .provider_failures import provider_failure_diagnostics
+
+    if isinstance(exc, InboxPagingError):
+        return None, exc.reason_code
+    if getattr(exc, "platform", None) in {"Facebook", "Instagram (Direct)"}:
+        diagnostic = provider_failure_diagnostics(exc)
+        parts = [diagnostic["category"]]
+        for field in ("code", "subcode"):
+            if diagnostic[field] is not None:
+                parts.append(f"{field}={diagnostic[field]}")
+        return diagnostic["http_status"], ",".join(parts)
     status = getattr(exc, "status_code", None)
     raw_response = getattr(exc, "raw_response", None)
     reasons = google_error_reasons(raw_response) if isinstance(raw_response, dict) else set()
@@ -182,8 +195,11 @@ class InboxSyncEngine:
         and the recurring ``run_inbox_sync_cycle`` background task, so the two
         never diverge.
         """
+        from .accepted_projection import repair_missing_accepted_settlements, repair_missing_sent_replies
         from .sync_scheduler import run_sync_cycle
 
+        repair_missing_accepted_settlements()
+        repair_missing_sent_replies()
         run_sync_cycle()
         self.sync_all()
         self.check_sla()

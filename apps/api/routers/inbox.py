@@ -55,8 +55,10 @@ from apps.inbox.services import (
 router = Router(tags=["inbox"])
 
 from .conversation_composer import router as composer_router  # noqa: E402
+from .saved_inbox import router as saved_router  # noqa: E402
 
 router.add_router("/conversations", composer_router)
+router.add_router("/saved", saved_router)
 
 _LIMIT_DEFAULT = 50
 _LIMIT_MAX = 100

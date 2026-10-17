@@ -5,6 +5,7 @@
     window.inboxUnifiedInstalled = true;
     let selected = '';
     const requests = new WeakMap(), listRequests = new WeakMap(), listIntents = new WeakMap();
+    const listRefreshes = new WeakSet();
     let listGeneration = 0, wantedList = '', pendingHistory = null;
     function shell() { return document.querySelector('[data-unified-shell]'); }
     function highlight() {
@@ -144,6 +145,7 @@
         if (!shell()) return;
         if (event.detail.target && event.detail.target.id === 'inbox-list-content' && event.detail.xhr) {
             listRequests.set(event.detail.xhr, listGeneration);
+            if (event.detail.elt && event.detail.elt.matches('[data-unified-filters]')) listRefreshes.add(event.detail.xhr);
             const restore = event.detail.elt && event.detail.elt.dataset.unifiedHistoryRestore;
             if (restore) trackHistory(event.detail.xhr, restore, true);
         }
@@ -165,6 +167,14 @@
     });
     document.addEventListener('htmx:afterSwap', function (event) {
         highlight();
+        const xhr = event.detail && event.detail.xhr;
+        if (xhr && listRefreshes.has(xhr) && listRequests.get(xhr) === listGeneration &&
+                event.detail.target && event.detail.target.id === 'inbox-list-content') {
+            // Only an accepted refresh can rebase its old-page intent. HTMX has
+            // replaced the URL and list; failures retain the retryable old scope.
+            const form = document.querySelector('[data-unified-filters]');
+            wantedList = form ? listSignature(form, true) : '';
+        }
         if (pendingHistory && pendingHistory.normal && event.detail.xhr === pendingHistory.xhr) {
             document.dispatchEvent(new CustomEvent('htmx:historyRestore', {bubbles:true, detail:{
                 path:pendingHistory.path, cacheMiss:true

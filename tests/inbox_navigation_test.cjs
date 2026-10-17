@@ -157,3 +157,31 @@ test('source-switch unload is allowed for unchanged saved drafts and held for qu
     quote.emit('beforeunload', held);
     assert.equal(held.prevented, true);
 });
+
+test('timeout shows a single delivery warning without replacing draft, quote, focus or scroll', () => {
+    const app = setup();
+    const editor = {value: '尚未保存的回答', selectionStart: 3, selectionEnd: 5};
+    const quote = {value: 'quoted-message'};
+    const scroller = {scrollTop: 247};
+    const element = {}, warnings = [];
+    const panel = {
+        contains: node => node === element,
+        querySelector: () => warnings[0] || null,
+        prepend: warning => warnings.unshift(warning)
+    };
+    app.context.document.querySelector = () => panel;
+    app.context.document.activeElement = editor;
+    app.context.document.createElement = () => ({dataset: {}, setAttribute() {}});
+    for (const name of ['htmx:timeout', 'htmx:sendError', 'htmx:responseError']) {
+        app.emit(name, {detail: {elt: element}});
+        assert.equal(warnings.length, 1, name + ' immediately displays the warning');
+    }
+    assert.equal(warnings.length, 1);
+    assert.match(warnings[0].textContent, /check the reply status before sending again/);
+    assert.equal(app.context.document.activeElement, editor);
+    assert.equal(editor.value, '尚未保存的回答');
+    assert.equal(editor.selectionStart, 3); assert.equal(editor.selectionEnd, 5);
+    assert.equal(quote.value, 'quoted-message'); assert.equal(scroller.scrollTop, 247);
+    app.emit('htmx:timeout', {detail: {elt: {}}});
+    assert.equal(warnings.length, 1, 'a detached old request cannot warn in the new panel');
+});

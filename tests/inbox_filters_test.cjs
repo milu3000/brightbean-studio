@@ -27,6 +27,20 @@ test('clearing removes query and pagination while preserving every unrelated fil
     app.emit('htmx:configRequest', { detail: { elt: app.input, parameters } });
     assert.deepEqual(parameters, { platform: 'facebook', account: ['a', 'b'], assigned: 'person', status: 'open', date_from: '2026-10-01' });
 });
+test('unified mutation refresh drops snapshot pagination but preserves all selected filters', () => {
+    const app = setup();
+    const form = {closest:()=>form,matches:selector=>['[data-canonical-filters]','[data-unified-filters]'].includes(selector)};
+    const parameters = {domain:'comment',q:'coffee',page:3,cursor:'stale-snapshot',platform:'facebook',account:'synthetic-account',status:'unread',view:'mine'};
+    app.emit('htmx:configRequest',{detail:{elt:form,parameters}});
+    assert.deepEqual(parameters,{domain:'comment',q:'coffee',platform:'facebook',account:'synthetic-account',status:'unread',view:'mine'});
+});
+test('non-unified canonical refresh retains its existing cursor contract', () => {
+    const app = setup();
+    const form = {closest:()=>form,matches:selector=>selector==='[data-canonical-filters]'};
+    const parameters = {domain:'dm',cursor:'canonical-cursor',account:'synthetic-account',workflow:'waiting'};
+    app.emit('htmx:configRequest',{detail:{elt:form,parameters}});
+    assert.deepEqual(parameters,{domain:'dm',cursor:'canonical-cursor',account:'synthetic-account',workflow:'waiting'});
+});
 test('typed or pasted values toggle the clear button and duplicate installation adds no handlers', () => {
     const app = setup(''); assert.equal(app.clear.hidden, true);
     app.input.value = 'tea'; app.emit('input', { target: app.input }); assert.equal(app.clear.hidden, false);

@@ -471,6 +471,76 @@ def test_session_route_defaults_to_all_types_and_htmx_retains_one_mixed_list(con
         assert response["Cache-Control"] == "private, no-store"
 
 
+@pytest.mark.parametrize("domain", ["all", "comment"])
+@pytest.mark.parametrize("mutation", ["read", "status", "assignment"])
+def test_legacy_mutation_refresh_requires_a_new_snapshot_after_pagination(context, client, domain, mutation):
+    other = account(context)
+    now = timezone.now()
+    messages = [
+        legacy(
+            other,
+            stamp=now - timedelta(minutes=index),
+            status="unread",
+            assigned_to=context.user,
+            body=f"Synthetic mutation record {index}",
+        )
+        for index in range(35)
+    ]
+    legacy(context.account, body="Synthetic mutation record outside selected account")
+    client.force_login(context.user)
+    url = reverse("inbox:feed", kwargs={"workspace_id": context.account.workspace_id})
+    filters = {"domain": domain, "account": str(other.pk), "q": "Synthetic mutation"}
+    if domain == "comment":
+        filters.update(status="unread", view="mine")
+    initial = client.get(url, filters, HTTP_HX_REQUEST="true")
+    assert initial.status_code == 200
+    page_url = initial.context["unified_next_url"]
+    assert page_url
+    page = client.get(page_url, HTTP_HX_REQUEST="true")
+    assert page.status_code == 200
+    assert [item["id"] for item in page.context["unified_rows"]] == [str(item.pk) for item in messages[30:]]
+    target = messages[-1]
+    kwargs = {"workspace_id": context.account.workspace_id, "message_id": target.pk}
+    with (
+        patch("apps.inbox.native_thread_reads.read_native_thread") as native,
+        patch("apps.inbox.services._dispatch_to_platform") as provider,
+    ):
+        if mutation == "read":
+            response = client.get(reverse("inbox:message_detail", kwargs=kwargs), HTTP_HX_REQUEST="true")
+        elif mutation == "status":
+            response = client.post(
+                reverse("inbox:change_status", kwargs=kwargs), {"status": "resolved"}, HTTP_HX_REQUEST="true"
+            )
+        else:
+            response = client.post(reverse("inbox:assign", kwargs=kwargs), {"assigned_to": ""}, HTTP_HX_REQUEST="true")
+        assert response.status_code == 200
+        assert response["HX-Trigger"] == "inbox:refresh"
+        target.refresh_from_db()
+        if mutation == "assignment":
+            assert target.assigned_to_id is None
+        else:
+            assert target.status == ("open" if mutation == "read" else "resolved")
+
+        # Reusing the visible older-page cursor is the original frontend bug.
+        stale = client.get(page_url, HTTP_HX_REQUEST="true")
+        assert stale.status_code == 409
+        # The fix starts a new snapshot while retaining the exact selected scope.
+        fresh = client.get(url, filters, HTTP_HX_REQUEST="true")
+        assert fresh.status_code == 200
+        assert fresh.context["list_cursor"] == ""
+        assert fresh.context["active_account"] == str(other.pk)
+        assert fresh.context["search_query"] == filters["q"]
+        refreshed_ids = [item["id"] for item in fresh.context["unified_rows"]]
+        next_page = client.get(fresh.context["unified_next_url"], HTTP_HX_REQUEST="true")
+        assert next_page.status_code == 200
+        refreshed_ids += [item["id"] for item in next_page.context["unified_rows"]]
+        expected = messages[:-1] if domain == "comment" else messages
+        assert refreshed_ids == [str(item.pk) for item in expected]
+        assert len(refreshed_ids) == len(set(refreshed_ids))
+        native.assert_not_called()
+        provider.assert_not_called()
+
+
 @pytest.mark.parametrize("change", ["membership", "account_owner", "canonical_source", "legacy_body"])
 def test_session_render_rechecks_grants_sources_and_ownership_before_return(context, client, settings, change):
     from apps.inbox import unified_views

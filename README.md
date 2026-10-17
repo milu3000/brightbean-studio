@@ -688,6 +688,7 @@ Rate-limit responses (`429`) include `Retry-After`, `X-RateLimit-Limit`, and `X-
 | `POST` | `/media` | Upload a media file (multipart) | `upload_media` |
 | `GET` | `/media/{media_id}` | Retrieve a media asset | — |
 | `GET` | `/media` | List media assets (filter, paginate) | — |
+| `GET` | `/inbox/saved` | Saved All Types list shared with the UI; server selects sources | `use_inbox` |
 | `GET` | `/inbox` | List inbox messages (filter by status/type/account, paginate) | `use_inbox` |
 | `GET` | `/inbox/{message_id}` | Read one inbox message with its reply thread | `use_inbox` |
 | `POST` | `/inbox/{message_id}/replies` | Draft a reply (set `send: true` to deliver it now) | `use_inbox` (+ `reply_from_inbox` to send) |
@@ -718,6 +719,7 @@ The MCP server lives at `POST {APP_URL}/api/v1/mcp` and speaks JSON-RPC 2.0 over
 | `upload_media` | Upload a small base64-encoded file (≤ 1 MB raw). For larger files, use REST `POST /media`. | `upload_media` |
 | `get_account_analytics` | Channel analytics over a rolling 7–90 day window | `view_analytics` |
 | `get_post_analytics` | Per-platform metrics for a single post (safe for polling drafts) | `view_analytics` |
+| `list_inbox` | Saved All Types list shared with the UI (canonical reads rollout); no caller source choice | `use_inbox` |
 | `list_inbox_messages` | List inbox items (comments, mentions, DMs, reviews) with their reply threads | `use_inbox` |
 | `get_inbox_message` | Retrieve one inbox message and its reply thread | `use_inbox` |
 | `create_reply_draft` | Draft a reply to an inbox message (saved, not sent) | `use_inbox` |
@@ -796,3 +798,115 @@ To report a security vulnerability, see [SECURITY.md](SECURITY.md). Do not open 
 ## License
 
 [AGPL-3.0](LICENSE) - see LICENSE for details.
+
+### Saved inbox list
+
+With the existing canonical-read rollout enabled, `GET /api/v1/inbox/saved/`
+and MCP `list_inbox` use the same application service and projected rows as the
+Social Inbox UI. The default is All Types. Filters are `domain`, `account`,
+`platform`, `q`, `status`, `workflow`, and `view`; pagination uses `cursor` and
+`limit` (1–100). Existing source-specific inbox endpoints and tools remain
+compatible. This list performs no provider fetch or read acknowledgement.
+Draft/send/status intent adapters are not supplied by this list endpoint.
+
+The existing inbox worker also retries missing outgoing history projections
+from saved sent DM receipts in bounded batches of 100. It uses the original
+provider message ID and send timestamp, never posts again, and retains failures
+for the next cycle. It does not restore compacted content or overwrite an
+existing native observation, including withdrawal evidence. Uncertain receipts
+remain uncertain and are not repaired as accepted sends. This retry is not a
+freshness guarantee; a stopped worker or a held account can still delay history.
+
+The saved action facade adds `read_inbox`, `save_inbox_draft`,
+`send_inbox_reply`, and `get_inbox_send_status`. REST equivalents are
+`GET /inbox/saved/targets/{target_id}` and `POST /inbox/saved/draft`, `/send`,
+and `/status`. Read returns actual saved context and an opaque `reference`.
+Pass that reference with the requested body and optional `quote_target_id`.
+Keep the returned reference after saving. Reusing it sends the same action;
+a new message requires a fresh explicit conversation read. Saving does not
+renew the observed history proof. The status read reports acceptance separately
+from delivery and can look up the original receipt after the write reference
+expires, under current account and inbox permissions.
+
+The facade resolves canonical conversations and legacy/public targets on the
+server. Legacy drafts reuse existing reply rows and current permissions. Public
+sends commit an unknown marker before transport; ambiguous outcomes remain
+held across old entry points. Native quotes remain available through canonical
+conversation controls; public adapters do not gain an invented quote route.
+Historical draft adoption continues through existing composer controls.
+Per-account reader/writer retirement and real platform coverage remain separate
+acceptance gates.
+
+### Read one saved conversation with MCP
+
+Use the existing `read_inbox` tool with one required argument:
+
+```json
+{"target_id": "a-known-conversation-or-message-id"}
+```
+
+The reference may be a saved conversation UUID, an incoming or outgoing message
+UUID, an original inbox UUID, or an exact native ID already saved for this key.
+No preliminary account lookup, ID-conversion tool, source selection or proof
+parameters are required. `list_inbox` is optional when you do not already have an
+ID. An ID shared by multiple authorized brands/threads returns
+`ambiguous_reference`; use the exact saved UUID instead of guessing an account.
+
+The result includes `account`, `thread`, `anchor_message` when the reference
+identifies a message, `existing_replies`, advisory `reply_status`, and `history`.
+The compatible `conversation` field retains the bounded saved timeline; native
+outgoing appears there. Canonical receipt summaries contain metadata, while
+message bodies come from the canonical content projection. Empty receipt lists
+do not prove nobody replied on the platform. Older anchors remain available even
+when the latest page contains newer activity.
+
+Only request older saved content when needed, using the same reference and
+`history.next_cursor` (or `history.undated_next_cursor` for undated content) as
+`cursor`. `limit` is optional, defaults to 30 and is capped at 50. Pages and reply
+summaries are bounded; body/attachment truncation flags remain authoritative.
+No cursor means no more saved rows in that lane, not complete platform history.
+Legacy history only covers saved BrightBean replies; unknown coverage stays
+unknown. `reply_status` is advisory and never grants permission or authorizes a
+send. Reading does not fetch the platform, mark read, change workflow or send.
+Existing rollout flags and current account permissions still apply.
+
+This updates the existing facade, not its older source-specific compatibility
+tools. REST's existing `/inbox/saved/targets/{UUID}` route remains UUID-based.
+
+If a canonical incoming or outgoing item's `body_truncated` is true, request its
+saved full text through the **same** MCP tool, without a platform read:
+
+```json
+{"target_id": "the-message-id", "content": "body"}
+```
+
+This returns `content.body`, `content.body_offset`, and `next_cursor`. Text is
+bounded to 4000 characters per response. Start this full-text stream at offset
+zero; do not append the earlier preview. Continue with the same `target_id`,
+`content: "body"` and the returned `cursor` until `next_cursor` is null.
+History `limit` does not change the fixed text-page size. This mode returns no
+action reference and does not refresh an earlier send proof. Content changes,
+message switches, expiry and revoked scope remain subject to the existing saved
+content rules; withdrawn/retained content is not exposed. Use a message ID,
+not a conversation ID whose latest message the server would have to guess.
+Legacy/public full-message detail and existing attachment tools retain their
+current contracts. Complete saved text does not mean complete platform history.
+
+Old `InboxReply.id` receipt UUIDs are also accepted by `read_inbox`. The service
+checks their original message, saved conversation and linked projection agree
+within the current workspace/account scope. Conflicting brands or threads return
+`ambiguous_reference`; unavailable accounts remain unavailable. `anchor_receipt`
+contains receipt metadata. When an outgoing projection exists, `anchor_message`
+contains its normal visible content. A missing projection never causes the raw
+receipt body to be substituted or coverage to be declared complete.
+
+For truncated content, follow the item's `next_read`: each entry supplies the
+existing `tool` and complete `arguments`, including the correct message ID.
+Canonical full text points to `read_inbox` with `content: "body"`; attachments
+point to the existing `get_conversation_attachments`; legacy/public details point
+to `get_inbox_message`. No account lookup or source probe is needed. Existing
+attachment responses use `next_cursor`: keep the request's arguments and put that
+value in `cursor` to continue. Root `next_read` similarly supplies ready history,
+undated-history or body continuation requests and retains the page limit.
+These descriptions are guidance, not grants: every follow-up rechecks access.
+The reader never executes the requests automatically or calls the platform.

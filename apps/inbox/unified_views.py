@@ -4,7 +4,7 @@ from django.http import HttpResponse
 from django.shortcuts import render
 from django.urls import reverse
 
-from . import canonical_reads, canonical_views, unified_feed
+from . import canonical_reads, canonical_views, saved_reads, unified_feed
 
 
 def feed(request, workspace):
@@ -13,9 +13,9 @@ def feed(request, workspace):
             "Sentiment filtering has been retired. Remove the sentiment filter to continue.", status=400
         )
     try:
-        selected = unified_feed.filters(request.GET)
         scope = canonical_reads.session_read_scope(request.user, workspace.pk)
-        result = unified_feed.read_feed(scope, selected, cursor=request.GET.get("cursor") or None)
+        result = saved_reads.read_list(scope, request.GET)
+        selected = result["filters"]
         context = unified_feed.filter_context(scope, selected, result["sources"])
     except canonical_reads.CanonicalReadError as exc:
         if exc.code == "invalid_filter":

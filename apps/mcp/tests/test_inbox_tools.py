@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from datetime import timedelta
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 import pytest
 from django.test import Client
@@ -152,7 +152,7 @@ def draft_only_client(db, user, memberships, workspace, account):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 class TestInboxReadTools:
     def test_list_inbox_messages(self, full_client, message):
         InboxReply.objects.create(inbox_message=message, body="a draft")
@@ -187,7 +187,7 @@ class TestInboxReadTools:
         assert "not found" in body["error"]["message"].lower()
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 class TestInboxReplyTools:
     def test_create_reply_draft(self, full_client, message):
         _s, body = _call(full_client, "create_reply_draft", {"message_id": str(message.id), "body": "hi"})
@@ -224,7 +224,8 @@ class TestInboxReplyTools:
         with patch("apps.inbox.services._dispatch_to_platform", return_value="plat-1") as dispatch:
             _s, body = _call(full_client, "send_reply", {"reply_id": str(reply.id)})
         assert _result_json(body)["status"] == "sent"
-        dispatch.assert_called_once_with(message, "ready", automated=True)
+        dispatch.assert_called_once_with(message, "ready", automated=True, before_provider=ANY)
+        assert callable(dispatch.call_args.kwargs["before_provider"])
         assert message.replies.count() == 1
 
     def test_send_reply_create_and_send(self, full_client, message):
@@ -233,7 +234,8 @@ class TestInboxReplyTools:
         data = _result_json(body)
         assert data["status"] == "sent"
         assert data["platform_reply_id"] == "plat-2"
-        dispatch.assert_called_once_with(message, "yo", automated=True)
+        dispatch.assert_called_once_with(message, "yo", automated=True, before_provider=ANY)
+        assert callable(dispatch.call_args.kwargs["before_provider"])
         assert message.replies.count() == 1
 
     @pytest.mark.parametrize("extra_fields", [("message_id",), ("body",), ("message_id", "body")])

@@ -100,12 +100,12 @@ class Page {
         await delay(80);
     }
     async settle() { await delay(180); }
-    async fulfill(request, body, type = 'text/html', status = 200) {
+    async fulfill(request, body, type = 'text/html', status = 200, headers = []) {
         if (this.closed || this.cancelled.has(request.networkId)) return;
         try {
             await this.command('Fetch.fulfillRequest', {
                 requestId: request.requestId, responseCode:status,
-                responseHeaders:[{name:'Content-Type',value:type},{name:'Cache-Control',value:'no-store'}],
+                responseHeaders:[{name:'Content-Type',value:type},{name:'Cache-Control',value:'no-store'},...headers],
                 body:Buffer.from(body).toString('base64')
             });
         } catch (error) {
@@ -144,6 +144,11 @@ class Page {
         }
         if (url.pathname === '/favicon.ico') return this.fulfill(event, '', 'image/x-icon', 204);
         if (event.request.method === 'POST') {
+            if (Object.hasOwn(this.fixture.htmlPostResponses || {}, url.pathname)) {
+                this.posts.push({route,body:event.request.postData || ''});
+                const response = this.fixture.htmlPostResponses[url.pathname];
+                return this.fulfill(event,response.body,'text/html',200,response.headers);
+            }
             if (Object.hasOwn(this.fixture.postResponses || {}, url.pathname)) {
                 this.posts.push({route,body:event.request.postData || ''});
                 return this.fulfill(event, JSON.stringify(this.fixture.postResponses[url.pathname]), 'application/json');
