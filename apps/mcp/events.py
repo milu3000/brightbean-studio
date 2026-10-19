@@ -52,9 +52,18 @@ EVENT_DEFINITION = {
     "payloadSchema": {
         "type": "object",
         "properties": {
-            "message_id": {"type": "string", "format": "uuid"},
+            "message_id": {
+                "type": "string",
+                "format": "uuid",
+                "description": "Exact BrightBean incoming message ID accepted by get_inbox_message. This is a legacy InboxMessage ID when mapped, otherwise a canonical ConversationMessage ID; never a provider-native message ID.",
+            },
             "workspace_id": {"type": "string", "format": "uuid"},
             "social_account_id": {"type": "string", "format": "uuid"},
+            "conversation_id": {
+                "type": "string",
+                "format": "uuid",
+                "description": "Canonical BrightBean conversation ID when the message has a canonical source. Optional for legacy-only events.",
+            },
         },
         "required": ["message_id", "workspace_id", "social_account_id"],
         "additionalProperties": False,

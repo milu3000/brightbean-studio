@@ -1,6 +1,7 @@
 """Pinned Meta GETs; provider next URLs are evidence, never a request target."""
 
 import json
+import logging
 import re
 import time
 from email.utils import parsedate_to_datetime
@@ -34,6 +35,8 @@ from .sync_contracts import (
     valid_id,
 )
 from .sync_identity import SyncError
+
+logger = logging.getLogger(__name__)
 
 
 def _unique_object(pairs):
@@ -110,6 +113,16 @@ def _get(client, account, route, params, *, edge=True, optional_content=False):
     if response.status_code in {400, 500}:
         error = data.get("error") if isinstance(data, dict) else None
         error = error if isinstance(error, dict) else {}
+        # Retain the platform refusal's allowlisted diagnostics before reducing
+        # it to the existing checkpoint code. This changes no retry decision.
+        from .provider_failures import _numeric_code as diagnostic_code
+
+        logger.warning(
+            "Meta inbox GET refused: status=%s code=%s subcode=%s",
+            response.status_code,
+            diagnostic_code(error.get("code")),
+            diagnostic_code(error.get("error_subcode")),
+        )
         if edge and params.get("limit") and is_page_size_rejection(response.status_code, error):
             # The next fenced, budgeted attempt retries this exact cursor with
             # fewer rows. No extra GET or reduced content/identity fields here.

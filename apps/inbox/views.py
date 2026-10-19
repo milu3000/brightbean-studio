@@ -303,6 +303,17 @@ def _render_panel(request, workspace, target, **extra):
     return response
 
 
+def _render_header(request, workspace, target):
+    """Status and assignment leave the timeline and local composer nodes intact."""
+    message = _panel_message(request, target)
+    context = _detail_context(workspace, message, request)
+    response = render(request, "inbox/partials/_message_header.html", context)
+    response["HX-Retarget"] = "#inbox-message-header"
+    response["HX-Reswap"] = "outerHTML"
+    response["HX-Trigger"] = "inbox:refresh"
+    return response
+
+
 def _list_query(request):
     params = request.GET.copy()
     params.pop("page", None)
@@ -1076,7 +1087,7 @@ def assign_message(request, workspace_id, message_id):
             },
         )
 
-    return _render_panel(request, workspace, message)
+    return _render_header(request, workspace, message)
 
 
 # --- Status ---
@@ -1103,7 +1114,7 @@ def change_status(request, workspace_id, message_id):
     message.status = form.cleaned_data["status"]
     message.save(update_fields=["status"])
 
-    return _render_panel(request, workspace, message)
+    return _render_header(request, workspace, message)
 
 
 # --- Sentiment Override ---

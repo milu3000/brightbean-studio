@@ -435,3 +435,29 @@ def test_foreign_selection_id_cannot_retarget_panel(owner_client, inbox_account,
     assert response.status_code == 200
     assert b"Never expose this" not in response.content
     assert f'data-selected-message-id="{target.pk}"' in response.content.decode()
+
+
+@pytest.mark.parametrize("action", ["status", "assignment"])
+def test_metadata_mutations_replace_only_header(owner_client, inbox_message, org_owner, action):
+    """A saved receipt/draft and the user's current timeline must survive metadata edits."""
+    draft = InboxReply.objects.create(inbox_message=inbox_message, body="Saved draft", status="draft", author=org_owner)
+    kwargs = {"workspace_id": inbox_message.workspace_id, "message_id": inbox_message.pk}
+    name, data = ("change_status", {"status": "resolved"}) if action == "status" else ("assign", {"assigned_to": ""})
+    with (
+        patch("apps.inbox.native_thread_reads.read_native_thread") as native,
+        patch("apps.inbox.services._dispatch_to_platform") as provider,
+    ):
+        response = owner_client.post(reverse("inbox:" + name, kwargs=kwargs), data, HTTP_HX_REQUEST="true")
+    assert response.status_code == 200
+    assert response["HX-Retarget"] == "#inbox-message-header"
+    assert response["HX-Reswap"] == "outerHTML"
+    assert response["HX-Trigger"] == "inbox:refresh"
+    html = response.content.decode()
+    assert 'id="inbox-message-header"' in html
+    assert "data-inbox-scroll" not in html
+    assert "data-inbox-reply-form" not in html
+    assert "<textarea" not in html
+    draft.refresh_from_db()
+    assert draft.body == "Saved draft" and draft.status == "draft"
+    native.assert_not_called()
+    provider.assert_not_called()

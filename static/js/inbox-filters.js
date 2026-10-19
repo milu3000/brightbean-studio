@@ -48,7 +48,11 @@
         const element = event.detail.elt;
         if (!element || !element.closest('#inbox-filters')) return;
         const parameters = event.detail.parameters;
-        if (!element.matches('[data-canonical-filters]')) { delete parameters.page; delete parameters.cursor; }
+        // Unified cursors bind status/assignment as well as ordering. A mutation
+        // refresh must restart that snapshot, even when the filters are unchanged.
+        if (!element.matches('[data-canonical-filters]') || element.matches('[data-unified-filters]')) {
+            delete parameters.page; delete parameters.cursor;
+        }
         if (parameters.q === '') delete parameters.q;
     });
     document.addEventListener('htmx:afterSwap', update);

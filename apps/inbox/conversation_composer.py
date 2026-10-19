@@ -553,6 +553,8 @@ def save_conversation_draft(
     reply = adopted or InboxReply(inbox_message=target, author=author)
     if adopted:
         reply.inbox_message = target
+    reply.legacy_action_nonce = None
+    reply.legacy_context_digest = ""
     reply.conversation = conversation
     reply.action_nonce = nonce
     reply.account_platform_id = account.account_platform_id

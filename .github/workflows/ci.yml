@@ -70,9 +70,9 @@ jobs:
   test:
     name: Test (pytest)
     runs-on: ubuntu-latest
-    # The expanded PostgreSQL migration/concurrency suite exceeded 20 minutes
-    # while still making progress. Keep every test and give it a bounded run.
-    timeout-minutes: 45
+    # The full PostgreSQL suite hit 45 minutes while still making progress.
+    # Keep every test on the same runner with a bounded variance allowance.
+    timeout-minutes: 60
     services:
       postgres:
         # Pulled via AWS's public mirror of Docker Hub official images —

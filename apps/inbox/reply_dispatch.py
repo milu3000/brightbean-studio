@@ -560,6 +560,72 @@ def settle_dispatch_attempt(binding, attempt, reply, *, sent):
         state.save(update_fields=fields)
 
 
+@transaction.atomic
+def settle_recorded_acceptance(attempt_id):
+    """Repair bookkeeping from a persisted provider receipt; never dispatch.
+
+    A timeout, lease expiry, or an unknown attempt is not acceptance evidence.
+    Keep transferred/paused identities held rather than bypass their controls.
+    """
+    from types import SimpleNamespace
+
+    from .models import DMSendAttempt
+
+    snapshot = DMSendAttempt.objects.select_related("control").filter(pk=attempt_id).first()
+    if snapshot is None or snapshot.operation_id is None:
+        return False
+    account = lock_dm_account(snapshot.control.social_account_id, snapshot.control.workspace_id)
+    if account is None:
+        return False
+    pending = SendOperation.objects.filter(
+        pk=snapshot.operation_id,
+        workspace_id=account.workspace_id,
+        social_account=account,
+        platform=account.platform,
+        status="outcome_unknown",
+    ).first()
+    if pending is None:
+        return False
+    conversation = coordinator._conversation(account, pending.conversation_id)
+    owner = _ownership(account, conversation, required=True)
+    coordinator._state(conversation)
+    operation = SendOperation.objects.select_for_update().get(pk=pending.pk)
+    reply = InboxReply.objects.select_for_update().get(pk=snapshot.reply_id)
+    attempt = DMSendAttempt.objects.select_for_update().get(pk=attempt_id)
+    _check_identity(owner.control, account)
+    if (
+        owner.paused
+        or owner.control.paused
+        or owner.epoch != operation.owner_epoch
+        or owner.owner_scope != operation.actor_scope
+        or operation.ownership_id != owner.pk
+        or attempt.control_id != owner.control_id
+        or attempt.epoch != owner.control.epoch
+        or operation.status != "outcome_unknown"
+        or operation.attempt_id != attempt.pk
+        or operation.reply_id != reply.pk
+        or attempt.operation_id != operation.pk
+        or attempt.reply_id != reply.pk
+        or attempt.outcome != "sent"
+        or attempt.reason_code != "provider_accepted"
+        or not attempt.completed_at
+        or not operation.external_attempted_at
+        or attempt.completed_at < operation.external_attempted_at
+        or reply.status != "sent"
+        or not reply.platform_reply_id
+        or not reply.sent_at
+        or reply.not_sent_verified
+        or reply.inbox_message.social_account_id != account.pk
+        or reply.inbox_message.workspace_id != account.workspace_id
+        or (operation.conversation_action_nonce and operation.conversation_action_nonce != reply.action_nonce)
+    ):
+        return False
+    # The original settlement's generation check preserves newer incoming work;
+    # neither its fencing token nor any other active operation is changed here.
+    settle_dispatch_attempt(SimpleNamespace(operation_id=operation.pk), attempt, reply, sent=True)
+    return True
+
+
 def dispatch_reply(
     scope,
     *,

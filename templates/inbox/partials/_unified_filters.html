@@ -1,4 +1,4 @@
-<form id="inbox-filters" data-canonical-filters data-unified-filters action="{% url 'inbox:feed' workspace_id=workspace.id %}" method="get" hx-get="{% url 'inbox:feed' workspace_id=workspace.id %}" hx-trigger="inbox:refresh-list" hx-swap="innerHTML settle:0ms" hx-target="#inbox-list-content" hx-sync="#inbox-list-content:queue last" class="unified-filters">
+<form id="inbox-filters" data-canonical-filters data-unified-filters action="{% url 'inbox:feed' workspace_id=workspace.id %}" method="get" hx-get="{% url 'inbox:feed' workspace_id=workspace.id %}" hx-trigger="inbox:refresh-list" hx-replace-url="true" hx-swap="innerHTML settle:0ms" hx-target="#inbox-list-content" hx-sync="#inbox-list-content:queue last" class="unified-filters">
     <input type="hidden" name="domain" value="{{ active_domain|default:'all' }}">
     <input type="hidden" name="cursor" data-canonical-list-cursor value="{{ list_cursor }}">
     <div class="unified-search">

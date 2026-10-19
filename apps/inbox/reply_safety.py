@@ -304,8 +304,13 @@ def reply_send_availability(message, *, reply=None, follow_up_of=None):
                 )
             if parent is not None:
                 validate_follow_up_parent(message, parent, reply=reply)
-            if message.replies.filter(status=InboxReply.Status.UNKNOWN).exists():
-                raise _error("outcome_unknown", UNKNOWN_MESSAGE)
+            from .legacy_intents import public_send_hold
+
+            if public_send_hold(message):
+                raise _error(
+                    "outcome_unknown",
+                    "Delivery outcome is unknown in this thread. Check the original result and do not resend.",
+                )
             return result
         validate_dm_target(message)
         check_dm_receipts(message, reply, include_drafts=True, follow_up_of=follow_up_of)
@@ -358,6 +363,9 @@ def _check_current(reply, account, message, snapshot, authorization, automated):
 
     if DMSendControl.objects.filter(social_account=account).exists():
         raise _error("gate_changed", "The account send controls changed; review this reply before sending.")
+    from .legacy_intents import validate_context
+
+    validate_context(reply)
     check_conversation_send(account, message, reply)
     if reply.dm_send_attempts.exists():
         raise _error("legacy_attempt", "This reply requires its existing durable DM send gate.")

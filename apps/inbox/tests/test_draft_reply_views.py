@@ -51,7 +51,7 @@ def _url(workspace, path):
     return f"/workspace/{workspace.id}/inbox/{path}"
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 def test_save_reply_draft_creates_draft(client, workspace, account, message, org_owner, user):
     _member(workspace, user, WorkspaceMembership.WorkspaceRole.OWNER)
     client.force_login(user)
@@ -67,7 +67,7 @@ def test_save_reply_draft_creates_draft(client, workspace, account, message, org
     assert b"draft answer" in resp.content
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 def test_save_reply_draft_denied_for_viewer(client, workspace, account, message, org_owner, user):
     _member(workspace, user, WorkspaceMembership.WorkspaceRole.VIEWER)
     client.force_login(user)
@@ -78,7 +78,7 @@ def test_save_reply_draft_denied_for_viewer(client, workspace, account, message,
     assert InboxReply.objects.count() == 0
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 def test_send_reply_draft_delivers(client, workspace, account, message, org_owner, user):
     _member(workspace, user, WorkspaceMembership.WorkspaceRole.OWNER)
     client.force_login(user)
@@ -93,7 +93,7 @@ def test_send_reply_draft_delivers(client, workspace, account, message, org_owne
     assert reply.platform_reply_id == "plat-9"
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 def test_send_reply_draft_failure_keeps_failed_row(client, workspace, account, message, org_owner, user):
     _member(workspace, user, WorkspaceMembership.WorkspaceRole.OWNER)
     client.force_login(user)
@@ -108,7 +108,7 @@ def test_send_reply_draft_failure_keeps_failed_row(client, workspace, account, m
     assert reply.status == InboxReply.Status.FAILED
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 def test_send_reply_draft_denied_for_viewer(client, workspace, account, message, org_owner, user):
     _member(workspace, user, WorkspaceMembership.WorkspaceRole.VIEWER)
     client.force_login(user)
@@ -121,7 +121,7 @@ def test_send_reply_draft_denied_for_viewer(client, workspace, account, message,
     assert reply.status == InboxReply.Status.DRAFT
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 def test_discard_reply_draft_removes_it(client, workspace, account, message, org_owner, user):
     _member(workspace, user, WorkspaceMembership.WorkspaceRole.OWNER)
     client.force_login(user)
@@ -133,7 +133,7 @@ def test_discard_reply_draft_removes_it(client, workspace, account, message, org
     assert not InboxReply.objects.filter(pk=reply.pk).exists()
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 def test_discard_rejects_sent_reply(client, workspace, account, message, org_owner, user):
     _member(workspace, user, WorkspaceMembership.WorkspaceRole.OWNER)
     client.force_login(user)

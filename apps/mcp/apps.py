@@ -22,6 +22,7 @@ class McpConfig(AppConfig):
             events_canonical,
             handlers,
             reply_coordination_tools,
+            saved_inbox_tools,
         )
 
         post_migrate.connect(self._register_tasks, sender=self)

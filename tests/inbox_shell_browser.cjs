@@ -204,6 +204,52 @@ async function mixedInteractionScenario(browser) {
     } finally {await page.close();}
 }
 
+async function metadataPreservesComposerScenario(browser) {
+    for (const width of [1365,390]) {
+        const page=await createPage(browser,fixture,width,844);
+        try {
+            await page.evaluate('window.originalUnifiedShell=document.querySelector("[data-unified-shell]");window.originalDetailPane=document.querySelector("#inbox-detail-panel")');
+            await chooseType(page,'comment');
+            const comment=fixture.legacyThreads.find(thread=>thread.kind==='comment');
+            await openLegacy(page,comment);
+            await page.type('未保存的回覆保留');
+            const routes=Object.keys(fixture.htmlPostResponses);
+            await page.evaluate(`window.metadataEditor=document.querySelector('[data-inbox-reply-form] textarea');window.metadataScroll=document.querySelector('[data-inbox-scroll]');window.metadataEditor.setSelectionRange(2,4);const filler=document.createElement('div');filler.style.height='1800px';filler.setAttribute('aria-hidden','true');window.metadataScroll.appendChild(filler);window.metadataScroll.scrollTop=247;window.metadataTop=window.metadataScroll.scrollTop;window.metadataSwaps=0;document.addEventListener('htmx:afterSwap',event=>{if(event.detail.target?.id==='inbox-message-header')window.metadataSwaps++;});`);
+            for (const route of routes) {
+                page.delays.set(route,250);
+                const selector=`#inbox-message-header [hx-post="${route}"]`;
+                // Dispatch the real button click through HTMX. The menu is
+                // normally hidden; removing x-show avoids testing its toggle.
+                await page.evaluate(`document.querySelector(${JSON.stringify(selector)}).parentElement.style.display='block'`);
+                const before=await page.evaluate('window.metadataSwaps');
+                await page.click(selector);
+                await page.wait(`document.querySelector('#inbox-message-header-pending').classList.contains('htmx-request')`,'metadata pending indicator');
+                await page.evaluate(`window.metadataEditor.focus();window.metadataEditor.setSelectionRange(2,4)`);
+                await page.wait(`window.metadataSwaps>${before}`,'metadata header response');
+                assert(await page.evaluate(`document.querySelector('[data-inbox-reply-form] textarea')===window.metadataEditor`),'Metadata must keep the same composer DOM node');
+                assert(await page.evaluate(`document.activeElement===window.metadataEditor`),'Metadata response preserves composer focus');
+                assert.equal(await page.evaluate('window.metadataEditor.value'),'未保存的回覆保留');
+                assert.deepEqual(await page.evaluate('[window.metadataEditor.selectionStart,window.metadataEditor.selectionEnd]'),[2,4]);
+                assert(await page.evaluate(`document.querySelector('[data-inbox-scroll]')===window.metadataScroll`));
+                assert.equal(await page.evaluate('window.metadataScroll.scrollTop'),await page.evaluate('window.metadataTop'));
+            }
+            for (const failure of [409,500,0]) {
+                const route=routes[0];page.failures.set(route,failure);page.delays.delete(route);
+                const before=await page.evaluate('window.metadataSwaps');
+                await page.evaluate(`(() => {const button=document.querySelector('#inbox-message-header [hx-post="'+${JSON.stringify(route)}+'"]');button.parentElement.style.display='block';button.click();})()`);
+                await page.wait(`Boolean(document.querySelector('[data-inbox-request-error]'))`,'metadata failure warning');
+                assert.equal(await page.evaluate('window.metadataSwaps'),before);
+                assert.equal(await page.evaluate('window.metadataEditor.value'),'未保存的回覆保留');
+                await page.evaluate(`document.querySelector('[data-inbox-request-error]').remove()`);
+                page.failures.delete(route);
+            }
+            assert.equal(page.posts.filter(post=>/reply|send/.test(post.route)).length,0);
+            await page.clean();
+            process.stdout.write(`PASS metadata header preserves actual composer/focus/selection/scroll with delayed and 409/500/offline responses at ${width}\n`);
+        } finally {await page.close();}
+    }
+}
+
 async function immediateListControlScenario(browser) {
     for (const negative of [false,true]) {
         const withoutImmediate=html=>html.replaceAll(' hx-swap="innerHTML settle:0ms"','');
@@ -300,6 +346,64 @@ async function mixedRaceScenario(browser) {
         await page.clean();
     } finally {await page.close();}
     process.stdout.write('PASS stale canonical/legacy detail and list responses cannot replace newer selection\n');
+}
+
+async function paginatedMutationRefreshScenario(browser) {
+    // Request/history wiring with actual HTMX and rendered fixtures. The Django
+    // endpoint regression separately proves read/status/assignment HX-Trigger
+    // and stale-cursor 409s against real isolated database mutations.
+    const page=await createPage(browser,fixture,1365,900);
+    try {
+        await page.evaluate('window.originalUnifiedShell=document.querySelector("[data-unified-shell]");window.originalDetailPane=document.querySelector("#inbox-detail-panel")');
+        await page.open(fixture.threads[0]);await page.settle();
+        await page.type('Unsaved reply survives mutation refresh');
+        await page.evaluate(`window.refreshComposer=document.querySelector('[data-inbox-reply-form] textarea');window.refreshDetail=document.querySelector('#inbox-detail-panel');window.mutationListSwaps=0;window.mutationErrors=0;document.addEventListener('htmx:afterSwap',event=>{if(event.detail.target?.id==='inbox-list-content')window.mutationListSwaps++;});document.addEventListener('htmx:responseError',()=>window.mutationErrors++);`);
+        async function older() {
+            await page.click('[data-unified-next]');
+            await page.wait(`new URL(location.href).searchParams.has('cursor')`,'older page before mutation refresh');
+            await page.settle();
+            assert.deepEqual(await page.evaluate(`Array.from(document.querySelectorAll('[data-unified-row]'),row=>row.dataset.inboxOpenMessage)`),fixture.nextRows);
+        }
+        async function refresh() {
+            const swaps=await page.evaluate('window.mutationListSwaps');
+            await page.evaluate(`document.dispatchEvent(new CustomEvent('inbox:refresh',{bubbles:true}))`);
+            await page.wait(`window.mutationListSwaps>${swaps}`,'successful mutation list refresh');
+        }
+        await older();
+        const before=await page.command('Page.getNavigationHistory');
+        await refresh();
+        const after=await page.command('Page.getNavigationHistory');
+        assert.equal(after.entries.length,before.entries.length,'Automatic refresh replaces rather than pushes history');
+        assert.equal(after.currentIndex,before.currentIndex);
+        assert.equal(await page.evaluate(`new URL(location.href).searchParams.has('cursor')`),false);
+        assert.equal(await page.evaluate(`document.querySelector('[data-canonical-list-cursor]').value`),'','Canonical afterSwap must not reintroduce the old URL cursor');
+        assert.deepEqual(await page.evaluate(`Array.from(document.querySelectorAll('[data-unified-row]'),row=>row.dataset.inboxOpenMessage)`),fixture.firstRows);
+        const refreshRoute=page.requests.filter(request=>request.htmxRequest&&new URL(request.url).pathname===fixture.feed).at(-1).route;
+        assert.equal(new URL(refreshRoute,fixture.origin).searchParams.has('cursor'),false,'Refresh never submits the stale cursor');
+        await refresh(); // A stale wantedList signature used to block this follow-up.
+        await older();
+        const oldUrl=await page.evaluate('location.href'),oldCursor=await page.evaluate(`document.querySelector('[data-canonical-list-cursor]').value`);
+        const errors=await page.evaluate('window.mutationErrors'),swaps=await page.evaluate('window.mutationListSwaps');
+        page.failures.set(refreshRoute,409);
+        await page.evaluate(`document.dispatchEvent(new CustomEvent('inbox:refresh',{bubbles:true}))`);
+        await page.wait(`window.mutationErrors>${errors}`,'synthetic failed mutation refresh');
+        assert.equal(await page.evaluate('location.href'),oldUrl);
+        assert.equal(await page.evaluate(`document.querySelector('[data-canonical-list-cursor]').value`),oldCursor);
+        assert.equal(await page.evaluate('window.mutationListSwaps'),swaps);
+        assert.deepEqual(await page.evaluate(`Array.from(document.querySelectorAll('[data-unified-row]'),row=>row.dataset.inboxOpenMessage)`),fixture.nextRows);
+        page.failures.delete(refreshRoute);
+        await refresh();
+        await older();page.delays.set(refreshRoute,350);
+        await page.evaluate(`document.dispatchEvent(new CustomEvent('inbox:refresh',{bubbles:true}))`);
+        await chooseType(page,'mention');await page.settle();
+        assert.equal(await page.evaluate(`new URL(location.href).searchParams.get('domain')`),'mention','Delayed refresh cannot replace a newer filter URL');
+        assert.equal(await page.evaluate(`document.querySelector('[data-inbox-reply-form] textarea')===window.refreshComposer`),true);
+        assert.equal(await page.evaluate(`document.querySelector('#inbox-detail-panel')===window.refreshDetail`),true);
+        assert.equal(await page.evaluate(`document.querySelector('[data-inbox-reply-form] textarea').value`),'Unsaved reply survives mutation refresh');
+        assert.equal(page.posts.filter(post=>/reply|send/.test(post.route)).length,0);
+        await page.clean();
+        process.stdout.write('PASS paginated mutation refresh drops cursor, replaces URL, remains retryable and preserves newer navigation/detail/draft\n');
+    } finally {await page.close();}
 }
 
 async function browserHistoryScenario(browser) {
@@ -500,6 +604,7 @@ async function main() {
         await browser.command('Browser.getVersion',{},undefined,30000);
         const failures=[];
         async function run(label,operation) {
+            if (args.includes('--scenario') && value('--scenario') !== label) return;
             try { await operation(); } catch (error) {
                 const failure=label+': '+error.stack;failures.push(failure);process.stderr.write('SCENARIO FAILED '+failure+'\n');
             }
@@ -508,8 +613,10 @@ async function main() {
             await run(`layout ${width}x${height}`,()=>scenario(browser,width,height,collapsed));
         }
         await run('mixedInteractionScenario',()=>mixedInteractionScenario(browser));
+        await run('metadataPreservesComposerScenario',()=>metadataPreservesComposerScenario(browser));
         await run('immediateListControlScenario',()=>immediateListControlScenario(browser));
         await run('filteringScenario',()=>filteringScenario(browser));
+        await run('paginatedMutationRefreshScenario',()=>paginatedMutationRefreshScenario(browser));
         await run('mixedRaceScenario',()=>mixedRaceScenario(browser));
         await run('browserHistoryScenario',()=>browserHistoryScenario(browser));
         await run('historyRaceScenario',()=>historyRaceScenario(browser));

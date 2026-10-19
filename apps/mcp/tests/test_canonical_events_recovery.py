@@ -3,7 +3,7 @@
 import json
 import uuid
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -11,6 +11,7 @@ import pytest
 from django.db import IntegrityError, transaction
 from django.db.models.deletion import ProtectedError
 from django.utils import timezone
+from jsonschema import Draft202012Validator, FormatChecker, ValidationError
 
 from apps.inbox.conversation_workflow import canonical_actionable_observed, canonical_incoming_observed
 from apps.inbox.durable_sync import auth_fingerprint, claim_page, commit_page, start_scan
@@ -114,6 +115,9 @@ def test_page_enqueue_is_atomic_minimal_and_durable(flow, django_capture_on_comm
     assert delivery.canonical_event_revision == row.incoming_generation == 1
     assert not InboxMessage.objects.exists()
     payload = json.loads(delivery.payload)
+    Draft202012Validator(
+        events.list_events({}, flow.context)["events"][0]["payloadSchema"], format_checker=FormatChecker()
+    ).validate(payload["data"])
     assert payload["data"] == {
         "message_id": str(row.pk),
         "workspace_id": str(row.workspace_id),
@@ -128,6 +132,76 @@ def test_page_enqueue_is_atomic_minimal_and_durable(flow, django_capture_on_comm
     assert callback.call_count == 1
     delivery.refresh_from_db()
     assert delivery.status == "delivered"
+
+
+def test_delivered_reference_resolves_exact_incoming_message_and_rejects_wrong_account(flow):
+    from django.test import RequestFactory
+
+    from apps.api_keys.services import issue_api_key
+    from apps.mcp.handlers import _get_inbox_message
+    from apps.mcp.protocol import JsonRpcError
+    from apps.members.models import WorkspaceMembership
+    from apps.social_accounts.models import SocialAccount
+    from apps.workspaces.models import Workspace
+
+    row = ingest(flow)
+    delivery = EventOutbox.objects.get()
+    with patch("apps.mcp.tasks.post_signed", return_value=SimpleNamespace(status=204)) as callback:
+        process_delivery(delivery.pk)
+    payload = json.loads(callback.call_args.args[4])
+    reference = payload["data"]
+    assert reference["workspace_id"] == str(flow.context["workspace"].pk)
+    assert reference["social_account_id"] == str(flow.account.pk)
+    context = flow.context | {"request": RequestFactory().get("/api/v1/mcp/")}
+    result = _get_inbox_message({"message_id": reference["message_id"]}, context)
+    incoming = json.loads(result["content"][0]["text"])
+    assert incoming["id"] == str(row.pk)
+    assert incoming["id_namespace"] == "canonical_message"
+    assert incoming["platform_message_id"] == row.platform_message_id
+    assert incoming["workspace_id"] == reference["workspace_id"]
+    assert incoming["social_account_id"] == reference["social_account_id"]
+    assert datetime.fromisoformat(incoming["received_at"]) == datetime.fromisoformat(payload["timestamp"])
+
+    other_workspace = Workspace.objects.create(
+        name="Other synthetic workspace", organization=flow.account.workspace.organization
+    )
+    WorkspaceMembership.objects.create(
+        user=flow.context["api_key"].issued_by, workspace=other_workspace, workspace_role="owner"
+    )
+    other_workspace_account = SocialAccount.objects.create(
+        workspace=other_workspace,
+        platform="facebook",
+        account_platform_id="isolated-native-account",
+        account_name="Isolated synthetic account",
+    )
+    other_key = issue_api_key(
+        workspace=other_workspace,
+        social_accounts=[other_workspace_account],
+        issued_by=flow.context["api_key"].issued_by,
+        name="isolated-event-reader",
+        permissions=["use_inbox"],
+    ).api_key
+    with pytest.raises(JsonRpcError):
+        _get_inbox_message({"message_id": reference["message_id"]}, context | {"api_key": other_key})
+
+    other = SocialAccount.objects.create(
+        workspace=flow.context["workspace"],
+        platform="facebook",
+        account_platform_id="other-native-account",
+        account_name="Other synthetic account",
+    )
+    flow.context["api_key"].social_accounts.set([other])
+    with pytest.raises(JsonRpcError):
+        _get_inbox_message({"message_id": reference["message_id"]}, context)
+
+
+def test_task_text_without_event_reference_fails_catalog_contract(flow):
+    # Minimal downstream reproducer only: not a claim about platform's actual envelope.
+    schema = events.list_events({}, flow.context)["events"][0]["payloadSchema"]
+    validator = Draft202012Validator(schema, format_checker=FormatChecker())
+    for missing_reference in ({}, {"task": "Check the incoming direct message"}):
+        with pytest.raises(ValidationError):
+            validator.validate(missing_reference)
 
 
 def test_rollback_and_signal_failure_leave_no_event_or_message(flow, django_capture_on_commit_callbacks):

@@ -2,14 +2,16 @@
 
 Enrollment is a server-side operation, never implied by a feature flag. The
 committed unknown attempt is deliberately conservative: it can mean a process
-stopped before HTTP. Only the invocation that created it can settle it here.
-There is no recovery-by-timeout, reconciliation, or public mutation endpoint.
+stopped before HTTP. Only its original dispatch can decide its outcome. Saved
+accepted receipts may repair optional bookkeeping; unknown outcomes are never
+recovered by timeout or a public mutation endpoint.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
@@ -25,6 +27,8 @@ from apps.social_accounts.models import SocialAccount
 from .locking import lock_dm_account
 from .models import DMSendAttempt, DMSendControl, InboxMessage, InboxReply
 from .services import ReplyStateError
+
+logger = logging.getLogger(__name__)
 
 COVERAGE_VERSION = "brightbean-dm-gate-v1"
 SUPPORTED_PLATFORMS = {"facebook", "instagram_login"}
@@ -316,9 +320,11 @@ def _fingerprint(reply, message):
 
 
 def _check_send(control, account, reply, message, authorization, automated, dispatch_binding=None):
+    from .legacy_intents import validate_context
     from .reply_dispatch import check_conversation_send
     from .reply_safety import check_dm_receipts, validate_dm_target
 
+    validate_context(reply)
     _check_identity(control, account)
     check_conversation_send(account, message, reply, dispatch_binding)
     if control.paused:
@@ -529,7 +535,14 @@ def send_enrolled_dm(reply, *, actor, authorization, automated, snapshot, dispat
                     attempt.outcome, attempt.reason_code = DMSendAttempt.Outcome.SENT, "provider_accepted"
                     attempt.completed_at = timezone.now()
                     attempt.save(update_fields=["outcome", "reason_code", "completed_at"])
-                    settle_dispatch_attempt(dispatch_binding, attempt, reply, sent=True)
+                    # Acceptance is authoritative even if optional operation
+                    # bookkeeping fails. A savepoint preserves the sent receipt
+                    # while its existing operation stays held for local repair.
+                    try:
+                        with transaction.atomic():
+                            settle_dispatch_attempt(dispatch_binding, attempt, reply, sent=True)
+                    except Exception:
+                        logger.warning("Accepted reply %s requires operation settlement repair", reply.pk)
                     from .conversations import record_reply
 
                     try:

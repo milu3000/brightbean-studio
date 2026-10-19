@@ -145,7 +145,7 @@ def draft_api(draft_only_key):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 class TestListAndRead:
     def test_list_returns_allowlisted_messages_with_replies(self, api, message):
         InboxReply.objects.create(inbox_message=message, body="draft one")
@@ -191,7 +191,7 @@ class TestListAndRead:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 class TestReplyDrafts:
     def test_create_draft(self, api, message):
         r = api.post(
@@ -296,7 +296,7 @@ class TestReplyDrafts:
         assert r.status_code == 404
 
 
-@pytest.mark.django_db
+@pytest.mark.django_db(transaction=True)
 class TestReplyIdempotency:
     @pytest.mark.parametrize("header_key", [False, True])
     @pytest.mark.parametrize("send", [False, True])

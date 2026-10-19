@@ -17,6 +17,8 @@ from apps.inbox import services
 from apps.inbox.models import InboxMessage, InboxReply, InboxSLAConfig
 from apps.social_accounts.models import SocialAccount
 
+pytestmark = pytest.mark.django_db(transaction=True)
+
 
 @pytest.fixture
 def workspace(db, organization):
@@ -178,13 +180,15 @@ def test_stale_draft_cannot_change_sent_reply(message, operation):
     stale_reply = InboxReply.objects.get(pk=reply.pk)
     with patch("apps.inbox.services._dispatch_to_platform", return_value="sent-1") as dispatch:
         services.send_reply_now(reply)
-        with pytest.raises(services.ReplyStateError):
-            if operation == "send":
-                services.send_reply_now(stale_reply)
-            elif operation == "edit":
-                services.update_reply_draft(stale_reply, body="different answer")
-            else:
-                services.discard_reply_draft(stale_reply)
+        if operation == "send":
+            receipt = services.send_reply_now(stale_reply)
+            assert receipt.pk == reply.pk and receipt.platform_reply_id == "sent-1"
+        else:
+            with pytest.raises(services.ReplyStateError):
+                if operation == "edit":
+                    services.update_reply_draft(stale_reply, body="different answer")
+                else:
+                    services.discard_reply_draft(stale_reply)
     dispatch.assert_called_once()
     reply.refresh_from_db()
     assert reply.status == InboxReply.Status.SENT
@@ -222,8 +226,7 @@ def test_sla_failure_does_not_make_delivered_reply_sendable_again(message):
         reply.refresh_from_db()
         assert reply.status == InboxReply.Status.SENT
         assert reply.platform_reply_id == "sent-1"
-        with pytest.raises(services.ReplyStateError):
-            services.send_reply_now(reply)
+        assert services.send_reply_now(reply).platform_reply_id == "sent-1"
     dispatch.assert_called_once()
 
 
@@ -237,7 +240,9 @@ def test_concurrent_sends_deliver_draft_once(message):
     release_dispatch = Event()
     second_started = Event()
 
-    def dispatch(message, body):
+    def dispatch(message, body, *, automated, before_provider):
+        assert automated is False
+        before_provider()
         dispatch_started.set()
         assert release_dispatch.wait(timeout=10)
         return "sent-once"
@@ -262,8 +267,7 @@ def test_concurrent_sends_deliver_draft_once(message):
             finally:
                 release_dispatch.set()
             assert first.result(timeout=10) == InboxReply.Status.SENT
-            with pytest.raises(services.ReplyStateError, match="cannot be sent again"):
-                second.result(timeout=10)
+            assert second.result(timeout=10) == InboxReply.Status.SENT
         mocked_dispatch.assert_called_once()
     reply.refresh_from_db()
     assert reply.status == InboxReply.Status.SENT

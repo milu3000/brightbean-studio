@@ -26,9 +26,27 @@ def is_page_size_rejection(status_code: object, error: object) -> bool:
     )
 
 
+class InboxPagingError(APIError):
+    """Local bounded-paging failure, separate from a platform HTTP refusal."""
+
+    def __init__(self, reason: str, platform: str):
+        self.reason_code = {
+            "repeated cursor": "cursor_repeated",
+            "request budget exhausted": "request_budget_exhausted",
+            "invalid conversation identity": "invalid_conversation_identity",
+            "invalid pagination": "invalid_pagination",
+            "missing continuation cursor": "missing_continuation_cursor",
+            "invalid pagination route": "invalid_pagination_route",
+            "invalid pagination cursor or route": "invalid_pagination_cursor_or_route",
+            "invalid starting cursor": "invalid_starting_cursor",
+            "invalid page payload": "invalid_page_payload",
+        }.get(reason, "pagination_incomplete")
+        super().__init__(f"Inbox paging incomplete: {reason}", platform=platform)
+
+
 def _paging_error(reason: str, platform: str) -> APIError:
     # Never include provider URLs, cursors, participants or response text here.
-    return APIError(f"Inbox paging incomplete: {reason}", platform=platform)
+    return InboxPagingError(reason, platform)
 
 
 class InboxRequestBudget:
